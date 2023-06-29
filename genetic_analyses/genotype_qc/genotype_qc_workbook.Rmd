@@ -1,0 +1,598 @@
+---
+title: "Main Genotype QC"
+output: html_notebook
+---
+```{r setup}
+library(tidyverse)
+library(data.table)
+library(GGally)
+```
+additional metadata
+```{r}
+metadata_cas <- read.delim("/home1/NEURO/SHARE_DECIPHER/Genetic_data/DIGPD_cas/_covar_cas_dig.txt",stringsAsFactors = F)
+metadata_tem <- read.delim("/home1/NEURO/SHARE_DECIPHER/Genetic_data/DIGPD_tem/_covar_tem_dig.txt",stringsAsFactors = F)
+correspond <- readxl::read_xlsx("/home1/NEURO/SHARE_DECIPHER/Genetic_data/CORRESPONDANCES.xlsx")
+head(metadata_tem)
+metadata_tmp <- rbind(metadata_cas, metadata_tem) 
+summary(metadata_tmp$SEX)
+dim(metadata_tmp)
+
+## ISSUES IN ABOVE METADATA @TODO CHECK WITH SAM's VERSION BELOW
+metadata <- read.csv("/home1/NEURO/SHARE_DECIPHER/digpd_meta_master.csv")
+```
+
+### Pre-cleaning
+```{bash filter low call snps}
+cur_geno="$HOME/DIGPD_pre_qc/digpd_alleleupdate"
+~/plink --bfile "${cur_geno}" \
+  --make-bed \
+  --geno 0.05 \
+  --out "${cur_geno}_snpcall"
+cur_geno="${cur_geno}_snpcall"
+
+```
+
+### Individual based QC
+```{bash maf01}
+# remove some rare snps prior to individual missingness
+cur_geno="$HOME/DIGPD_pre_qc/digpd_alleleupdate_snpcall"
+~/plink --bfile "${cur_geno}" \
+  --maf 0.01 \
+  --make-bed \
+  --out "${cur_geno}_maf01"
+cur_geno="${cur_geno}_maf01"
+#individual missingness
+~/plink --bfile "${cur_geno}" \
+  --mind 0.02 \
+  --make-bed \
+  --out "${cur_geno}_mind02"
+cur_geno="${cur_geno}_mind02"
+
+#checksex probes
+~/plink --bfile "${cur_geno}" \
+  --check-sex \
+  --out "${cur_geno}"
+  
+# filter out samples that don't pass check
+cat /home1/NEURO/casazza/DIGPD_pre_qc/digpd_alleleupdate_snpcall_maf01_mind02.sexcheck |
+  grep -v "OK" | tail -n+2 > sex_failed_tmp.txt
+~/plink --bfile "${cur_geno}" \
+  --remove sex_failed_tmp.txt \
+  --make-bed \
+  --out "${cur_geno}_sex_check"
+cur_geno="${cur_geno}_sex_check"
+
+# Compute method of moments heritability F
+~/plink --bfile "${cur_geno}" \
+  --het \
+  --out "${cur_geno}"
+
+```
+<!-- @TODO check if the sample below makes sense -->
+Let's see which sample didn't pass sex check:
+```{r}
+tmp <- read.delim("/home1/NEURO/casazza/DIGPD_pre_qc/digpd_alleleupdate_snpcall_maf01_mind02.sexcheck", sep="")
+tmp[tmp$STATUS == "PROBLEM",]
+```
+now lets plot out heritability F stats:
+```{r}
+(fhet <- read.delim("~/DIGPD_pre_qc/digpd_alleleupdate_snpcall_maf01_mind02_sex_check.het", sep="")  %>% left_join(metadata, by = c("FID","IID"))) %>% 
+  ggplot(aes(F,fill= as.factor(ethnicity))) + geom_histogram()
+```
+
+Since no individual has a coeficient larger than the threshold of 0.20 (~0.25 is full sibling/parent-offspring relationship).
+
+### PCA QC
+#### Pre-PCA filtering:
+* sex chromosomes and MAF <0.05
+* strand ambiguous snps(should be caught in merging)
+* duplicate checking
+* Long range LD regions and MHC regions
+* LD pruning r2 <0.2 in a 200 SNP window (RUN TWICE)
+```{bash}
+cur_geno="/home1/NEURO/casazza/DIGPD_pre_qc/digpd_alleleupdate_snpcall_maf01_mind02_sex_check"
+~/plink --bfile "${cur_geno}" \
+  --maf 0.05 \
+  --autosome \
+  --snps-only \
+  --make-bed \
+  --out "${cur_geno}_autosome"
+cur_geno="${cur_geno}_autosome"
+
+
+~/plink --bfile "${cur_geno}" \
+  --bmerge "${cur_geno}"\
+  --merge-equal-pos \
+  --out "${cur_geno}_flipfix" #failed 
+  
+# remove duplicate snps
+~/plink --bfile "${cur_geno}" \
+  --list-duplicate-vars ids-only suppress-first \
+  --make-bed \
+  --out "${cur_geno}_dedup"
+~/plink --bfile "${cur_geno}" \
+  --exclude "${cur_geno}_dedup.dupvar"\
+  --make-bed \
+  --out "${cur_geno}_dedup"
+cur_geno="${cur_geno}_dedup"
+
+#@TODO RE-RUN WITH COMMAND BELOW TO REMOVE AMBIGUOUS SNPs
+cat "${cur_geno}".bim | grep -E "A.*T|T.*A|G.*C|C.*G" > tmp_ambiguous.txt
+~/plink --bfile "${cur_geno}" \
+  --exclude tmp_ambiguous.txt \
+  --make-bed \
+  --out "${cur_geno}_ambig"
+cur_geno="${cur_geno}_ambig"
+
+# filtering unreliable regions
+cat ~/regions_to_exclude/longrange_ld.txt ~/regions_to_exclude/mhc_region.txt > ~/regions_to_exclude/all_exclude_regions.txt
+
+~/plink --bfile "${cur_geno}" \
+  --exclude 'range' ~/regions_to_exclude/all_exclude_regions.txt \
+  --make-bed \
+  --out "${cur_geno}_exclude_regions"
+cur_geno="${cur_geno}_exclude_regions"
+
+~/plink --bfile "${cur_geno}" \
+  --indep-pairwise 200 100 0.2 \
+  --make-bed \
+  --out "${cur_geno}_LD_1"
+cur_geno="${cur_geno}_LD_1"
+
+~/plink --bfile "${cur_geno}" \
+  --indep-pairwise 200 100 0.2 \
+  --make-bed \
+  --out "${cur_geno}_2"
+cur_geno="${cur_geno}_2"
+```
+#### Select appropriate 1000G population
+```{bash}
+# All asian european and african samples
+mkdir 1000G_data
+awk '$3 == "EUR" || $3 == "EAS" || $3 == "SAS" || $3 == "AFR" { print $1}' $HOME/1000G_variants/integrated_call_samples_v3.20130502.ALL.panel  > $HOME/1000G_variants/eur_asn_afr_samples.txt
+~/plink2  --pfile ~/1000G_plink/all_phase3 \
+  --max-alleles 2 \
+  --out 1000G_data/all_phase3_EUR_ASN_AFR
+cur_geno="1000G_data/all_phase3_EUR_ASN_AFR"
+~/plink  --bfile "${cur_geno}"\
+  --autosome \
+  --make-bed \
+  --out "${cur_geno}_autosome"
+cur_geno="${cur_geno}_autosome"
+
+~/plink --bfile "${cur_geno}" \
+  --maf 0.05 \
+  --out "${cur_geno}_maf"
+cur_geno="${cur_geno}_maf"
+
+cat "${cur_geno}".bim | grep -E "A.*T|T.*A|G.*C|C.*G" > tmp_ambiguous.txt
+~/plink --bfile "${cur_geno}" \
+  --exclude tmp_ambiguous.txt \
+  --make-bed \
+  --out "${cur_geno}_ambig"
+cur_geno="${cur_geno}_ambig"
+
+~/plink --bfile "${cur_geno}" \
+  --exclude 'range' data/all_exclude_regions.txt \
+  --make-bed \
+  --out "${cur_geno}_exclude_regions"
+cur_geno="${cur_geno}_exclude_regions"
+
+~/plink --bfile "${cur_geno}" \
+  --indep-pairwise 200 100 0.2 \
+  --make-bed \
+  --out "${cur_geno}_LD_1"
+cur_geno="${cur_geno}_LD_1"
+
+~/plink --bfile "${cur_geno}" \
+  --indep-pairwise 200 100 0.2 \
+  --make-bed \
+  --out "${cur_geno}_2"
+cur_geno="${cur_geno}_2"
+
+~/plink  --bfile "${cur_geno}" \
+  --pca \
+  --out "${cur_geno}"
+```
+
+#### PCA analysis
+
+```{bash}
+cur_geno="/home1/NEURO/casazza/DIGPD_pre_qc/digpd_alleleupdate_snpcall_maf01_mind02_sex_check_autosome_dedup_ambig_exclude_regions_LD_1_2"
+~/plink --bfile "${cur_geno}" \
+  --pca \
+  --out "${cur_geno}"
+```
+##### Plotting PC pairs
+
+Age:
+```{r}
+library(RColorBrewer)
+pcs_robinson <- read.delim("/home1/NEURO/casazza/DIGPD_pre_qc/digpd_alleleupdate_snpcall_maf01_mind02_sex_check_autosome_dedup_ambig_exclude_regions_LD_1_2.eigenvec", sep="",stringsAsFactors = F, header = F)
+annotated_pcs_robinson  <- pcs_robinson %>% full_join(metadata,by=c("V1"="FID","V2"="IID"))
+colnames(annotated_pcs_robinson)[3:22] <- paste0("PC",1:20)
+age_pairs <- ggpairs(annotated_pcs_robinson, aes(color=as.factor(ethnicity)), columns = c("Age",colnames(annotated_pcs_robinson)[3:13])) 
+lapply(2:11, function(x) getPlot(age_pairs,x,1))
+```
+
+
+Pairs of PCs:
+```{r}
+
+all_pairs <-ggpairs(annotated_pcs_robinson %>% replace_na(list(ethnicity="unknown")), aes(color=as.factor(ethnicity)), columns = 3:8) 
+plot_idx <- 1:5
+plot_idx2 <- 2:6
+lapply(1:5, function(x) getPlot(all_pairs,plot_idx2[x],plot_idx[x])+ scale_color_brewer(palette = "Paired"))
+all_pairs <-ggpairs(annotated_pcs_robinson , aes(color = as.factor(ethnicity)), columns = 3:8) 
+plot_idx <- 1:5
+plot_idx2 <- 2:6
+lapply(1:5, function(x) getPlot(all_pairs,plot_idx2[x],plot_idx[x])+ scale_color_brewer(palette = "Paired"))
+
+```
+
+
+```{r}
+pc_1kg <- read.delim("1000G_data/all_phase3_EUR_ASN_AFR_exclude_regions_LD_1_2.eigenvec", sep="", stringsAsFactors = F, header = F)
+panel <- read.delim("~/1000G_variants/integrated_call_samples_v3.20130502.ALL.panel", sep = "", stringsAsFactors = F, header = F)
+annotated_pcs_1kg <- left_join(pc_1kg,panel,by = c("V2"="V1"))
+colnames(annotated_pcs_1kg)[3:22] <- paste0("PC",1:20)
+all_pairs <-ggpairs(annotated_pcs_1kg, aes(color=V3.y), columns = 3:8) 
+plot_idx <- 1:5
+plot_idx2 <- 2:6
+lapply(1:5, function(x) getPlot(all_pairs,plot_idx2[x],plot_idx[x]))
+
+```
+#### PCA ON MERGED DATA
+**steps**
+* merge 1KG and my data to the subset of shared SNPs
+* compute PCA on whole dataset
+* find populations/subpopulations that best capture my reported groups
+* map my samples to these populations by their distance to these groups
+
+First merge samples from 1kg with my own:
+```{bash}
+
+cur_geno="/home/BCRICWH.LAN/wcasazza/predixcan_genotyping_qc/data/all_genotypes_snpcall_maf01_mind02_sex_check_autosome_dedup_exclude_regions"
+~/plink --bfile "$cur_geno" \
+  --bmerge 1000G_data/all_phase3_EUR_ASN_AFR_exclude_regions_LD_1_2 \
+  --make-bed \
+  --out merged
+
+```
+
+
+
+resolve flipping:
+```{bash}
+source1="/home/BCRICWH.LAN/wcasazza/predixcan_genotyping_qc/data/all_genotypes_snpcall_maf01_mind02_sex_check_autosome_dedup_exclude_regions_LD_1_2"
+source2="1000G_data/all_phase3_EUR_ASN_AFR_exclude_regions_LD_1_2"
+
+~/plink --bfile $source1 --exclude merged-merge.missnp --make-bed --out source1_tmp
+
+~/plink --bfile $source2 --exclude merged-merge.missnp --make-bed --out source2_tmp
+
+~/plink --bfile source1_tmp --bmerge source2_tmp --make-bed --out merged_tmp
+
+~/plink --bfile merged_tmp \
+    --list-duplicate-vars 'require-same-ref' 'ids-only' 'suppress-first'\
+    --out merged_tmp
+
+~/plink --bfile merged_tmp \
+  --exclude merged_tmp.dupvar \
+  --snps-only \
+  --make-bed \
+  --out merged
+rm source1_tmp.*
+
+rm source2_tmp.*
+rm merged_tmp.*
+```
+
+Compute PCs on merged data:
+```{bash}
+~/plink --bfile merged \
+  --pca \
+  --out 1000G_data/merged_robinson_EUR_ASN_AFR
+```
+
+plot:
+```{r}
+merged_pcs <- read.delim("1000G_data/merged_robinson_EUR_ASN_AFR.eigenvec", sep="", stringsAsFactors = F, header = F)
+ethnicity_map <- rbind(
+  annotated_pcs_robinson %>% select(V2,Maternal_ethnicity) %>% mutate(subpop=NA) %>% rename(ethnicity=Maternal_ethnicity),
+  annotated_pcs_1kg %>% select(V2, V3.y,V2.y) %>% rename(ethnicity=V3.y, subpop=V2.y)
+)
+merged_pcs <- left_join(merged_pcs,ethnicity_map,by="V2")
+colnames(merged_pcs)[3:22] <- paste0("PC",1:20)
+
+all_pairs <-ggpairs(merged_pcs %>% filter(ethnicity != "Other", ethnicity != "Unknown"), aes(color=ethnicity), columns = 3:8) 
+plot_idx <- 1:5
+plot_idx2 <- 2:6
+lapply(1:5, function(x) getPlot(all_pairs,plot_idx2[x],plot_idx[x])+ scale_color_brewer(palette = "Paired"))
+
+```
+
+##### flashPCA
+
+ensure 1KG snps and my SNPs that I'm running on are encoded EXACTLY the same:
+```{r}
+snps_1kg <- fread("1000G_data/all_phase3_EUR_ASN_AFR_exclude_regions_LD_1_2.bim", header=F)
+my_snps <-  fread("data/all_genotypes_snpcall_maf01_mind02_sex_check_autosome_dedup_exclude_regions_LD_1_2.bim", header=F)
+sum(my_snps$V2 %in% snps_1kg$V2)
+write.csv(my_snps$V2[my_snps$V2 %in% snps_1kg$V2], "common_snps.txt",quote=F,row.names=F,col.names = F)
+```
+```{bash}
+~/plink --bfile 1000G_data/all_phase3_EUR_ASN_AFR_exclude_regions_LD_1_2  --extract common_snps.txt --make-bed --out common_snps_1kg
+~/plink --bfile data/all_genotypes_snpcall_maf01_mind02_sex_check_autosome_dedup_exclude_regions --extract common_snps.txt --reference-allele common_snps_1kg.bim --make-bed --out common_snps_my_data
+```
+
+
+```{bash}
+~/flashpca_x86-64 --bfile common_snps_1kg --outmeansd meansd.txt --outload loadings.txt
+```
+
+
+
+```{bash}
+~/flashpca_x86-64 --bfile common_snps_my_data --project --inmeansd meansd.txt --inload loadings.txt --outproj projected_my_data.txt
+```
+
+###### Plotting
+```{r}
+pc_dat <- rbind(
+    read.delim("projected_my_data.txt", stringsAsFactors = F),
+    read.delim("pcs.txt", stringsAsFactors = F)
+  ) %>%
+  left_join(
+    ethnicity_map,
+    by=c("IID"="V2")
+  )
+pc_dat$PC1 = -pc_dat$PC1
+pc_dat$PC2 = -pc_dat$PC2
+all_pairs <-ggpairs(pc_dat %>% filter(ethnicity != "Other", ethnicity != "Unknown"), aes(color=ethnicity), columns = 3:8) 
+plot_idx <- 1:5
+plot_idx2 <- 2:6
+lapply(1:5, function(x) getPlot(all_pairs,plot_idx2[x],plot_idx[x])+ scale_color_brewer(palette = "Paired"))
+
+```
+
+
+
+```{r}
+cmp_pc <- merged_pcs %>% left_join(pc_dat, by=c("V1"="FID","V2"="IID"))
+cor(cmp_pc$PC5.x,-cmp_pc$PC5.y)
+```
+
+
+
+###### Peter's protocol
+
+* merge snps
+* pre-pca QC
+* restrict to shared snps
+* run PCA
+* map populations for my samples
+####### Merge
+```{bash}
+cur_geno="/home/BCRICWH.LAN/wcasazza/predixcan_genotyping_qc/data/all_genotypes_snpcall_maf01_mind02_sex_check"
+~/plink2  --pfile ~/1000G_plink/all_phase3 \
+  --keep ~/1000G_variants/eur_asn_afr_samples.txt \
+  --snps-only \
+  --autosome \
+  --max-alleles 2\
+  --make-bed \
+  --out ~/1000G_plink/all_phase3_EUR_ASN_AFR_subset
+~/plink --bfile "$cur_geno" \
+  --bmerge ~/1000G_plink/all_phase3_EUR_ASN_AFR_subset \
+  --make-bed \
+  --out merged_pca
+```
+
+
+```{bash}
+source1="/home/BCRICWH.LAN/wcasazza/predixcan_genotyping_qc/data/all_genotypes_snpcall_maf01_mind02_sex_check"
+source2="${HOME}/1000G_plink/all_phase3_EUR_ASN_AFR_subset"
+
+~/plink --bfile $source1 --exclude merged_pca-merge.missnp --make-bed --out source1_tmp
+
+~/plink --bfile $source2 --exclude merged_pca-merge.missnp --make-bed --out source2_tmp
+
+~/plink --bfile source1_tmp --bmerge source2_tmp --make-bed --out merged_tmp
+
+~/plink --bfile merged_tmp \
+    --list-duplicate-vars 'require-same-ref' 'ids-only' 'suppress-first'\
+    --out merged_tmp
+
+~/plink --bfile merged_tmp \
+  --exclude merged_tmp.dupvar \
+  --snps-only \
+  --make-bed \
+  --out merged_pca
+rm source1_tmp.*
+
+rm source2_tmp.*
+rm merged_tmp.*
+```
+
+######## pre-PCA QC
+```{bash}
+cur_geno="$HOME/predixcan_genotyping_qc/merged_pca"
+
+~/plink  --bfile "${cur_geno}"\
+  --autosome \
+  --snps-only \
+  --make-bed \
+  --out "${cur_geno}_autosome"
+cur_geno="${cur_geno}_autosome"
+
+~/plink --bfile "${cur_geno}" \
+  --maf 0.05 \
+  --make-bed \
+  --out "${cur_geno}_maf"
+cur_geno="${cur_geno}_maf"
+
+cat "${cur_geno}".bim | grep -E "A.*T|T.*A|G.*C|C.*G" > tmp_ambiguous.txt
+~/plink --bfile "${cur_geno}" \
+  --exclude tmp_ambiguous.txt \
+  --make-bed \
+  --out "${cur_geno}_ambig"
+cur_geno="${cur_geno}_ambig"
+
+~/plink --bfile "${cur_geno}" \
+  --exclude 'range' data/all_exclude_regions.txt \
+  --make-bed \
+  --out "${cur_geno}_exclude_regions"
+cur_geno="${cur_geno}_exclude_regions"
+
+~/plink --bfile "${cur_geno}" \
+  --indep-pairwise 200 100 0.2 \
+  --make-bed \
+  --out "${cur_geno}_LD_1"
+cur_geno="${cur_geno}_LD_1"
+
+~/plink --bfile "${cur_geno}" \
+  --indep-pairwise 200 100 0.2 \
+  --make-bed \
+  --out "${cur_geno}_2"
+cur_geno="${cur_geno}_2"
+
+```
+######## PCA 
+**Steps**
+1. exclude snps unique to 1KG and unique to my data
+2. compute 10 PCs on 1KG
+3. project my data onto 1KG
+4. map my samples to closest super-sub population depending on group size
+```{r}
+snps_1kg <- fread("~/1000G_plink/all_phase3_EUR_ASN_AFR_subset.bim", header=F)
+my_snps <-  fread("data/all_genotypes_snpcall_maf01_mind02_sex_check.bim", header=F)
+sum(my_snps$V2 %in% snps_1kg$V2)
+fwrite(my_snps[my_snps$V2 %in% snps_1kg$V2,.(V2)], "common_snps_v2.txt",quote=F,row.names=F,col.names = F)
+```
+```{bash}
+fam_1kg="${HOME}/1000G_plink/all_phase3_EUR_ASN_AFR_subset.fam"
+fam_robinson="${HOME}/predixcan_genotyping_qc/data/all_genotypes_snpcall_maf01_mind02_sex_check.fam"
+cur_geno="${HOME}/predixcan_genotyping_qc/merged_pca_autosome_maf_ambig_exclude_regions_LD_1_2"
+
+~/plink --bfile "${cur_geno}" --remove "${fam_1kg}" --extract common_snps_v2.txt --make-bed --out common_snps_v2_my_data
+~/plink --bfile "${cur_geno}" --remove "${fam_robinson}" --extract common_snps_v2.txt --make-bed --out common_snps_v2_1kg
+```
+
+
+```{bash}
+~/flashpca_x86-64 --bfile common_snps_v2_1kg --outmeansd meansd_v2.txt --outload loadings_v2.txt --outpc 1kg_pcs.txt
+```
+
+
+
+```{bash}
+~/flashpca_x86-64 --bfile common_snps_v2_my_data --project --inmeansd meansd_v2.txt --inload loadings_v2.txt --outproj projected_my_data_v2.txt
+```
+I'm also going to try just PCA on the merged data:
+
+```{bash}
+cur_geno="${HOME}/predixcan_genotyping_qc/merged_pca_autosome_maf_ambig_exclude_regions_LD_1_2"
+~/plink --bfile "${cur_geno}" --extract common_snps_v2.txt --make-bed --out common_snps_v2_all
+~/flashpca_x86-64 --bfile common_snps_v2_all --outpc common_snps_pcs_all.txt
+
+```
+
+
+### Assign to ancestry clusters
+
+##### Mahalanobis distance
+Following protocol in [Peterson et al, 2017](https://onlinelibrary.wiley.com/doi/full/10.1111/ajad.12586) with step to remove subjects that are "too" far from any cluster (mahalanobis distance from cluster center > 4).
+```{r}
+# Read data and merge in ethnicity labels
+pcs_1kg <- read.delim("1kg_pcs.txt")  %>% left_join(ethnicity_map, by = c( "IID"="V2")) %>% unique()
+pcs_my_data <- read.delim("projected_my_data_v2.txt")%>% left_join(ethnicity_map, by = c( "IID"="V2"))  %>% unique()
+# check that excluding mahalanobis> 4 is reasonable
+AFR_mahalanobis <- pc_AFR %>% mutate(d = sqrt(mahalanobis(.,colMeans(.),cov(.))))
+ggplot(AFR_mahalanobis,aes(d)) + geom_histogram() + ggtitle("AFR")
+
+EUR_mahalanobis <- pc_EUR %>% mutate(d = sqrt(mahalanobis(.,colMeans(.),cov(.))))
+ggplot(EUR_mahalanobis,aes(d)) + geom_histogram() + ggtitle("EUR")
+
+EAS_mahalanobis <- pc_EAS %>% mutate(d = sqrt(mahalanobis(.,colMeans(.),cov(.))))
+ggplot(EAS_mahalanobis,aes(d)) + geom_histogram() + ggtitle("EAS")
+
+SAS_mahalanobis <- pc_SAS %>% mutate(d = sqrt(mahalanobis(.,colMeans(.),cov(.))))
+ggplot(SAS_mahalanobis,aes(d)) + geom_histogram() + ggtitle("SAS")
+
+# remove outliers from reference population
+pcs_1kg %>% group_by(ethnicity) %>% summarize_at(vars(contains("PC")), list(~sd(.),~mean(.)))
+pc_EUR <- pcs_1kg %>% 
+  filter(ethnicity== "EUR") %>% 
+  select(contains("PC")) %>% 
+  filter(sqrt(mahalanobis(.,colMeans(.),cov(.))) < 4)
+pc_EAS <- pcs_1kg %>% 
+  filter(ethnicity== "EAS") %>% 
+  select(contains("PC")) %>% 
+  filter(sqrt(mahalanobis(.,colMeans(.),cov(.))) < 4)
+pc_SAS <- pcs_1kg %>% 
+  filter(ethnicity== "SAS") %>% 
+  select(contains("PC")) %>% 
+  filter(sqrt(mahalanobis(.,colMeans(.),cov(.))) < 4)
+pc_AFR <- pcs_1kg %>% 
+  filter(ethnicity== "AFR") %>% 
+  select(contains("PC")) %>% 
+  filter(sqrt(mahalanobis(.,colMeans(.),cov(.))) < 4)
+
+
+
+just_pcs <- pcs_my_data %>% select(contains("PC"))
+assign_cluster <- pcs_my_data %>% mutate(
+    EUR_dist =  sqrt(mahalanobis(just_pcs, colMeans(pc_EUR),cov(pc_EUR))),
+    EAS_dist =  sqrt(mahalanobis(just_pcs, colMeans(pc_EAS),cov(pc_EAS))),
+    SAS_dist =  sqrt(mahalanobis(just_pcs, colMeans(pc_SAS),cov(pc_SAS))),
+    AFR_dist =  sqrt(mahalanobis(just_pcs, colMeans(pc_AFR),cov(pc_AFR)))
+  ) %>%
+   mutate(
+    EUR_sd =  EUR_dist > 4 * sd(EUR_dist),
+    EAS_sd =  EAS_dist > 4 * sd(EAS_dist),
+    SAS_sd =  SAS_dist > 4 * sd(SAS_dist),
+    AFR_sd =  AFR_dist > 4 * sd(AFR_dist)
+  ) %>%
+  filter_at(vars(contains("sd")),all_vars(!.)) %>%
+  pivot_longer(contains("dist")) %>%
+  mutate(name=gsub("_dist","",name)) %>%
+  group_by(FID,IID) %>% 
+  summarize(
+    assigned=name[which.min(value)]
+  )
+reclassified_data <- pcs_my_data %>% left_join(assign_cluster,by=c("FID","IID")) %>% replace_na(list(assigned="excluded"))
+ggplot(reclassified_data, aes(assigned, fill=ethnicity)) + geom_bar(position="dodge") + scale_fill_brewer(palette = "Paired")
+ggplot(reclassified_data, aes(PC1,PC2, color = assigned)) + geom_point() + scale_fill_brewer(palette = "Paired")
+
+ggplot(reclassified_data, aes(PC2,PC3, color = assigned)) + geom_point() + scale_fill_brewer(palette = "Paired")
+ggplot(reclassified_data, aes(PC3,PC4, color = assigned)) + geom_point() + scale_fill_brewer(palette = "Paired")
+ggplot(reclassified_data, aes(PC4,PC5, color = assigned)) + geom_point() + scale_fill_brewer(palette = "Paired")
+ggplot(reclassified_data, aes(PC5,PC6, color = assigned)) + geom_point() + scale_fill_brewer(palette = "Paired")
+sum(reclassified_data$assigned == "excluded")
+
+# write out file for excluding samples as well as cluster file
+write.table(reclassified_data %>% select(FID,IID,assigned) %>% filter(assigned != "excluded"),"my_samples.clst",sep=" ", col.names = F, row.names = F,quote = F)
+```
+Now to assign ancestry groups to original data and remove samples too far from 1KG samples:
+```{bash}
+<!-- cur_geno="/home/BCRICWH.LAN/wcasazza/predixcan_genotyping_qc/data/all_genotypes_snpcall_maf01_mind02_sex_check_autosome_dedup_exclude_regions_LD_1_2" -->
+# remove outlier samples
+~/plink --bfile "${cur_geno}" \
+  --keep my_samples.clst \
+  --make-bed \
+  --out "${cur_geno}_ancestry"
+cur_geno="${cur_geno}_ancestry"
+
+# filtering
+~/plink --bfile "${cur_geno}"\
+  --within my_samples.clst \
+  --maf 0.05 \
+  --indep-pairwise 200 100 0.2 \
+  --fst \
+  --out "${cur_geno}"
+```
+```{r}
+(fst_report <- fread('/home/BCRICWH.LAN/wcasazza/predixcan_genotyping_qc/data/all_genotypes_snpcall_maf01_mind02_sex_check_autosome_dedup_exclude_regions_LD_1_2_ancestry.fst'))
+sum(fst_report$FST > 0.3)
+```
+

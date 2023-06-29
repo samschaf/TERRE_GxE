@@ -1,0 +1,205 @@
+---
+title: "Heritability of DNAm in cis"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+library(data.table)
+library(tidyverse)
+Sys.setlocale("LC_MESSAGES", "en_US.utf8")
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, eval = TRUE, autodep = TRUE)
+```
+*Goals:* Compute the variation in DNAm attributable to additive effects of SNPs.
+Considerations:
+1. Definition of cis: here I'm choosing all variants on a given chromosome as cis to a particular DNAm probe. Something different to consider here would be something like a haplotype block (estimated from 1000G EUR) that contain a particular CpG site, or all SNPs within a specified window around each CpG site. However, DNAm may be affected by SNPs outside of a block. If sample size were larger, it would be ideal to compute heritability using something like all blocks on a given chromosome to estimate cis-heritability of DNAm, or at least multiple blocks flanking and containing the CpG site.
+
+
+## Protocol for this analysis
+1. Compute genetic relationship matrix for each chromosome and generate phenotype and covariate inputs
+2. Compute reml estimate of snp heritability of DNAm for each CpG site
+3. evaluate estimates globally
+4. see how these intersect with CpGs that are significantly differentially methylated with PD
+
+## Generating inputs
+### Computing GRM
+```{bash, eval=FALSE}
+GCTA="$HOME/gcta_1.93.2beta/gcta64"
+DATA="$HOME/genotype_qc/TERRE_QC/raw_data.imputed.r2_30.hard_call.maf_mismatch"
+for i in {1..22}; do
+  $GCTA --bfile $DATA --make-grm-bin --chr $i --out $HOME/analysis_of_pd_dnam/gcta_analysis/terre_grm/chr_$i
+done
+```
+### Phenotype and covariate input
+First load data into namespace:
+```{r, eval = FALSE}
+load("/home1/NEURO/SHARE_DECIPHER/processed_DNAm_data/TERRE/TERRE_betas_combat.RData") # betas_sub
+```
+
+Now format it and write out phenotype and covariate inputs for GREML:
+```{r, eval = FALSE}
+# Match genotyped and methylation samples
+fam_file <- fread("~/genotype_qc/TERRE_QC/raw_data.imputed.r2_30.hard_call.maf_mismatch.fam")[, c(1, 2)]
+head(fam_file)
+metadata <- fread("/home1/NEURO/SHARE_DECIPHER/terre_meta_master.csv")
+metadata[, c("FID", "IID") := gsub("PAE_[0-9]*_[0-9]*_", "", FID)]
+metadata <- metadata[FID %in% fam_file$V1, ]
+ord <- match(metadata$FID, fam_file$V1)
+metadata <- metadata[match(FID, fam_file$V1)]
+head(metadata)
+# metadata <- cbind(metadata,pcs[,-c(1,2)])
+
+pheno <- as.data.frame(t(betas_sub))
+mvals_sub <- log2(betas_sub / (1 - betas_sub))
+pheno_m <- as.data.frame(t(mvals_sub))
+pheno <- as.data.table(cbind(metadata[, .(FID, IID)], pheno[metadata$patient, ]))
+pheno_m <- as.data.table(cbind(metadata[, .(FID, IID)], pheno_m[metadata$patient, ]))
+all(metadata$FID == pheno$FID)
+
+# covariates
+tmp <- t(read.delim("~/cis_mQTL_analyses/terre_data/covariates_9_methy_PC.txt", sep = ""))
+covar <- as.data.frame(apply(tmp[-c(1), ], 2, as.numeric))[ord, ]
+colnames(covar) <- tmp[1, ]
+covar <- cbind(metadata[, .(FID, IID)], covar)
+
+fwrite(covar, "gcta_analysis/terre_covariates.cov", sep = "\t", row.names = F)
+fwrite(pheno, "gcta_analysis/terre_methylation.phen", sep = "\t", row.names = F)
+fwrite(pheno_m, "gcta_analysis/terre_methylation_mvalue.phen", sep = "\t", row.names = F)
+```
+## REML estimates for gene expression in cis
+```{r}
+# see run_cis_heritability.R
+annot <- fread("~/MethylationEPIC_v-1-0_B4.csv", skip = 7, header = T, fill = T)
+```
+
+## Format results
+```{r}
+grab_data <- function(dt, i) {
+  cpg <- dt$geneid[i]
+  chr <- dt$chr[i]
+  fname <- sprintf("~/analysis_of_pd_dnam/gcta_analysis/terre_output/%s_%s.hsq", cpg, chr)
+  if (file.exists(fname)) {
+    tab <- fread(fname, fill = T)
+    data.table(probe = cpg, h2 = tab$Variance[4], SE = tab$SE[4], P = tab$Variance[9])
+  }
+}
+```
+
+```{r, eval=FALSE}
+library(ggrepel)
+tested_cpgs <- fread("gcta_analysis/terre_sig_prs_probe_pos.txt")
+
+h2_prs <- rbindlist(lapply(1:nrow(tested_cpgs), function(i) grab_data(tested_cpgs, i))) %>% left_join(annot, by = c("probe" = "Name"))
+h2_prs$gene <- ifelse(h2_prs$UCSC_RefGene_Name == "", h2_prs$probe, gsub(";.*", "", h2_prs$UCSC_RefGene_Name))
+h2_prs$probe <- factor(h2_prs$probe, levels = h2_prs$probe[order(h2_prs$h2)])
+ggplot(h2_prs, aes(probe, h2, ymin = h2 - SE, ymax = h2 + SE, label = gene)) +
+  geom_bar(stat = "identity") +
+  geom_errorbar(width = 0.2) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 1)) +
+  geom_text(hjust = 0, vjust = 0, size = 3) +
+  coord_flip(ylim = c(0, 1)) +
+  ggtitle(bquote(h[SNP]^2 ~ "for" ~ "PRS" ~ "associated" ~ "DNAm"))
+```
+
+```{r, eval = FALSE}
+many_cpgs <- fread("~/cis_mQTL_analyses/terre_data/probe_pos.txt")[chr != "chrX"]
+h2_many <- rbindlist(lapply(1:nrow(many_cpgs), function(i) grab_data(many_cpgs, i))) %>% left_join(annot, by = c("probe" = "Name"))
+# h2_many$gene <- ifelse(h2_many$UCSC_RefGene_Name == "",h2_many$probe,gsub(";.*","",h2_many$UCSC_RefGene_Name))
+h2_many$probe <- factor(h2_many$probe, levels = h2_many$probe[order(h2_many$h2)])
+ggplot(h2_many, aes(probe, h2, ymin = h2 - SE, ymax = h2 + SE)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(axis.text.y = element_blank()) +
+  coord_flip(ylim = c(0, 1)) +
+  ggtitle(bquote(h[SNP]^2 ~ "for" ~ "many" ~ "associated" ~ "DNAm"))
+num_estimated <- nrow(h2_many[h2 - SE >= 0])
+num_perc <- nrow(h2_many[h2 > 0.01])
+ggplot(h2_many[h2 - SE >= 0], aes(h2)) +
+  geom_histogram(bins = 200) +
+  theme_minimal() +
+  ggtitle("Distribution of Cis-heritability (SE doesn't overlap 0)")
+ggplot(h2_many[h2 > 0.01], aes(h2)) +
+  geom_histogram(bins = 200) +
+  theme_minimal() +
+  ggtitle("Distribution of Cis-heritability (h2 > 1e-2)")
+```
+```{r,eval = FALSE}
+dmr_cpgs <- fread("gcta_analysis/terre_sig_DMR_sex_stratified.txt")
+h2_dmr <- rbindlist(lapply(1:nrow(dmr_cpgs), function(i) grab_data(dmr_cpgs, i))) %>% left_join(annot, by = c("probe" = "Name"))
+h2_dmr$gene <- ifelse(h2_dmr$UCSC_RefGene_Name == "", h2_dmr$probe, gsub(";.*", "", h2_dmr$UCSC_RefGene_Name))
+h2_dmr$probe <- factor(h2_dmr$probe, levels = h2_dmr$probe[order(h2_dmr$h2)])
+ggplot(h2_dmr, aes(probe, h2, ymin = h2 - SE, ymax = h2 + SE, label = gene)) +
+  geom_bar(stat = "identity") +
+  geom_errorbar(width = 0.2) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 1)) +
+  geom_text(hjust = 0, vjust = 0, size = 3) +
+  coord_flip(ylim = c(0, 1)) +
+  ggtitle(bquote(h[SNP]^2 ~ "for" ~ "DMR" ~ "associated" ~ "DNAm"))
+ggplot(h2_dmr[h2 - SE >= 0], aes(probe, h2, ymin = h2 - SE, ymax = h2 + SE, label = gene)) +
+  geom_bar(stat = "identity") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 0, vjust = 0)) +
+  geom_text(hjust = 0, vjust = 0.5, size = 2) +
+  coord_flip(ylim = c(0, 1.1)) +
+  ggtitle(bquote(h[SNP]^2 ~ "for" ~ "DMR" ~ "associated" ~ "DNAm" ~ "nonzero"))
+```
+```{r}
+ggplot(h2_dmr[h2 > 0.01], aes(h2)) +
+  geom_histogram(bins = 50) +
+  ggtitle("Distribution of Cis-heritability (h2 > 1e-2)") +
+  theme_minimal()
+```
+## Smaller window (75kb) on M-Values
+
+```{r}
+library(parallel)
+grab_data <- function(cpg) {
+  fname <- sprintf("~/analysis_of_pd_dnam/gcta_analysis/terre_output/%s.hsq", cpg)
+  if (file.exists(fname)) {
+    tab <- fread(fname, fill = T)
+    data.table(probe = cpg, h2 = tab$Variance[4], SE = tab$SE[4], P = tab$Variance[8])
+  }
+}
+if (file.exists("terre_heritability_150kb_mvalue.txt")) {
+  h2_mvalue <- fread("terre_heritability_150kb_mvalue.txt")
+} else {
+  computed <- gsub(".hsq", "", dir("gcta_analysis/terre_output/"))
+  h2_mvalue <- rbindlist(mclapply(computed, function(cpg) grab_data(cpg), mc.cores = 32)) %>% left_join(annot, by = c("probe" = "Name"))
+  fwrite(h2_mvalue, "terre_heritability_150kb_mvalue.txt", sep = "\t", row.names = F)
+}
+ggplot(h2_mvalue[P < 0.05], aes(h2)) +
+  geom_histogram(binwidth = 0.05)
+```
+
+
+## Exploring heritability
+```{r}
+summary(h2_mvalue[P < 0.05]$h2)
+length(h2_mvalue[P < 0.05]$h2)
+summary(h2_mvalue[P < 0.05 & Methyl450_Loci]$h2)
+```
+Calculating number of SNPs in window around CpG site:
+```{r}
+snps <- fread("../prs_ewas_integration/cis_mQTL_analyses/terre_data/snp_pos.txt")
+probes <- fread("../prs_ewas_integration/cis_mQTL_analyses/terre_data/probe_pos.txt")
+num_cis <- function(cpg) {
+  i <- which(probes$geneid == cpg)
+  s1 <- probes$s1[i]
+  s2 <- probes$s2[i]
+  chr <- probes$chr[i]
+  nrow(snps[chr, on = "CHR"][(POS >= s1 - 75000 & POS <= s2 + 75000)])
+}
+h2_mvalue_sig <- h2_mvalue[P < 0.05]
+h2_mvalue_sig[, c("n_cis_snps") := unlist(mclapply(h2_mvalue_sig$probe, num_cis, mc.cores = 50))]
+fwrite(h2_mvalue_sig, "terre_heritability_150kb_mvalue_sig.txt", sep = "\t", quote = F, row.names = F)
+```
+```{r, eval=TRUE}
+h2_mvalue_sig <- fread("terre_heritability_150kb_mvalue_sig.txt")
+ggplot(h2_mvalue_sig, aes(h2)) +
+  geom_histogram(bins = 100)
+ggplot(h2_mvalue_sig, aes(n_cis_snps)) +
+  geom_histogram(bins = 100) +
+  coord_cartesian(xlim = c(0, 3000)) +
+  scale_x_continuous(breaks = seq(0, 3000, 250))
+```

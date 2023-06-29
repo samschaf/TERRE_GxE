@@ -1,0 +1,231 @@
+---
+title: "Clean terre DMR breakdown"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(data.table)
+Sys.setlocale("LC_MESSAGES", "en_US.utf8")
+knitr::opts_chunk$set(echo = TRUE, cache = FALSE, eval = TRUE, autodep = TRUE)
+```
+
+# Process for whole- model testing
+- Step 1: read in data, run multiple test correction
+- step 2: remove those which don't pass a significance threshold
+- step 3: rank by AIC
+Loading in all experiments
+```{r}
+f_dmrs <- fread("/home1/NEURO/SHARE_DECIPHER/DMRs/TERRE/sig.cpgs.TERRE.F.HT.ancestry.csv")[abs(meanbetafc) >= 0.03]
+m_dmrs <- fread("/home1/NEURO/SHARE_DECIPHER/DMRs/TERRE/sig.cpgs.TERRE.M.HT.ancestry.csv")[abs(meanbetafc) >= 0.03]
+males_pd <- rbindlist(
+  lapply(
+    Sys.glob("male_terre_pd_f_*_dnam_breakdown.txt.gz"),
+    function(f) fread(f, fill = TRUE)
+  ),
+  fill = TRUE
+)[cpg %in% m_dmrs$cpg]
+males_pd[, `:=`(f_q = p.adjust(f_p, method = "BH")), by = c("model", "env")]
+females_pd <- rbindlist(
+  lapply(
+    Sys.glob("female_terre_pd_f_*_dnam_breakdown.txt.gz"),
+    function(f) fread(f, fill = TRUE)
+  ),
+  fill = TRUE
+)[cpg %in% f_dmrs$cpg]
+females_pd[, `:=`(f_q = p.adjust(f_p, method = "BH")), by = c("model", "env")]
+```
+
+Filtering data by:
+```{r}
+males_pd_sig <- males_pd[f_q < 0.05]
+females_pd_sig <- females_pd[f_q < 0.05]
+```
+aic ranking
+```{r}
+males_aic <- males_pd_sig[, .SD[which.min(aic)], by = "cpg"]
+females_aic <- females_pd_sig[, .SD[which.min(aic)], by = "cpg"]
+```
+
+```{r}
+males_aic[m_dmrs, on = .(cpg)]
+females_aic[f_dmrs, on = .(cpg)]
+males_aic$Sex <- "Male"
+females_aic$Sex <- "Female"
+ggplot(rbind(males_aic, females_aic), aes(model, fill = Sex)) +
+  geom_bar(position = "dodge") +
+  geom_text(stat = "count", aes(label = ..count..), position = position_dodge(width = 0.9), vjust = 0) +
+  scale_fill_manual(values = c("Male" = "lightblue2", "Female" = "pink")) +
+  theme_minimal()
+f_dmrs$Sex <- "Female"
+m_dmrs$Sex <- "Male"
+all_dmr <- rbind(m_dmrs, f_dmrs)
+all_aic <- rbind(males_aic, females_aic)
+to_plot <- all_aic[all_dmr, on = .(cpg, Sex), nomatch = 0]
+ggplot(to_plot[!duplicated(paste0(dmr, model, Sex))], aes(model, fill = Sex)) +
+  geom_bar(position = "dodge") +
+  geom_text(stat = "count", aes(label = ..count..), position = position_dodge(width = 0.9), vjust = 0) +
+  scale_fill_manual(values = c("Male" = "lightblue2", "Female" = "pink")) +
+  theme_minimal()
+```
+## Effect size comparisons
+Take all significant models, compare G vs E vs GxE effect sizes:
+```{r}
+males_pd_sig[, .(.N, uniqueN(cpg)), by = "model"]
+females_pd_sig[, .(.N, uniqueN(cpg)), by = "model"]
+```
+```{r}
+plt <- VennDiagram::venn.diagram(
+  lapply(split(males_pd_sig, by = "model"), function(dt) dt$cpg),
+  filename = NULL
+)
+grid::grid.newpage()
+grid::grid.draw(plt)
+
+plt <- VennDiagram::venn.diagram(
+  lapply(split(females_pd_sig, by = "model"), function(dt) dt$cpg),
+  filename = NULL
+)
+grid::grid.newpage()
+grid::grid.draw(plt)
+
+plt <- VennDiagram::venn.diagram(
+  lapply(split(males_pd_sig, by = "model"), function(dt) dt$SNP),
+  filename = NULL
+)
+grid::grid.newpage()
+grid::grid.draw(plt)
+
+plt <- VennDiagram::venn.diagram(
+  lapply(split(females_pd_sig, by = "model"), function(dt) dt$SNP),
+  filename = NULL
+)
+grid::grid.newpage()
+grid::grid.draw(plt)
+```
+## Effects in GxE set
+```{r}
+library(ggpubr)
+gxe_males_pd <- males_pd[model == "GxE"]
+gxe_males_pd[, `:=`(G_q = p.adjust(Gp, method = "fdr"), E_q = p.adjust(Ep, method = "fdr"), GxE_q = p.adjust(GxEp, method = "fdr")), by = c("env")]
+gxe_males_pd <- gxe_males_pd[f_q < 0.05]
+
+gxe_males_pd[, .(uniqueN(cpg[G_q < 0.05]), uniqueN(cpg[E_q < 0.05]), uniqueN(cpg[GxE_q < 0.05]))]
+gxe_male_sig_G_count <- table(gxe_males_pd[G_q < 0.05][, .(cpg, env)]) # counts of SNPs with significant effects per cpg,env
+
+gxe_males_pd[G_q < 0.05][!duplicated(cpg)]
+sig_male_e <- gxe_males_pd[E_q < 0.05]
+sig_male_e[!duplicated(sig_male_e[, .(env, cpg)])]
+
+gxe_females_pd <- females_pd[model == "GxE"]
+gxe_females_pd[, `:=`(G_q = p.adjust(Gp, method = "fdr"), E_q = p.adjust(Ep, method = "fdr"), GxE_q = p.adjust(GxEp, method = "fdr")), by = c("env")]
+gxe_females_pd <- gxe_females_pd[f_q < 0.05]
+
+gxe_females_pd[, .(uniqueN(cpg[G_q < 0.05]), uniqueN(cpg[E_q < 0.05]), uniqueN(cpg[GxE_q < 0.05]))]
+gxe_female_sig_G_count <- table(gxe_females_pd[G_q < 0.05][, .(cpg, env)]) # counts of SNPs with significant effects per cpg,env
+
+gxe_females_pd[G_q < 0.05][!duplicated(cpg)]
+gxe_females_pd[E_q < 0.05]
+```
+```{r}
+ggboxplot(
+  melt(gxe_males_pd[, .SD[which.min(aic)], by = "cpg"][, .(G = abs(Gest), E = abs(Eest), GxE = abs(GxEest))], value.name = "Estimate", variable.name = "Coefficient"),
+  x = "Coefficient", y = "Estimate", outlier.shape = NA, fill = "lightblue2"
+) +
+  coord_cartesian(ylim = c(0, 1)) +
+  stat_compare_means(
+    paired = TRUE, label.y = -0.5, method.args = list(alternative = "g"), tip.length = 0.01, step.increase = 0.012,
+    comparisons = list(c("G", "E"), c("G", "GxE"), c("E", "GxE"))
+  )
+compare_means(
+  Estimate ~ Coefficient,
+  paired = TRUE,
+  melt(gxe_males_pd[, .SD[which.min(aic)], by = "cpg"][, .(G = abs(Gest), E = abs(Eest), GxE = abs(GxEest))], value.name = "Estimate", variable.name = "Coefficient"),
+  alternative = "l", method = "wilcox"
+)
+kruskal.test(melt(gxe_males_pd[, .SD[which.min(aic)], by = "cpg"][, .(G = abs(Gest), E = abs(Eest), GxE = abs(GxEest))], value.name = "Estimate", variable.name = "Coefficient"))
+
+ggboxplot(
+  melt(gxe_females_pd[, .SD[which.min(aic)], by = "cpg"][, .(G = abs(Gest), E = abs(Eest), GxE = abs(GxEest))], value.name = "Estimate", variable.name = "Coefficient"),
+  x = "Coefficient", y = "Estimate", outlier.shape = NA, fill = "pink"
+) +
+  coord_cartesian(ylim = c(0, 1.5)) +
+  stat_compare_means(paired = TRUE, label.y = -14., method.args = list(alternative = "l"), tip.length = 0.0005, step.increase = 0.0006, comparisons = list(c("G", "E"), c("G", "GxE"), c("E", "GxE")))
+compare_means(Estimate ~ Coefficient, paired = TRUE, melt(gxe_females_pd[, .SD[which.min(aic)], by = "cpg"][, .(G = abs(Gest), E = abs(Eest), GxE = abs(GxEest))], value.name = "Estimate", variable.name = "Coefficient"), alternative = "g")
+kruskal.test(melt(gxe_females_pd[, .SD[which.min(aic)], by = "cpg"][, .(G = abs(Gest), E = abs(Eest), GxE = abs(GxEest))], value.name = "Estimate", variable.name = "Coefficient"))
+```
+
+### scale of differences per model @TODO GxE
+
+```{r}
+gxe_males_pd[, `:=`(Zge = (abs(Gest) - abs(Eest)) / sqrt(Gse^2 + Ese^2))]
+gxe_males_pd[, `:=`(Zp = 2 * (pnorm(-abs(Zge))))]
+gxe_males_pd[, `:=`(Z_q = p.adjust(Zp, method = "fdr")), by = c("env")]
+
+gxe_males_pd[, `:=`(Zgxe = (abs(Gest) - abs(GxEest)) / sqrt(Gse^2 + GxEse^2))]
+gxe_males_pd[, `:=`(Zgxep = 2 * (pnorm(-abs(Zgxe))))]
+gxe_males_pd[, `:=`(Zgxe_q = p.adjust(Zgxep, method = "fdr")), by = c("env")]
+
+gxe_males_pd[, `:=`(Zegxe = (abs(Eest) - abs(GxEest)) / sqrt(Ese^2 + GxEse^2))]
+gxe_males_pd[, `:=`(Zegxep = 2 * (pnorm(-abs(Zegxe))))]
+gxe_males_pd[, `:=`(Zegxe_q = p.adjust(Zegxep, method = "fdr")), by = c("env")]
+
+gxe_females_pd[, `:=`(Zge = (abs(Gest) - abs(Eest)) / sqrt(Gse^2 + Ese^2))]
+gxe_females_pd[, `:=`(Zp = 2 * (pnorm(-abs(Zge))))]
+gxe_females_pd[, `:=`(Z_q = p.adjust(Zp, method = "fdr")), by = c("env")]
+
+gxe_females_pd[, `:=`(Zgxe = (abs(Gest) - abs(GxEest)) / sqrt(Gse^2 + GxEse^2))]
+gxe_females_pd[, `:=`(Zgxep = 2 * (pnorm(-abs(Zgxe))))]
+gxe_females_pd[, `:=`(Zgxe_q = p.adjust(Zgxep, method = "fdr")), by = c("env")]
+
+gxe_females_pd[, `:=`(Zegxe = (abs(Eest) - abs(GxEest)) / sqrt(Ese^2 + GxEse^2))]
+gxe_females_pd[, `:=`(Zegxep = 2 * (pnorm(-abs(Zegxe))))]
+gxe_females_pd[, `:=`(Zegxe_q = p.adjust(Zegxep, method = "fdr")), by = c("env")]
+```
+
+```{r}
+gxe_males_pd[Z_q < 0.05, .(hits = uniqueN(cpg), paste0(unique(cpg), collapse = ",")), by = "env"]
+gxe_females_pd[Z_q < 0.05, .(hits = uniqueN(cpg), paste0(unique(cpg), collapse = ",")), by = "env"]
+gxe_males_pd[Z_q < 0.05]
+gxe_females_pd[Z_q < 0.05]
+unique(gxe_males_pd[Z_q < 0.05]$cpg)
+unique(gxe_females_pd[Z_q < 0.05]$cpg)
+m_dmrs[cpg %in% unique(gxe_males_pd[Z_q < 0.05]$cpg)]
+f_dmrs[cpg %in% unique(gxe_females_pd[Z_q < 0.05]$cpg)]
+```
+
+```{r}
+gxe_males_pd[Zgxe_q < 0.05, .(hits = uniqueN(cpg), paste0(unique(cpg), collapse = ",")), by = "env"]
+gxe_females_pd[Zgxe_q < 0.05, .(hits = uniqueN(cpg), paste0(unique(cpg), collapse = ",")), by = "env"]
+gxe_males_pd[Zgxe_q < 0.05]
+gxe_females_pd[Zgxe_q < 0.05]
+unique(gxe_males_pd[Zgxe_q < 0.05]$cpg)
+unique(gxe_females_pd[Zgxe_q < 0.05]$cpg)
+m_dmrs[cpg %in% unique(gxe_males_pd[Zgxe_q < 0.05]$cpg)]
+f_dmrs[cpg %in% unique(gxe_females_pd[Zgxe_q < 0.05]$cpg)]
+```
+```{r}
+gxe_males_pd[Zegxe_q < 0.05, .(hits = uniqueN(cpg), paste0(unique(cpg), collapse = ",")), by = "env"]
+gxe_females_pd[Zegxe_q < 0.05, .(hits = uniqueN(cpg), paste0(unique(cpg), collapse = ",")), by = "env"]
+gxe_males_pd[Zegxe_q < 0.05]
+gxe_females_pd[Zegxe_q < 0.05]
+unique(gxe_males_pd[Zegxe_q < 0.05]$cpg)
+unique(gxe_females_pd[Zegxe_q < 0.05]$cpg)
+m_dmrs[cpg %in% unique(gxe_males_pd[Zegxe_q < 0.05]$cpg)]
+f_dmrs[cpg %in% unique(gxe_females_pd[Zegxe_q < 0.05]$cpg)]
+```
+
+```{r}
+ggboxplot(rbindlist(list(Male = gxe_males_pd[, .(Zge)], Female = gxe_females_pd[, .(Zge)]), idcol = "Sex"), x = "Sex", y = "Zge", fill = "Sex") +
+  scale_fill_manual(values = c(Male = "lightblue2", Female = "pink")) +
+  stat_compare_means()
+
+ggboxplot(rbindlist(list(Male = gxe_males_pd[, .(Zgxe)], Female = gxe_females_pd[, .(Zgxe)]), idcol = "Sex"), x = "Sex", y = "Zgxe", fill = "Sex") +
+  scale_fill_manual(values = c(Male = "lightblue2", Female = "pink")) +
+  stat_compare_means()
+
+ggboxplot(rbindlist(list(Male = gxe_males_pd[, .(Zegxe)], Female = gxe_females_pd[, .(Zegxe)]), idcol = "Sex"), x = "Sex", y = "Zegxe", fill = "Sex") +
+  scale_fill_manual(values = c(Male = "lightblue2", Female = "pink")) +
+  stat_compare_means()
+```

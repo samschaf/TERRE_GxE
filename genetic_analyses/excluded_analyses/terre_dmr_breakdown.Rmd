@@ -1,0 +1,1043 @@
+---
+title: "Exploring Terre Parkinson's DMRs"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+library(dplyr)
+library(ggplot2)
+library(data.table)
+Sys.setlocale("LC_MESSAGES", "en_US.utf8")
+knitr::opts_chunk$set(echo = TRUE, cache = FALSE, eval = TRUE, autodep = TRUE)
+```
+
+# Analysis plan
+*Goal:* Characterize Parkinson's associated DNA methylation as a combination of genetic and environmental factors. This includes:
+1. Heritability of DMR tagCpGs in relation to all CpG sites
+2. A model ranking scheme for SNP association in cis and E events
+3. Relationship, if any, between patterns observed in ranking with number of SNPs in cis to CpG site
+
+## Model Ranking
+I've set up my code to take in CpG sites and `matrixEQTL` formatted genetic and expression data. Here I will load in DMRs prior to setting `rank_cis_cpg_models` running:
+```{r}
+heritability <- fread("terre_heritability_150kb_mvalue.txt")
+(f_dmrs <- fread("/home1/NEURO/SHARE_DECIPHER/DMRs/TERRE/sig.cpgs.TERRE.F.HT.ancestry.csv"))
+(m_dmrs <- fread("/home1/NEURO/SHARE_DECIPHER/DMRs/TERRE/sig.cpgs.TERRE.M.HT.ancestry.csv"))
+
+sum(f_dmrs$cpg %in% m_dmrs$cpg) # overlap between M and F
+
+# num heritable in cis
+sum(m_dmrs$cpg %in% heritability[P < 0.05]$probe)
+sum(f_dmrs$cpg %in% heritability[P < 0.05]$probe)
+
+# proportion heritable in cis
+sum(m_dmrs$cpg %in% heritability[P < 0.05]$probe) / nrow(m_dmrs)
+sum(f_dmrs$cpg %in% heritability[P < 0.05]$probe) / nrow(f_dmrs)
+
+# total proportion heritable in cis
+nrow(heritability[P < 0.05]) / nrow(heritability)
+
+```
+Checking if these proportions are larger than expected at random:
+```{r}
+# Test 1 is proportion significantly different than proportion of heritable CpGs
+prop.test(c(72, 53165), c(407, 772599))
+prop.test(c(135, 53165), c(960, 772599))
+prop.test(c(72, 135), c(407, 960))
+library(stats)
+# Test 2 is proportion different than if CpGs were selected at random
+1 - phyper(72, sum(heritability$P < 0.05), sum(heritability$P > 0.05), 407)
+1 - phyper(135, sum(heritability$P < 0.05), sum(heritability$P > 0.05), 960)
+# Permutation test
+sum(sapply(1:10000, function(i) sum(sample(heritability$P < 0.05, 407))) >= 72) / 10000
+sum(sapply(1:10000, function(i) sum(sample(heritability$P < 0.05, 960))) >= 135) / 10000
+```
+
+
+Let's plot out the h2 value for these "heritable" DMRs, as well as the number of cis SNPs for these DMR CpGs:
+```{r}
+heritability_sig <- fread("terre_heritability_150kb_mvalue_sig.txt")
+ggplot(heritability[m_dmrs$cpg, on = .(probe)][P < 0.05], aes(h2)) +
+  geom_histogram(bins = 30) +
+  coord_cartesian(xlim = c(0.2, 1.0), ylim = c(0, 20))
+ggplot(heritability[f_dmrs$cpg, on = .(probe)][P < 0.05], aes(h2)) +
+  geom_histogram(bins = 30) +
+  coord_cartesian(xlim = c(0.2, 1.0), ylim = c(0, 20))
+
+ggplot(heritability_sig[m_dmrs$cpg, on = .(probe)][P < 0.05], aes(n_cis_snps)) +
+  geom_histogram(bins = 30) +
+  coord_cartesian(xlim = c(0, NA))
+ggplot(heritability_sig[f_dmrs$cpg, on = .(probe)][P < 0.05], aes(n_cis_snps)) +
+  geom_histogram(bins = 30) +
+  coord_cartesian(xlim = c(0, NA))
+```
+```{r}
+f_heritable <- f_dmrs[cpg %chin% heritability[P < 0.05]$probe][order(-minpvalue)]
+m_heritable <- m_dmrs[cpg %chin% heritability[P < 0.05]$probe][order(-minpvalue)]
+m_heritable$h2 <- heritability[m_heritable$cpg, on = "probe"]$h2
+f_heritable$h2 <- heritability[f_heritable$cpg, on = "probe"]$h2
+
+f_heritable[order(-h2, minpvalue)]
+m_heritable[order(-h2, minpvalue)]
+```
+## Analysis of cis-mQTLs at each DMR
+```{r}
+cis_mQTLs <- fread("../prs_ewas_integration/cis_mQTL_analyses/terre_data/cis_all_impute_mQTL_results_CTP.txt.gz")
+mQTLs_at_mdmr <- cis_mQTLs[m_dmrs$cpg, on = "gene"]
+mQTLs_at_fdmr <- cis_mQTLs[f_dmrs$cpg, on = "gene"]
+```
+```{r}
+cis_mQTLs[FDR < 0.05]
+cis_mQTLs[FDR < 0.05 & !duplicated(gene)]
+```
+
+Digging into these:
+```{r}
+merge(f_dmrs, mQTLs_at_fdmr[, .(min(`p-value`)), by = "gene"], by.x = "cpg", by.y = "gene")
+merge(m_dmrs, mQTLs_at_mdmr[, .(min(`p-value`)), by = "gene"], by.x = "cpg", by.y = "gene")
+```
+## Sex-stratified mQTL analysis
+```{r}
+cis_mQTLs_m <- fread("../prs_ewas_integration/cis_mQTL_analyses/terre_data/male_cis_all_impute_mQTL_results_CTP.txt.gz", key = c("SNP", "gene"))
+male_mQTLs_at_mdmr <- cis_mQTLs_m[m_dmrs$cpg, on = "gene"]
+cis_mQTLs_f <- fread("../prs_ewas_integration/cis_mQTL_analyses/terre_data/female_cis_all_impute_mQTL_results_CTP.txt.gz", key = c("SNP", "gene"))
+female_mQTLs_at_fdmr <- cis_mQTLs_f[f_dmrs$cpg, on = "gene"]
+```
+```{r}
+hist(cis_mQTLs_f$`p-value`, breaks = 100, main = "Distribution of cis mQTL P Values in Females", ylim = c(0, 10e6))
+abline(h = nrow(cis_mQTLs_f) / 100)
+
+hist(cis_mQTLs_m$`p-value`, breaks = 100, main = "Distribution of cis mQTL P Values in Males", ylim = c(0, 10e6))
+abline(h = nrow(cis_mQTLs_m) / 100)
+```
+
+```{r}
+male_mQTLs_at_mdmr[, "P" := min(`p-value`), by = "gene"]
+female_mQTLs_at_fdmr[, "P" := min(`p-value`), by = "gene"]
+male_mQTLs_at_mdmr
+female_mQTLs_at_fdmr
+hist(male_mQTLs_at_mdmr[!duplicated(gene)]$P)
+hist(female_mQTLs_at_fdmr[!duplicated(gene)]$P)
+
+hist(male_mQTLs_at_mdmr$`p-value`, breaks = 100, main = "Distribution of cis-mQTL P Values at Male DMRs", ylim = c(0, 50000))
+abline(h = nrow(male_mQTLs_at_mdmr) / 100)
+
+hist(female_mQTLs_at_fdmr$`p-value`, breaks = 100, main = "Distribution of cis-mQTL P Values at Female DMRs")
+abline(h = nrow(female_mQTLs_at_fdmr) / 100)
+
+
+# heritability[P < 0.05][m_dmrs$cpg[m_dmrs$cpg %in% f_dmrs$cpg],on="probe"]
+library(qqman)
+library(qvalue)
+qq(male_mQTLs_at_mdmr$`p-value`)
+qq(female_mQTLs_at_fdmr$`p-value`)
+m_matched_stat <- cis_mQTLs_m[cis_mQTLs_f[FDR < 0.05][, .(SNP, gene)], on = c("SNP", "gene")]
+f_matched_stat <- cis_mQTLs_f[cis_mQTLs_m[FDR < 0.05][, .(SNP, gene)], on = c("SNP", "gene")]
+```
+
+
+
+## AIC values for sex-stratified G models
+```{r}
+(male_g_aic <- fread("male_dnam_breakdown.txt")[order(aic)])
+(female_g_aic <- fread("female_dnam_breakdown.txt")[order(aic)])
+m_min_aic <- male_g_aic[, .(aic = min(aic), sex = "male"), by = "cpg"]
+f_min_aic <- female_g_aic[, .(aic = min(aic), sex = "female"), by = "cpg"]
+ggplot(rbind(m_min_aic, f_min_aic), aes(aic, fill = sex)) +
+  geom_histogram(bins = 100, alpha = .9) +
+  ggtitle("Minimum G-model AIC Value per DMR per Sex") +
+  theme_minimal()
+```
+
+## AIC values for top 5 represented E + Pesticides of Interest
+```{r}
+male_all_aic <- unique(rbindlist(lapply(fs::dir_ls(glob = "male*breakdown.txt.gz"), fread), fill = TRUE))
+female_all_aic <- unique(rbindlist(lapply(fs::dir_ls(glob = "female*breakdown.txt.gz"), fread), fill = TRUE))
+```
+### Ranking models
+```{r}
+female_dmr_cpgs <- fread("~/AIC_F.csv")
+male_dmr_cpgs <- fread("~/AIC_M.csv")
+male_min_aic_models <- male_all_aic[, .SD[which.min(aic)], by = c("cpg", "model")][, .SD[which.min(aic)], by = "cpg"]
+female_min_aic_models <- female_all_aic[, .SD[which.min(aic)], by = c("cpg", "model")][, .SD[which.min(aic)], by = "cpg"]
+female_min_aic_models[order(-model)]
+female_min_aic_models[order(-model)]
+unique(female_min_aic_models$env)
+write.csv(female_min_aic_models %>% filter(grepl("E", model)) %>% select(cpg, SNP, model, env, aic), quote = F)
+
+write.csv(female_min_aic_models %>% filter(grepl("E", model)) %>% select(cpg, SNP, model, env, aic) %>% filter(cpg %in% female_dmr_cpgs$CpG), quote = F)
+write.csv(male_min_aic_models %>% filter(grepl("E", model)) %>% select(cpg, SNP, model, env, aic) %>% filter(cpg %in% male_dmr_cpgs$CpG), quote = F)
+write.csv(female_min_aic_models %>% select(cpg, SNP, model, env, aic) %>% filter(cpg %in% female_dmr_cpgs$CpG), quote = F)
+write.csv(male_min_aic_models %>% select(cpg, SNP, model, env, aic) %>% filter(cpg %in% male_dmr_cpgs$CpG), quote = F)
+```
+
+
+```{r}
+ggplot(male_min_aic_models %>% filter(cpg %in% male_dmr_cpgs$CpG), aes(model)) +
+  geom_bar() +
+  geom_text(aes(label = ..count..), stat = "count", vjust = -0.5)
+ggplot(female_min_aic_models %>% filter(cpg %in% female_dmr_cpgs$CpG), aes(model)) +
+  geom_bar() +
+  geom_text(aes(label = ..count..), stat = "count", vjust = -0.5) +
+  ggtitle("Female DMR models (representative CpGs)")
+```
+### Ranges of AIC values across models
+```{r}
+both_sex_aic <- bind_rows(list(male = male_all_aic %>% filter(cpg %in% male_dmr_cpgs$CpG), female = female_all_aic %>% filter(cpg %in% female_dmr_cpgs$CpG)), .id = "Sex")
+ggplot(both_sex_aic, aes(aic, fill = Sex)) +
+  geom_histogram() +
+  facet_grid(rows = vars(model), scales = "free_y")
+```
+
+```{r}
+male_all_aic[model == "E"]
+```
+### Models accounting for PD
+- Step 1: read in data, run multiple test correction
+- step 2: remove those which don't pass a significance threshold
+- step 3: rank by AIC
+Loading in all experiments
+```{r}
+males_pd <- rbindlist(lapply(Sys.glob("male_terre_pd_f_*_dnam_breakdown.txt.gz"), function(f) fread(f, fill = TRUE)), fill = TRUE)
+males_pd[, c("f_q") := c(p.adjust(f_p, method = "BH")), by = c("model", "env")]
+females_pd <- rbindlist(lapply(Sys.glob("female_terre_pd_f_*_dnam_breakdown.txt.gz"), function(f) fread(f, fill = TRUE)), fill = TRUE)
+females_pd[, c("f_q") := c(p.adjust(f_p, method = "BH")), by = c("model", "env")]
+```
+
+#### Exclude models based on F test and delta beta cutoff vs baseline
+```{r}
+(min_f_females_pd <- females_pd[order(cpg), .SD[which.min(aic)], by = c("cpg", "model")][f_q < 0.05])
+(min_f_males_pd <- males_pd[order(cpg), .SD[which.min(aic)], by = c("cpg", "model")][f_q < 0.05])
+```
+```{r}
+ggplot(min_f_females_pd[, .SD[which.min(f_p)], by = "cpg"], aes(model)) +
+  geom_bar() +
+  geom_text(aes(label = ..count..), stat = "count", vjust = 0) +
+  ggtitle("Female Models ranked by P(F) accounting for\nPD status") +
+  coord_cartesian(ylim = c(0, 1000))
+ggplot(min_f_males_pd[, .SD[which.min(f_p)], by = "cpg"], aes(model)) +
+  geom_bar() +
+  geom_text(aes(label = ..count..), stat = "count", vjust = 0) +
+  ggtitle("Male Models ranked by P(F) accounting for\nPD status") +
+  coord_cartesian(ylim = c(0, 1000))
+ggplot(min_f_females_pd, aes(model)) +
+  geom_bar() +
+  geom_text(aes(label = ..count..), stat = "count", vjust = 0) +
+  ggtitle("Significant Female Models accounting for\nPD status") +
+  coord_cartesian(ylim = c(0, 1000))
+ggplot(min_f_males_pd, aes(model)) +
+  geom_bar() +
+  geom_text(aes(label = ..count..), stat = "count", vjust = 0) +
+  ggtitle("Significant Male Models accounting for\nPD status") +
+  coord_cartesian(ylim = c(0, 1000))
+```
+
+```{r}
+(min_aic_females_pd <- females_pd[order(cpg), .SD[which.min(aic)], by = "cpg"])
+(min_aic_males_pd <- males_pd[order(cpg), .SD[which.min(aic)], by = "cpg"])
+```
+
+```{r}
+p1 <- ggplot(min_aic_females_pd %>% mutate(sig_f = factor(f_q < 0.05, levels = c(TRUE, FALSE))), aes(model, fill = sig_f)) +
+  geom_bar(position = "dodge") +
+  geom_text(aes(label = ..count..), position = position_dodge(width = 1), stat = "count", vjust = 0) +
+  coord_cartesian(ylim = c(0, 1000)) +
+  labs(fill = "FDR < 0.05") +
+  theme_classic() +
+  scale_fill_manual(values = c("lightpink2", "lightpink4"))
+
+p2 <- ggplot(min_aic_males_pd %>% mutate(sig_f = factor(f_q < 0.05, levels = c(TRUE, FALSE))), aes(model, fill = sig_f)) +
+  geom_bar(position = "dodge") +
+  geom_text(aes(label = ..count..), position = position_dodge(width = 1), stat = "count", vjust = 0) +
+  coord_cartesian(ylim = c(0, 1000)) +
+  labs(fill = "FDR < 0.05") +
+  theme_classic() +
+  scale_fill_manual(values = c("lightsteelblue2", "lightsteelblue4"))
+
+
+
+
+p3 <- ggplot(min_aic_females_pd %>% mutate(sig_f = factor(f_q < 0.05, levels = c(TRUE, FALSE))) %>% filter(cpg %in% female_dmr_cpgs$CpG), aes(model, fill = sig_f)) +
+  geom_bar(position = "dodge") +
+  geom_text(aes(label = ..count..), position = position_dodge(width = 1), stat = "count", vjust = 0) +
+  coord_cartesian(ylim = c(0, 50)) +
+  labs(fill = "FDR < 0.05") +
+  theme_classic() +
+  scale_fill_manual(values = c("lightpink2", "lightpink4"))
+
+p4 <- ggplot(min_aic_males_pd %>% mutate(sig_f = factor(f_q < 0.05, levels = c(TRUE, FALSE))) %>% filter(cpg %in% male_dmr_cpgs$CpG), aes(model, fill = sig_f)) +
+  geom_bar(position = "dodge") +
+  geom_text(aes(label = ..count..), position = position_dodge(width = 1), stat = "count", vjust = 0) +
+  labs(fill = "FDR < 0.05") +
+  theme_classic() +
+  coord_cartesian(ylim = c(0, 50)) +
+  scale_fill_manual(values = c("lightsteelblue2", "lightsteelblue4"))
+cowplot::plot_grid(p1, p2, p3, p4, nrow = 2, labels = "AUTO")
+```
+
+```{r}
+min_aic_females_pd %>%
+  filter(f_q < 0.05, cpg %in% female_dmr_cpgs$CpG, model == "GxE") %>%
+  write.csv()
+```
+
+#### Nested models
+
+```{r}
+female_nested <- fread("female_terre_pd_fnested_dnam_breakdown.txt.gz")
+female_nested[, `:=`(
+  f_q_gxe = p.adjust(f_p_gxe, method = "BH"),
+  f_q_gee = p.adjust(f_p_gee, method = "BH"),
+  f_q_geg = p.adjust(f_p_geg, method = "BH"),
+  f_q_g = p.adjust(f_p_g, method = "BH"),
+  f_q_e = p.adjust(f_p_e, method = "BH")
+),
+by = "env"
+]
+male_nested <- fread("male_terre_pd_fnested_dnam_breakdown.txt.gz")
+male_nested[, `:=`(
+  f_q_gxe = p.adjust(f_p_gxe, method = "BH"),
+  f_q_gee = p.adjust(f_p_gee, method = "BH"),
+  f_q_geg = p.adjust(f_p_geg, method = "BH"),
+  f_q_g = p.adjust(f_p_g, method = "BH"),
+  f_q_e = p.adjust(f_p_e, method = "BH")
+),
+by = "env"
+]
+```
+
+
+```{r}
+(f_gxe_count <- female_nested[f_q_gxe < 0.05 & (f_q_gee < 0.05 | f_q_geg < 0.05) & (f_q_g < 0.05 | f_q_e < 0.05)][, .(snps = length(unique(snp)), envs = paste0(unique(env), collapse = ",")), by = "cpg"])
+(m_gxe_count <- male_nested[f_q_gxe < 0.05 & (f_q_gee < 0.05 | f_q_geg < 0.05) & (f_q_g < 0.05 | f_q_e < 0.05)][, .(snps = length(unique(snp)), envs = paste0(unique(env), collapse = ",")), by = "cpg"])
+
+(f_ge_count <- female_nested[f_q_gxe > 0.05 & (f_q_gee < 0.05 | f_q_geg < 0.05) & (f_q_g < 0.05 | f_q_e < 0.05)][, .(snps = length(unique(snp)), envs = paste0(unique(env), collapse = ",")), by = "cpg"])
+(m_ge_count <- male_nested[f_q_gxe > 0.05 & (f_q_gee < 0.05 | f_q_geg < 0.05) & (f_q_g < 0.05 | f_q_e < 0.05)][, .(snps = length(unique(snp)), envs = paste0(unique(env), collapse = ",")), by = "cpg"])
+
+(f_g_count <- female_nested[f_q_gxe > 0.05 & f_q_gee > 0.05 & f_q_geg > 0.05 & f_q_g < 0.05 & f_q_e > 0.05][, .(snps = length(unique(snp)), envs = paste0(unique(env), collapse = ",")), by = "cpg"])
+(m_g_count <- male_nested[f_q_gxe > 0.05 & f_q_gee > 0.05 & f_q_geg > 0.05 & f_q_g < 0.05 & f_q_e > 0.05][, .(snps = length(unique(snp)), envs = paste0(unique(env), collapse = ",")), by = "cpg"])
+
+(f_e_count <- female_nested[f_q_gxe > 0.05 & f_q_gee > 0.05 & f_q_geg > 0.05 & f_q_g > 0.05 & f_q_e < 0.05][, .(snps = length(unique(snp)), envs = paste0(unique(env), collapse = ",")), by = "cpg"])
+(m_e_count <- male_nested[f_q_gxe > 0.05 & f_q_gee > 0.05 & f_q_geg > 0.05 & f_q_g > 0.05 & f_q_e < 0.05][, .(snps = length(unique(snp)), envs = paste0(unique(env), collapse = ",")), by = "cpg"])
+```
+Restricting to just those DMRs which pass a stricter cutoff:
+```{r}
+(sig_f_gxe_count <- female_nested[f_q_gxe < 0.05 & (f_q_gee < 0.05 | f_q_geg < 0.05) & (f_q_g < 0.05 | f_q_e < 0.05)][, .(snps = length(unique(snp)), envs = paste0(unique(env), collapse = ",")), by = "cpg"][cpg %in% female_dmr_cpgs$V1])
+(sig_m_gxe_count <- male_nested[f_q_gxe < 0.05 & (f_q_gee < 0.05 | f_q_geg < 0.05) & (f_q_g < 0.05 | f_q_e < 0.05)][, .(snps = length(unique(snp)), envs = paste0(unique(env), collapse = ",")), by = "cpg"][cpg %in% male_dmr_cpgs$V1])
+
+(sig_f_ge_count <- female_nested[f_q_gxe > 0.05 & (f_q_gee < 0.05 | f_q_geg < 0.05) & (f_q_g < 0.05 | f_q_e < 0.05)][, .(snps = length(unique(snp)), envs = paste0(unique(env), collapse = ",")), by = "cpg"][cpg %in% female_dmr_cpgs$V1])
+(sig_m_ge_count <- male_nested[f_q_gxe > 0.05 & (f_q_gee < 0.05 | f_q_geg < 0.05) & (f_q_g < 0.05 | f_q_e < 0.05)][, .(snps = length(unique(snp)), envs = paste0(unique(env), collapse = ",")), by = "cpg"][cpg %in% male_dmr_cpgs$V1])
+
+(sig_f_g_count <- female_nested[f_q_gxe > 0.05 & f_q_gee > 0.05 & f_q_geg > 0.05 & f_q_g < 0.05 & f_q_e > 0.05][, .(snps = length(unique(snp)), envs = paste0(unique(env), collapse = ",")), by = "cpg"][cpg %in% female_dmr_cpgs$V1])
+(sig_m_g_count <- male_nested[f_q_gxe > 0.05 & f_q_gee > 0.05 & f_q_geg > 0.05 & f_q_g < 0.05 & f_q_e > 0.05][, .(snps = length(unique(snp)), envs = paste0(unique(env), collapse = ",")), by = "cpg"][cpg %in% male_dmr_cpgs$V1])
+
+(sig_f_e_count <- female_nested[f_q_gxe > 0.05 & f_q_gee > 0.05 & f_q_geg > 0.05 & f_q_g > 0.05 & f_q_e < 0.05][, .(snps = length(unique(snp)), envs = paste0(unique(env), collapse = ",")), by = "cpg"][cpg %in% female_dmr_cpgs$V1])
+(sig_m_e_count <- male_nested[f_q_gxe > 0.05 & f_q_gee > 0.05 & f_q_geg > 0.05 & f_q_g > 0.05 & f_q_e < 0.05][, .(snps = length(unique(snp)), envs = paste0(unique(env), collapse = ",")), by = "cpg"][cpg %in% male_dmr_cpgs$V1])
+```
+##### Plotting counts from previous Section
+```{r}
+f_nested_count <- data.table(
+  count = c(nrow(f_gxe_count), nrow(f_ge_count), nrow(f_g_count), nrow(f_e_count)),
+  Model = c("GxE", "G+E", "G", "E")
+)
+
+m_nested_count <- data.table(
+  count = c(nrow(m_gxe_count), nrow(m_ge_count), nrow(m_g_count), nrow(m_e_count)),
+  Model = c("GxE", "G+E", "G", "E")
+)
+sig_f_nested_count <- data.table(
+  count = c(nrow(sig_f_gxe_count), nrow(sig_f_ge_count), nrow(sig_f_g_count), nrow(sig_f_e_count)),
+  Model = c("GxE", "G+E", "G", "E")
+)
+
+sig_m_nested_count <- data.table(
+  count = c(nrow(sig_m_gxe_count), nrow(sig_m_ge_count), nrow(sig_m_g_count), nrow(sig_m_e_count)),
+  Model = c("GxE", "G+E", "G", "E")
+)
+
+
+ggplot(f_nested_count, aes(Model, count, label = count)) +
+  geom_col() +
+  geom_text(position = position_dodge(width = 1), vjust = 0)
+ggplot(m_nested_count, aes(Model, count, label = count)) +
+  geom_col() +
+  geom_text(position = position_dodge(width = 1), vjust = 0)
+ggplot(sig_f_nested_count, aes(Model, count, label = count)) +
+  geom_col() +
+  geom_text(position = position_dodge(width = 1), vjust = 0)
+ggplot(sig_m_nested_count, aes(Model, count, label = count)) +
+  geom_col() +
+  geom_text(position = position_dodge(width = 1), vjust = 0)
+```
+
+##### AIC models that match with nested definition
+```{r}
+m_gxe_count$model <- "GxE"
+m_ge_count$model <- "G+E"
+m_g_count$model <- "G"
+m_e_count$model <- "E"
+
+f_gxe_count$model <- "GxE"
+f_ge_count$model <- "G+E"
+f_g_count$model <- "G"
+f_e_count$model <- "E"
+
+m_aic_fnested <- merge(min_aic_males_pd, rbind(m_gxe_count, m_ge_count, m_g_count, m_e_count), by = c("cpg", "model"))
+f_aic_fnested <- merge(min_aic_females_pd, rbind(f_gxe_count, f_ge_count, f_g_count, f_e_count), by = c("cpg", "model"))
+
+
+ggplot(f_aic_fnested, aes(model)) +
+  geom_bar() +
+  geom_text(aes(label = ..count..), position = position_dodge(width = 1), stat = "count", vjust = 0)
+ggplot(m_aic_fnested, aes(model)) +
+  geom_bar() +
+  geom_text(aes(label = ..count..), position = position_dodge(width = 1), stat = "count", vjust = 0)
+
+ggplot(f_aic_fnested[cpg %in% female_dmr_cpgs$V1], aes(model)) +
+  geom_bar() +
+  geom_text(aes(label = ..count..), position = position_dodge(width = 1), stat = "count", vjust = 0)
+ggplot(m_aic_fnested[cpg %in% male_dmr_cpgs$V1], aes(model)) +
+  geom_bar() +
+  geom_text(aes(label = ..count..), position = position_dodge(width = 1), stat = "count", vjust = 0)
+```
+##### Gene analysis
+```{r}
+annotation <- fread("~/MethylationEPIC_v-1-0_B4.csv", skip = 7, fill = TRUE)
+
+f_nested_annot <- merge(annotation, rbind(f_gxe_count, f_ge_count, f_g_count, f_e_count), by.x = "Name", by.y = "cpg")
+m_nested_annot <- merge(annotation, rbind(m_gxe_count, m_ge_count, m_g_count, m_e_count), by.x = "Name", by.y = "cpg")
+
+unique(f_nested_annot, by = "UCSC_RefGene_Name")[model == "GxE"]
+unique(m_nested_annot, by = "UCSC_RefGene_Name")[model == "GxE"]
+
+unique(f_nested_annot, by = "UCSC_RefGene_Name")[model == "E"]
+unique(m_nested_annot, by = "UCSC_RefGene_Name")[model == "E"]
+
+unique(f_nested_annot, by = "UCSC_RefGene_Name")[Name %in% female_dmr_cpgs$V1 & model == "G+E"]
+unique(m_nested_annot, by = "UCSC_RefGene_Name")[Name %in% male_dmr_cpgs$V1 & model == "G+E"]
+
+unique(f_nested_annot, by = "UCSC_RefGene_Name")[Name %in% female_dmr_cpgs$V1 & model == "G"]
+unique(m_nested_annot, by = "UCSC_RefGene_Name")[Name %in% male_dmr_cpgs$V1 & model == "G"]
+
+missMethyl::gometh(f_nested_annot[Name %in% female_dmr_cpgs$V1]$Name, array.type = "EPIC") %>% arrange(P.DE)
+missMethyl::gometh(f_nested_annot[Name %in% female_dmr_cpgs$V1]$Name, array.type = "EPIC", collection = "KEGG") %>% arrange(P.DE)
+```
+##### CpG sites for which neither G or E outperformed
+
+```{r}
+female_dmr_cpgs[!female_dmr_cpgs$V1 %in% f_nested_annot$Name]
+male_dmr_cpgs[!male_dmr_cpgs$V1 %in% m_nested_annot$Name]
+```
+
+### Viewing G and E effects and comparing to interaction model
+```{r}
+male_gpe_model <- fread("male_terre_pd_f_G+E_dnam_breakdown.txt.gz")
+female_gpe_model <- fread("female_terre_pd_f_G+E_dnam_breakdown.txt.gz")
+male_gpe_model[, `:=`(Gq = p.adjust(Gp, method = "BH"), Eq = p.adjust(Ep, method = "BH")), by = "env"]
+female_gpe_model[, `:=`(Gq = p.adjust(Gp, method = "BH"), Eq = p.adjust(Ep, method = "BH")), by = "env"]
+```
+```{r}
+length(unique(male_gpe_model[Gq < 0.05]$cpg))
+length(unique(male_gpe_model[Eq < 0.05]$cpg))
+male_gpe_model[Gq > 0.05 & Eq < 0.05]
+male_gpe_model[Gq < 0.05 & Eq > 0.05]
+male_gpe_model[Gq < 0.05 & Eq < 0.05]
+
+length(unique(female_gpe_model[Gq < 0.05]$cpg))
+length(unique(female_gpe_model[Eq < 0.05]$cpg))
+length(unique(female_gpe_model$cpg))
+female_gpe_model[Gq > 0.05 & Eq < 0.05]
+female_gpe_model[Gq < 0.05 & Eq > 0.05]
+female_gpe_model[Gq < 0.05 & Eq < 0.05]
+```
+```{r}
+ggplot(melt(male_gpe_model[, .(-log10(Gp), -log10(Ep))]), aes(value, fill = variable)) +
+  geom_density(alpha = 0.5)
+
+# Check G sig
+ggplot(melt(male_gpe_model[Gq < 0.05, .(Gest, Eest)]), aes(value, fill = variable)) +
+  geom_density(alpha = 0.5)
+ggplot(melt(male_gpe_model[Gq < 0.05, .(-log10(Gp), -log10(Ep))]), aes(value, fill = variable)) +
+  geom_density(alpha = 0.5)
+
+
+# Check E sig
+ggplot(melt(male_gpe_model[Eq < 0.05, .(Gest, Eest)]), aes(value, fill = variable)) +
+  geom_density(alpha = 0.5)
+ggplot(melt(male_gpe_model[Eq < 0.05, .(-log10(Gp), -log10(Ep))]), aes(value, fill = variable)) +
+  geom_density(alpha = 0.5)
+
+# both G and E sig
+ggplot(melt(male_gpe_model[Gq < 0.05 & Eq < 0.05, .(-log10(Gp), -log10(Ep))]), aes(value, fill = variable)) +
+  geom_density(alpha = 0.5)
+
+ggplot(male_gpe_model[Gq < 0.05 & Eq < 0.05, ], aes(Gest, Eest, color = cpg)) +
+  geom_point()
+
+ggplot(male_gpe_model[Gq < 0.05 & Eq < 0.05, ], aes(-log10(Gp), -log10(Ep), color = cpg)) +
+  geom_point() +
+  coord_cartesian(xlim = c(2, 5), ylim = c(2, 5))
+
+
+# E sig G not sig
+ggplot(male_gpe_model[Gq > 0.05 & Eq < 0.05, ], aes(Gest, Eest, color = cpg)) +
+  geom_point()
+ggplot(melt(male_gpe_model[Gq > 0.05 & Eq < 0.05, .(Gest, Eest, cpg, SNP)]), aes(variable, abs(value), color = cpg)) +
+  geom_point() +
+  geom_line(aes(group = interaction(SNP, cpg))) +
+  facet_wrap(~cpg)
+ggplot(melt(male_gpe_model[Gq > 0.05 & Eq < 0.05, .(Gest, Eest, cpg, SNP)]), aes(variable, abs(value), color = cpg)) +
+  geom_point() +
+  geom_boxplot() +
+  facet_wrap(~cpg)
+
+ggplot(male_gpe_model[Gq > 0.05 & Eq < 0.05, ], aes(-log10(Gp), -log10(Ep), color = cpg)) +
+  geom_point()
+```
+#### is there interaction at these sites with significant G and E?
+```{r}
+male_gpe_interest <- male_gpe_model[Gq < 0.05 & Eq < 0.05, ]
+(merge(male_nested, male_gpe_interest, by.x = c("cpg", "snp", "env"), by.y = c("cpg", "SNP", "env")))
+male_nested[f_q_gxe < 0.05]
+```
+```{r}
+ggplot(melt(female_gpe_model[, .(-log10(Gp), -log10(Ep))]), aes(value, fill = variable)) +
+  geom_density(alpha = 0.5)
+
+# Check G sig
+ggplot(melt(female_gpe_model[Gq < 0.05, .(Gest, Eest)]) %>% mutate(variable = recode(variable, "V1" = "G_effect", "V2" = "E_effect")), aes(value, fill = variable)) +
+  geom_density(alpha = 0.5) +
+  ggtitle("Distribution of effect sizes for significant G models")
+ggplot(melt(female_gpe_model[Gq < 0.05, .(-log10(Gp), -log10(Ep))]) %>% mutate(variable = recode(variable, "V1" = "-log10(Gp)", "V2" = "-log10(Ep)")), aes(value, fill = variable)) +
+  geom_density(alpha = 0.5) +
+  ggtitle("Distribution of P values for significant G models")
+
+
+# Check E sig
+ggplot(melt(female_gpe_model[Eq < 0.05, .(Gest, Eest)]), aes(value, fill = variable)) +
+  geom_density(alpha = 0.5)
+ggplot(melt(female_gpe_model[Eq < 0.05, .(-log10(Gp), -log10(Ep))]), aes(value, fill = variable)) +
+  geom_density(alpha = 0.5)
+
+# both G and E sig
+ggplot(melt(female_gpe_model[Gq < 0.05 & Eq < 0.05, .(-log10(Gp), -log10(Ep))]), aes(value, fill = variable)) +
+  geom_density(alpha = 0.5)
+
+ggplot(female_gpe_model[Gq < 0.05 & Eq < 0.05, ], aes(Gest, Eest, color = cpg)) +
+  geom_point()
+
+ggplot(female_gpe_model[Gq < 0.05 & Eq < 0.05, ], aes(-log10(Gp), -log10(Ep), color = cpg)) +
+  geom_point() +
+  coord_cartesian(xlim = c(2, 5), ylim = c(2, 5))
+
+
+# E sig G not sig
+ggplot(female_gpe_model[Gq > 0.05 & Eq < 0.05, ], aes(Gest, Eest, color = cpg)) +
+  geom_point()
+
+ggplot(female_gpe_model[Gq > 0.05 & Eq < 0.05, ], aes(-log10(Gp), -log10(Ep), color = cpg)) +
+  geom_point()
+```
+
+### Comparing $R^2$ for each model
+```{r}
+male_gxe_model <- fread("male_terre_pd_f_GxE_dnam_breakdown.txt.gz")
+female_gxe_model <- fread("female_terre_pd_f_GxE_dnam_breakdown.txt.gz")
+```
+
+```{r}
+gxe_vs_gpe <- data.frame(gxe_r2 = male_gxe_model$R2, gpe_r2 = male_gpe_model$R2)
+ggplot(gxe_vs_gpe, aes(gxe_r2, gpe_r2)) +
+  geom_bin2d()
+gxe_vs_gpe <- data.frame(gxe_r2 = female_gxe_model$R2, gpe_r2 = female_gpe_model$R2)
+ggplot(gxe_vs_gpe, aes(gxe_r2, gpe_r2)) +
+  geom_bin2d()
+```
+
+### Additional last questions
+#### what proportion of CpGs have neither G nor E effect
+
+```{r}
+female_dmr_cpgs <- fread("~/AIC_F.csv")
+male_dmr_cpgs <- fread("~/AIC_M.csv")
+effect_cpgs_male <- unique(male_gpe_model[(Gq < 0.05 | Eq < 0.05) & cpg %in% male_dmr_cpgs$CpG]$cpg)
+effect_cpgs_female <- unique(female_gpe_model[(Gq < 0.05 | Eq < 0.05) & cpg %in% female_dmr_cpgs$CpG]$cpg)
+
+length(unique(male_gpe_model[cpg %in% male_dmr_cpgs$CpG]$cpg)) - length(effect_cpgs_male)
+
+length(unique(male_gpe_model[cpg %in% male_dmr_cpgs$CpG]$cpg))
+
+sum(!unique(male_gpe_model[cpg %in% male_dmr_cpgs$CpG]$cpg) %in% effect_cpgs_male) / length(unique(male_gpe_model[cpg %in% male_dmr_cpgs$CpG]$cpg))
+
+
+length(unique(female_gpe_model[cpg %in% female_dmr_cpgs$CpG]$cpg)) - length(effect_cpgs_female)
+length(unique(female_gpe_model[cpg %in% female_dmr_cpgs$CpG]$cpg))
+sum(!unique(female_gpe_model[cpg %in% female_dmr_cpgs$CpG]$cpg) %in% effect_cpgs_female) / length(unique(female_gpe_model[cpg %in% female_dmr_cpgs$CpG]$cpg))
+
+unique(male_gpe_model[(Gq < 0.05 & Eq < 0.05) & cpg %in% male_dmr_cpgs$CpG]$cpg)
+
+
+# write.csv(male_dmr_cpgs[!V1 %in% effect_cpgs_male])
+# write.csv(female_dmr_cpgs[!V1 %in% effect_cpgs_female])
+
+write.csv(male_gpe_model[!cpg %in% effect_cpgs_male & cpg %in% male_dmr_cpgs$V1,.SD[which.min(aic)],by=cpg])
+write.csv(female_gpe_model[!cpg %in% effect_cpgs_female & cpg %in% female_dmr_cpgs$V1,.SD[which.min(aic)],by=cpg])
+```
+
+#### is G effect generally more impactful/larger than E effect?
+```{r}
+library(ggpubr)
+male_tmp <- male_gpe_model
+male_tmp$Sex <- "Male"
+female_tmp <- female_gpe_model
+female_tmp$Sex <- "Female"
+male_female_gpe <- rbind(male_tmp, female_tmp)
+male_female_max_gpe_effects <- melt(male_female_gpe[, .(G = max(abs(Gest)), E = max(abs(Eest))), by = c("cpg", "Sex")])
+cor.test(male_gpe_model$Gt, male_gpe_model$Et, method = "spearman")
+cor.test(male_gpe_model$Gest, male_gpe_model$Eest, method = "spearman")
+
+cor.test(female_gpe_model$Gt, female_gpe_model$Et, method = "spearman")
+cor.test(female_gpe_model$Gest, female_gpe_model$Eest, method = "spearman")
+
+male_female_gpe[, .(G = max(abs(Gest)), E = max(abs(Eest)), Gq = Gq[which.max(abs(Gest))], Eq = Eq[which.max(abs(Eest))]), by = c("cpg", "Sex")]
+male_female_max_gpe_effects_sig <- melt(male_female_gpe[, .(G = max(abs(Gest[Gq < 0.05])), E = max(abs(Eest[Eq < 0.05]))), by = c("cpg", "Sex")])[!is.infinite(value)]
+
+
+p1 <- ggboxplot(male_female_max_gpe_effects[Sex == "Male"], "variable", "value", fill = "Sex", palette = c("lightsteelblue2"), group = "variable") + stat_compare_means(comparisons = list(c("G", "E"))) + theme_classic() + theme(legend.position = "") + labs(x = "Variable", y = "|Effect|")
+
+p2 <- ggboxplot(male_female_max_gpe_effects[Sex == "Female"], "variable", "value", fill = "Sex", palette = c("lightpink2"), group = "variable") + stat_compare_means(comparisons = list(c("G", "E"))) + theme_classic() + theme(legend.position = "") + labs(x = "Variable", y = "|Effect|")
+
+p3 <- ggboxplot(male_female_max_gpe_effects_sig[Sex == "Male"], "variable", "value", fill = "Sex", palette = c("lightsteelblue2")) + stat_compare_means(comparisons = list(c("G", "E"))) + theme_classic() + theme(legend.position = "") + labs(x = "Variable", y = "|Effect|")
+
+
+p4 <- ggboxplot(male_female_max_gpe_effects_sig[Sex == "Female"], "variable", "value", fill = "Sex", palette = c("lightpink2")) + stat_compare_means(comparisons = list(c("G", "E"))) + theme_classic() + theme(legend.position = "")
+p4
+cowplot::plot_grid(p1, p2, p3, nrow = 1, labels = "AUTO")
+```
+#### Same as previous but with t statistics
+```{r}
+
+male_female_max_gpe_t <- melt(male_female_gpe[, .(Gt = max(abs(Gt)), Et = max(abs(Et))), by = c("cpg", "Sex")])
+
+male_female_max_gpe_t_sig <- melt(male_female_gpe[, .(Gt = max(abs(Gt[Gq < 0.05])), Et = max(abs(Et[Eq < 0.05]))), by = c("cpg", "Sex")])[!is.infinite(value)]
+
+p1 <- ggboxplot(male_female_max_gpe_t[Sex == "Male"], "variable", "value", fill = "Sex", palette = c("lightsteelblue2"), group = "variable") + stat_compare_means(comparisons = list(c("Gt", "Et"))) + theme_classic() + theme(legend.position = "") + labs(x = "Variable", y = "|Effect|")
+
+p2 <- ggboxplot(male_female_max_gpe_t[Sex == "Female"], "variable", "value", fill = "Sex", palette = c("lightpink2"), group = "variable") + stat_compare_means(comparisons = list(c("Gt", "Et"))) + theme_classic() + theme(legend.position = "") + labs(x = "Variable", y = "|Effect|")
+
+p3 <- ggboxplot(male_female_max_gpe_t_sig[Sex == "Male"], "variable", "value", fill = "Sex", palette = c("lightsteelblue2")) + stat_compare_means(comparisons = list(c("Gt", "Et"))) + theme_classic() + theme(legend.position = "") + labs(x = "Variable", y = "|Effect|")
+
+
+p4 <- ggboxplot(male_female_max_gpe_t_sig[Sex == "Female"], "variable", "value", fill = "Sex", palette = c("lightpink2")) + stat_compare_means(comparisons = list(c("Gt", "Et"))) + theme_classic() + theme(legend.position = "")
+p4
+cowplot::plot_grid(p1, p2, p3, nrow = 1, labels = "AUTO")
+mean(male_female_max_gpe_t[Sex == "Male" & variable == "Gt"]$value)
+mean(male_female_max_gpe_t[Sex == "Male" & variable == "Et"]$value)
+mean(male_female_max_gpe_t[Sex == "Female" & variable == "Gt"]$value)
+mean(male_female_max_gpe_t[Sex == "Female" & variable == "Et"]$value)
+```
+```{r, fig.height=7}
+male_female_gpe_all <- melt(male_female_gpe[, .(Gt = abs(Gt), Et = abs(Et)), by = c("cpg", "Sex", "env")])
+ggboxplot(male_female_gpe_all[Sex == "Male"], "variable", "value", fill = "Sex", palette = c("lightsteelblue2"), group = "variable") + stat_compare_means(comparisons = list(c("Gt", "Et"))) + facet_wrap(~env) + theme_classic() + theme(legend.position = "") + labs(x = "Variable", y = "|Effect|")
+
+ggboxplot(male_female_gpe_all[Sex == "Female"], "variable", "value", fill = "Sex", palette = c("lightpink2"), group = "variable") + stat_compare_means(comparisons = list(c("Gt", "Et"))) + facet_wrap(~env) + theme_classic() + theme(legend.position = "") + labs(x = "Variable", y = "|Effect|")
+```
+
+#### number of significant differences
+```{r}
+z_scores_df <- male_female_gpe[, `:=`(Zge = (abs(Gest) - abs(Eest)) / sqrt(Gse^2 + Ese^2))]
+p1 <- ggplot(z_scores_df, aes(Zge, fill = Sex)) +
+  geom_histogram(bins = 100, position = "identity") +
+  scale_fill_manual(values = c("lightpink2", "lightsteelblue2")) +
+  theme_classic()
+z_scores_df[, `:=`(Zgreaterp = pnorm(Zge))] # one-sided , E greater than G
+z_scores_df[, `:=`(Zlessp = pnorm(-Zge))] # one-sided, G greater than E
+z_scores_df[, `:=`(Zgreaterq = p.adjust(Zgreaterp, method = "BH")), by = "env"]
+z_scores_df[, `:=`(Zlessq = p.adjust(Zlessp, method = "BH")), by = "env"]
+#Two-sided
+z_scores_df[, `:=`(Zp = 2*pnorm(-abs(Zge)))] # one-sided , E greater than G
+z_scores_df[, `:=`(Zq = p.adjust(Zp,method="BH")),by="env"]
+
+# z_scores_df[Zlessq < 0.05]
+z_scores_df[Zlessq < 0.05, .(CpG = uniqueN(cpg)), by = c("env", "Sex")]
+p2 <- ggplot(z_scores_df[Zlessq < 0.05, .(CpG = uniqueN(cpg)), by = c("env", "Sex")], aes(env, CpG, fill = Sex)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 1)) +
+  geom_text(aes(label = CpG), size = 4,vjust=-0.5, stat = "identity", position = position_dodge(width = 1)) +
+  scale_fill_manual(values = c("lightpink2", "lightsteelblue2")) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 1))
+p2
+# ggplot(z_scores_df[Zgreaterq < 0.05, .(CpG = uniqueN(cpg)), by = c("env", "Sex")], aes(env, CpG, fill = Sex)) +
+#   geom_bar(stat = "identity", position = "dodge") +
+#   geom_text(aes(label = CpG), stat = "identity", position = "dodge") +
+#   scale_fill_manual(values = c("lightpink2", "lightsteelblue2")) +
+#   theme_classic() +
+#   theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 1))
+# ggplot(z_scores_df[Zlessq < 0.05,.SD[which.max(abs(Zge))],by = c("cpg","env")],aes(env,fill = Sex)) +
+#     geom_bar(stat = "count",position ="dodge")+
+# geom_text(aes(label=..count..), stat="count")+
+# scale_fill_manual(values = c("lightpink2","lightsteelblue2")) +
+# theme_classic()
+# ggplot(z_scores_df[Zgreaterq < 0.05,.SD[which.max(abs(Zge))],by = c("cpg","env")],aes(env,fill = Sex)) +
+#     geom_bar(position = "dodge")+
+#     geom_text(aes(label=..count..), stat="count")+
+#     scale_fill_manual(values = c("lightpink2","lightsteelblue2")) +
+#     theme_classic()
+cowplot::plot_grid(p1, p2, labels = "AUTO", nrow = 1)
+total_male <- nrow(z_scores_df[!duplicated(cpg) & Sex == "Male"])
+total_female <- nrow(z_scores_df[!duplicated(cpg) & Sex == "Female"])
+p3 <- ggplot(z_scores_df[, .(CpG = ifelse(Sex == "Male", total_male - uniqueN(cpg[Zlessq < 0.05]), total_female - uniqueN(cpg[Zlessq < 0.05]))), by = c("env", "Sex")], aes(env, CpG, fill = Sex)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 1)) +
+  geom_text(aes(label = CpG), size = 4, vjust=-0.5, stat = "identity", position = position_dodge(width = 1)) +
+  scale_fill_manual(values = c("lightpink2", "lightsteelblue2")) +
+  theme_classic() +
+  #ggtitle("No difference in either G or E effect") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 1))
+p1
+p2 + scale_y_continuous(limits=c(0,225))
+p3 + scale_y_continuous(limits=c(0,925))
+```
+
+#### Difference in z scores males vs females
+```{r}
+(tmp <- wilcox.test(z_scores_df[Sex == "Male" & Zq < 0.05]$Zge,z_scores_df[Sex == "Female" & Zq < 0.05]$Zge,alternative = "l"))
+tmp$p.value
+
+(tmp <- t.test(z_scores_df[Sex == "Male" & Zq < 0.05]$Zge,z_scores_df[Sex == "Female" & Zq < 0.05]$Zge,alternative = "g"))
+tmp$p.value
+
+(tmp <- wilcox.test(z_scores_df[Sex == "Male" & Zq < 0.05]$Zge,alternative = "g"))
+tmp$p.value
+(tmp <- wilcox.test(z_scores_df[Sex == "Female" & Zq < 0.05]$Zge,alternative = "g"))
+tmp$p.value
+```
+
+
+
+#### What E effects overlap with G effect?
+```{r,fig.height=5}
+ggplot(melt(male_gpe_model[Eq < 0.05, .(Gest, Eest, cpg, SNP)]), aes(variable, abs(value), color = cpg)) +
+  geom_point() +
+  geom_line(aes(group = interaction(SNP, cpg))) +
+  facet_wrap(~cpg)
+ggboxplot(
+  melt(male_gpe_model[Eq < 0.05, .(G = abs(Gest), E = abs(Eest), cpg, SNP)]),
+  "variable",
+  "value",
+  facet.by = "cpg",
+  fill = "lightsteelblue2"
+) +
+  stat_compare_means(comparisons = list(c("G", "E")), vjust = 1.1, tip.length = 0) +
+  theme_classic()
+
+
+
+ggplot(melt(male_gpe_model[Gq < 0.05 & Eq < 0.05, .(Gt, Et, cpg, SNP)]), aes(variable, abs(value), color = cpg)) +
+  geom_point() +
+  geom_line(aes(group = interaction(SNP, cpg))) +
+  facet_wrap(~cpg)
+ggboxplot(
+  melt(male_gpe_model[Gq < 0.05 & Eq < 0.05, .(G = abs(Gt), E = abs(Et), cpg, SNP)]),
+  "variable",
+  "value",
+  facet.by = "cpg",
+  fill = "lightsteelblue2"
+) +
+  stat_compare_means(comparisons = list(c("G", "E")), vjust = 1.2, tip.length = ) +
+  theme_classic() + labs(x = "Variable", y = "|Effect|")
+```
+```{r}
+ggplot(melt(male_gpe_model[Eq < 0.05, .(Gt, Et, cpg, SNP)]), aes(variable, abs(value), color = cpg)) +
+  geom_point() +
+  geom_line(aes(group = interaction(SNP, cpg))) +
+  facet_wrap(~cpg)
+ggboxplot(
+  melt(male_gpe_model[Eq < 0.05, .(G = abs(Gt), E = abs(Et), cpg, SNP)]),
+  "variable",
+  "value",
+  facet.by = "cpg",
+  palette = c(),
+  fill = "lightsteelblue2"
+) +
+  stat_compare_means(comparisons = list(c("G", "E")), vjust = 1.1, tip.length = 0) +
+  theme_classic()
+
+
+
+ggplot(melt(male_gpe_model[Gq < 0.05 & Eq < 0.05, .(Gt, Et, cpg, SNP)]), aes(variable, abs(value), color = cpg)) +
+  geom_point() +
+  geom_line(aes(group = interaction(SNP, cpg))) +
+  facet_wrap(~cpg)
+ggboxplot(
+  melt(male_gpe_model[Gq < 0.05 & Eq < 0.05, .(G = abs(Gt), E = abs(Et), cpg, SNP)]),
+  "variable",
+  "value",
+  facet.by = "cpg",
+  fill = "lightsteelblue2"
+) +
+  stat_compare_means(comparisons = list(c("G", "E")), vjust = 1.2, tip.length = ) +
+  theme_classic() + labs(x = "Variable", y = "|t|")
+```
+
+
+#### Which pesticides and which SNPs
+```{r}
+unique(male_gpe_model[Eq < 0.05]$env)
+unique(female_gpe_model[Eq < 0.05]$env)
+
+male_gpe_model[Gq < 0.05, .SD[which.min(Gq)], by = "cpg"]
+female_gpe_model[Gq < 0.05, .SD[which.min(Gq)], by = "cpg"]
+
+males_pd_G <- males_pd[model == "G"]
+males_pd_G$Gq <- p.adjust(males_pd_G$Gp, method = "BH")
+females_pd_G <- females_pd[model == "G"]
+females_pd_G$Gq <- p.adjust(females_pd_G$Gp, method = "BH")
+
+males_pd_G[Gq < 0.05, .SD[which.min(Gq)], by = "cpg"]
+females_pd_G[Gq < 0.05, .SD[which.min(Gq)], by = "cpg"]
+```
+
+### model Ranking final results
+
+#### Plot interaction for GxE in females
+```{r}
+
+```
+### Replication of G models in DIPGD
+
+```{r}
+female_g_digpd <- fread("female_digpd_pd_f_G_dnam_breakdown.txt.gz")
+f_dmrs_digpd <- fread("/home1/NEURO/SHARE_DECIPHER/DMRs/DIGPD/sig.cpgs.DIGPD.F.csv")[, .SD[which.min(HMFDR)], by = "dmr"]
+female_g_digpd[, `:=`(Gq = p.adjust(Gp, method = "BH"))]
+sig_female_G_digpd <- merge(f_dmrs_digpd, female_g_digpd[Gq < 0.05, .SD[which.min(Gq)], by = "cpg"], by = "cpg")
+
+male_g_digpd <- fread("male_digpd_pd_f_G_dnam_breakdown.txt.gz")
+m_dmrs_digpd <- fread("/home1/NEURO/SHARE_DECIPHER/DMRs/DIGPD/sig.cpgs.DIGPD.M.csv")[, .SD[which.min(HMFDR)], by = "dmr"]
+male_g_digpd[, `:=`(Gq = p.adjust(Gp, method = "BH"))]
+sig_male_G_digpd <- merge(m_dmrs_digpd, male_g_digpd[Gq < 0.05, .SD[which.min(Gq)], by = "cpg"], by = "cpg")
+```
+```{r}
+female_overlap_G <- merge(females_pd_G[Gq < 0.05], female_g_digpd[Gq < 0.05], by = c("cpg", "SNP"))
+female_overlap_G_min_snp <- merge(females_pd_G[Gq < 0.05, .SD[which.min(Gq)], by = "cpg"], female_g_digpd[Gq < 0.05, .SD[which.min(Gq)], by = "cpg"], by = c("cpg", "SNP"))
+female_overlap_G_cpg <- merge(females_pd_G[Gq < 0.05, .SD[which.min(Gq)], by = "cpg"], female_g_digpd[Gq < 0.05, .SD[which.min(Gq)], by = "cpg"], by = c("cpg"))
+female_overlap_G # SNP-CpG pairs significant in both cohorts
+female_overlap_G_min_snp # overlap in minimum significant SNP per CpG in cohorts
+female_overlap_G_cpg # overlap in CpGs with significant SNP between cohorts
+sig_female_G_digpd # Representative DMRs for DIGPD with a significant G effect
+
+
+male_overlap_G <- merge(males_pd_G[Gq < 0.05], male_g_digpd[Gq < 0.05], by = c("cpg", "SNP"))
+male_overlap_G_min_snp <- merge(males_pd_G[Gq < 0.05, .SD[which.min(Gq)], by = "cpg"], male_g_digpd[Gq < 0.05, .SD[which.min(Gq)], by = "cpg"], by = c("cpg", "SNP"))
+male_overlap_G_cpg <- merge(males_pd_G[Gq < 0.05, .SD[which.min(Gq)], by = "cpg"], male_g_digpd[Gq < 0.05, .SD[which.min(Gq)], by = "cpg"], by = c("cpg"))
+male_overlap_G
+male_overlap_G_min_snp
+male_overlap_G_cpg
+sig_male_G_digpd
+```
+
+## Plot out overlap
+```{r}
+sig_female_G_digpd[cpg %in% female_overlap_G_cpg$cpg]
+library(VennDiagram)
+venn.diagram(
+  x = list(
+    unique(females_pd_G[Gq < 0.05]$cpg),
+    unique(female_g_digpd[Gq < 0.05]$cpg),
+    unique(males_pd_G[Gq < 0.05]$cpg),
+    unique(male_g_digpd[Gq < 0.05]$cpg)
+  ),
+  category.names = c("TERRE Females", "DIGPD Females", "TERRE males", "DIGPD males"),
+  filename = "terre_digpd_cpg_overlap_G.png",
+  output = TRUE,
+  imagetype = "png",
+  height = 480,
+  width = 480,
+  resolution = 300,
+  compression = "lzw",
+  lwd = 1,
+  col = c("#eea2adff", "#8b5f65ff", "#bcd2eeff", "#6e7b8bff"),
+  fill = c(alpha("#eea2adff", 0.3), alpha("#8b5f65ff", 0.3), alpha("#bcd2eeff", 0.3), alpha("#6e7b8bff", 0.3)),
+  cex = 0.5,
+  fontfamily = "sans",
+  cat.cex = 0.3,
+  cat.default.pos = "outer",
+  cat.pos = c(-27, 27, -27, 27),
+  cat.dist = c(0.055, 0.055, 0.055, 0.055),
+  cat.fontfamily = "sans"
+  #         cat.col = c("#440154ff", '#21908dff'),
+  #         rotation = 1
+)
+
+
+venn.diagram(
+  x = list(
+    unique(females_pd_G[, .SD[all(Gq > 0.05)], by = "cpg"]$cpg),
+    unique(female_g_digpd[, .SD[all(Gq > 0.05)], by = "cpg"]$cpg),
+    unique(males_pd_G[, .SD[all(Gq > 0.05)], by = "cpg"]$cpg),
+    unique(male_g_digpd[, .SD[all(Gq > 0.05)], by = "cpg"]$cpg)
+  ),
+  category.names = c("TERRE Females", "DIGPD Females", "TERRE males", "DIGPD males"),
+  filename = "terre_digpd_cpg_overlap_no_G.png",
+  output = TRUE,
+  imagetype = "png",
+  height = 480,
+  width = 480,
+  resolution = 300,
+  compression = "lzw",
+  lwd = 1,
+  col = c("#eea2adff", "#8b5f65ff", "#bcd2eeff", "#6e7b8bff"),
+  fill = c(alpha("#eea2adff", 0.3), alpha("#8b5f65ff", 0.3), alpha("#bcd2eeff", 0.3), alpha("#6e7b8bff", 0.3)),
+  cex = 0.5,
+  fontfamily = "sans",
+  cat.cex = 0.3,
+  cat.default.pos = "outer",
+  cat.pos = c(-27, 27, -27, 27),
+  cat.dist = c(0.055, 0.055, 0.055, 0.055),
+  cat.fontfamily = "sans"
+  #         cat.col = c("#440154ff", '#21908dff'),
+  #         rotation = 1
+)
+```
+
+```{r}
+library(fastSave)
+cur_env <- Sys.getenv("PATH")
+Sys.setenv(PATH = paste(cur_env, "/home1/NEURO/casazza/miniconda3/bin", sep = ":"))
+# save.image.lbzip2(n.cores=16)
+load.lbzip2(".RDataFS",n.cores=32)
+```
+
+### mQTL replication
+```{r}
+sig_terre_m <- fread("/home1/NEURO/casazza/prs_ewas_integration/cis_mQTL_analyses/terre_data/male_cis_mqtl_PD_CTP_sig.txt.gz")
+sig_terre_f <- fread("/home1/NEURO/casazza/prs_ewas_integration/cis_mQTL_analyses/terre_data/female_cis_mqtl_PD_CTP_sig.txt.gz")
+sig_terre <- fread("/home1/NEURO/casazza/prs_ewas_integration/cis_mQTL_analyses/terre_data/cis_mqtl_PD_CTP_sig.txt.gz")
+# digpd_all <- fread("/home1/NEURO/casazza/prs_ewas_integration/cis_mQTL_analyses/digpd_data/cis_all_impute_mQTL_results_CTP.txt")
+digpd_m <- fread("/home1/NEURO/casazza/prs_ewas_integration/cis_mQTL_analyses/digpd_data/male_cis_all_impute_mQTL_results_PD_CTP_no_mut.txt.gz")
+digpd_f <- fread("/home1/NEURO/casazza/prs_ewas_integration/cis_mQTL_analyses/digpd_data/female_cis_all_impute_mQTL_results_PD_CTP_no_mut.txt.gz")
+
+# merged <- merge(sig_terre, digpd_all, by = c("SNP", "gene"))
+merged_f <- merge(sig_terre_f, digpd_f, by = c("SNP", "gene"))
+merged_m <- merge(sig_terre_m, digpd_m, by = c("SNP", "gene"))
+```
+
+```{r}
+# length(merged$`FDR.y`)
+# sum(merged$`FDR.y` < 0.05)
+#
+# sum(merged$`FDR.y` < 0.05) / length(merged$`FDR.y`)
+#
+# nrow(merged[FDR.y < 0.05, .SD[which.min(`p-value.y`)], by = "gene"])
+# length(unique(merged$gene))
+# nrow(merged[FDR.y < 0.05, .SD[which.min(`p-value.y`)], by = "gene"]) / length(unique(merged$gene))
+
+
+
+length(merged_f$`FDR.y`)
+sum(merged_f$`FDR.y` < 0.05)
+
+sum(merged_f$`FDR.y` < 0.05) / length(merged_f$`FDR.y`)
+
+nrow(merged_f[FDR.y < 0.05, .SD[which.min(`p-value.y`)], by = "gene"])
+length(unique(merged_f$gene))
+nrow(merged_f[FDR.y < 0.05, .SD[which.min(`p-value.y`)], by = "gene"]) / length(unique(merged_f$gene))
+
+
+
+length(merged_m$`FDR.y`)
+sum(merged_m$`FDR.y` < 0.05)
+
+sum(merged_m$`FDR.y` < 0.05) / length(merged_m$`FDR.y`)
+
+nrow(merged_m[FDR.y < 0.05, .SD[which.min(`p-value.y`)], by = "gene"])
+length(unique(merged_m$gene))
+```
+```{r}
+source("~/pi0.tst.R")
+library(multtest)
+1 - pi0.tst(merged_f$`p-value.y`)
+1 - pi0.tst(merged_m$`p-value.y`)
+```
+
+
+### DMRs in either dataset with a significant genetic effect in both datasets
+```{r}
+(terre_f_dmr <- fread("/home1/NEURO/SHARE_DECIPHER/DMRs/TERRE/sig.cpgs.TERRE.F.HT.ancestry.csv"))
+nrow(terre_f_dmr[threshold== TRUE])
+(terre_m_dmr <- fread("/home1/NEURO/SHARE_DECIPHER/DMRs/TERRE/sig.cpgs.TERRE.M.HT.ancestry.csv"))
+nrow(terre_m_dmr[threshold== TRUE])
+
+(digpd_f_dmr <- fread("/home1/NEURO/SHARE_DECIPHER/DMRs/DIGPD/sig.cpgs.DIGPD.F.noGBA.csv"))
+nrow(digpd_f_dmr[threshold== TRUE])
+(digpd_m_dmr <- fread("/home1/NEURO/SHARE_DECIPHER/DMRs/DIGPD/sig.cpgs.DIGPD.M.nomut.csv"))
+nrow(digpd_m_dmr[threshold== TRUE])
+```
+```{r}
+get_sig_dmr <- function(dmr_table, mqtl_dt){
+  mQTLs <- mqtl_dt[dmr_table$cpg,on="gene",nomatch=0]
+  res<- mQTLs[FDR < 0.05,.SD[which.min(`p-value`)],by="gene"]
+  dmrs <- unique(dmr_table[res$gene,on="cpg"]$dmr)
+  genes <- unique(dmr_table[res$gene,on="cpg"]$genes)
+  res <- list(res=res,dmr=dmrs,genes=genes)
+  return(res)
+}
+res1 <- get_sig_dmr(terre_f_dmr[sig_terre_f[FDR < 0.05]$gene, on="cpg",nomatch=0],digpd_f)
+res2 <- get_sig_dmr(terre_m_dmr[sig_terre_m[FDR < 0.05]$gene, on="cpg",nomatch=0],digpd_m)
+
+res3 <- get_sig_dmr(digpd_f_dmr[digpd_f[FDR < 0.05]$gene, on="cpg",nomatch=0],sig_terre_f)
+res4 <- get_sig_dmr(digpd_m_dmr[digpd_m[FDR < 0.05]$gene, on="cpg",nomatch=0],sig_terre_m)
+
+print(length(unique(res1$dmr)))
+print(length(unique(res2$dmr)))
+print(length(unique(res3$dmr)))
+print(length(unique(res4$dmr)))
+
+print(length(unique(res1$res$gene)))
+print(length(unique(res2$res$gene)))
+print(length(unique(res3$res$gene)))
+print(length(unique(res4$res$gene)))
+
+print(unique(res1$genes))
+print(unique(res2$genes))
+print(unique(res3$genes))
+print(unique(res4$genes))
+```
+```{r}
+
+res1 <- get_sig_dmr(terre_f_dmr[sig_terre_f[FDR < 0.05]$gene, on="cpg",nomatch=0][threshold == TRUE],digpd_f)
+res2 <- get_sig_dmr(terre_m_dmr[sig_terre_m[FDR < 0.05]$gene, on="cpg",nomatch=0][threshold == TRUE],digpd_m)
+
+res3 <- get_sig_dmr(digpd_f_dmr[digpd_f[FDR < 0.05]$gene, on="cpg",nomatch=0][threshold == TRUE],sig_terre_f)
+res4 <- get_sig_dmr(digpd_m_dmr[digpd_m[FDR < 0.05]$gene, on="cpg",nomatch=0][threshold == TRUE],sig_terre_m)
+
+print(length(unique(res1$dmr)))
+print(length(unique(res2$dmr)))
+print(length(unique(res3$dmr)))
+print(length(unique(res4$dmr)))
+print(length(unique(res1$res$gene)))
+print(length(unique(res2$res$gene)))
+print(length(unique(res3$res$gene)))
+print(length(unique(res4$res$gene)))
+print(unique(res1$genes))
+print(unique(res2$genes))
+print(unique(res3$genes))
+print(unique(res4$genes))
+```
+
+
+####Permutation testing
+Select random sets CpG sites of same size for dataset and test replication (i.e. is the replication in which sets of CpG sites have an mQTL more or less than expected by chances):
+
+1. Take all CpG sites in both data sets
+2. get a subset of __ CpGs in males and __ CpGs in females for TERRE, __ CpGs in males and __ CpGs in females for TERRE for DIGPD
+3. get which CpG has an mQTL at FDR < 0.05
+4. count overlap in DMRs between datasets
+5.  repeat 1000 Times and plot distribution of replication
+```{r}
+epic_cpgs <- fread("~/MethylationEPIC_v-1-0_B4.csv", skip = 7, fill = TRUE)$Name
+male_n <- uniqueN(male_gpe_model$cpg)
+female_n <- uniqueN(female_gpe_model$cpg)
+```
+```{r}
+m_dmrs_digpd
+```

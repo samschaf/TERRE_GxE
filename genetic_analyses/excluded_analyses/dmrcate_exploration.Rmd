@@ -1,0 +1,14 @@
+---
+title: "DMRcate Exploration"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(DMRcate)
+library(tidyverse)
+library(data.table)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# TERRE
+Data loading and prep:

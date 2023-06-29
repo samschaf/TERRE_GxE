@@ -1,0 +1,69 @@
+---
+title: "mQTL data prep"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(data.table)
+library(minfi)
+Sys.setlocale("LC_MESSAGES", "en_US.utf8")
+knitr::opts_knit$set(root.dir = "~/prs_ewas_integration/cis_mQTL_analyses")
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, cache.lazy = FALSE, autodep = TRUE)
+```
+
+# TERRE
+```{r}
+male_meta <- fread("/home1/NEURO/SHARE_DECIPHER/processed_DNAm_data/2022/TERRE_processed_2022/3-terre_meta_M_probit_matched_4.5.3.csv")
+female_meta <- fread("/home1/NEURO/SHARE_DECIPHER/processed_DNAm_data/2022/TERRE_processed_2022/3-terre_meta_F_probit_matched_4.5.3.csv")
+genotype <- fread("~/genotype_qc/TERRE_QC/raw_data.imputed.r2_30.maf_mismatch.traw")
+colnames(genotype) <- gsub("_","-",gsub("PAE_(.*)_PAE.*", "\\1",colnames(genotype)))
+load("/home1/NEURO/SHARE_DECIPHER/processed_DNAm_data/2022/TERRE_processed_2022/1-TERRE_RG_filtered.RData")#methylation
+```
+
+## Format Covariates
+```{r}
+methy <- getBeta(PD_RG_filtered)
+methy <- methy[,colnames(methy) %in% colnames(genotype)]
+genotype <- genotype[,colnames(genotype) %in% c(colnames(genotype)[1:6],colnames(methy)),with=FALSE]
+all(colnames(genotype)[-c(1:6)] == colnames(methy))
+
+female_meta <- female_meta[female_meta$patient %in% colnames(methy)]
+male_meta <- male_meta[male_meta$patient %in% colnames(methy)]
+```
+```{r}
+methy <- as.data.table(methy,keep.rownames = "cpg")
+# Male data
+fwrite(methy[,c("cpg",male_meta$patient),with=FALSE],"male_methy_2022.txt.gz",sep='\t',quote=F)
+fwrite(genotype[,c("SNP",male_meta$patient),with=FALSE],"male_geno_2022.txt.gz",sep='\t',quote=F)
+fwrite(male_meta[,.(PD,age,smoking,alcohol1,head_trauma, CTP_PC1,CTP_PC2,CTP_PC3,CTP_PC4,CTP_PC5,CTP_PC6,ancestryPC1,ancestryPC2,ancestryPC3,plate,SentrixPosition_A,weights)],"male_meta_2022_w_weights.txt.gz",sep='\t',quote=F)
+male_meta_to_write <-as.data.table(model.matrix(~0+.,data=male_meta[,.(PD,age,smoking,alcohol1=factor(alcohol1),head_trauma, CTP_PC1,CTP_PC2,CTP_PC3,CTP_PC4,CTP_PC5,CTP_PC6,ancestryPC1,ancestryPC2,ancestryPC3,plate=factor(plate),SentrixPosition_A=factor(SentrixPosition_A))]))
+fwrite(transpose(male_meta_to_write, keep.names = "id"),"male_meta_2022_no_weights.txt.gz",sep='\t',quote=F)
+# Female data
+fwrite(methy[,c("cpg",female_meta$patient),with=FALSE],"female_methy_2022.txt.gz",sep='\t',quote=F)
+fwrite(genotype[,c("SNP",female_meta$patient),with=FALSE],"female_geno_2022.txt.gz",sep='\t',quote=F)
+fwrite(female_meta[,.(PD,age,smoking,alcohol1,head_trauma, CTP_PC1,CTP_PC2,CTP_PC3,CTP_PC4,CTP_PC5,CTP_PC6,ancestryPC1,ancestryPC2,ancestryPC3,plate,SentrixPosition_A,weights)],"female_meta_2022_w_weights.txt.gz",sep='\t',quote=F)
+female_meta_to_write <- as.data.table(model.matrix(~0+.,data=female_meta[,.(PD,age,smoking,alcohol1=factor(alcohol1),head_trauma, CTP_PC1,CTP_PC2,CTP_PC3,CTP_PC4,CTP_PC5,CTP_PC6,ancestryPC1,ancestryPC2,ancestryPC3,plate=factor(plate),SentrixPosition_A=factor(SentrixPosition_A))]))
+fwrite(transpose(female_meta_to_write, keep.names = "id"),"female_meta_2022_no_weights.txt.gz",sep='\t',quote=F)
+```
+
+## format for cross-sex and PRS work
+```{r}
+pc_data <- prcomp(methy[,-c(1)][,rbind(male_meta,female_meta)$patient,with=FALSE], center=TRUE,scale.=TRUE, rank.=10)
+```
+
+```{r}
+male_meta$sex <- 1
+female_meta$sex <- 0
+cross <- data.table(cbind(rbind(male_meta,female_meta),pc_data$rotation))
+```
+
+```{r}
+covar_names <- c("sex","age",paste0("ancestryPC",1:3),paste0("PC",1:10))
+cross[,..covar_names]
+fwrite(genotype[,c("SNP",cross$patient),with=FALSE],"all_geno_2022.txt",sep='\t',quote=F)
+fwrite(methy[,c("cpg",cross$patient),with=FALSE],"all_methy_2022.txt",sep='\t',quote=F)
+fwrite(transpose(data.table(model.matrix(~0+.,data=cross[,..covar_names])),keep.names = "id"),"all_meta_2022_prs.txt",sep='\t', quote=F)
+fwrite(transpose(data.table(model.matrix(~0+.-sex,data=cross[sex==1,..covar_names])),keep.names = "id"),"male_meta_2022_prs.txt",sep='\t', quote=F)
+fwrite(transpose(data.table(model.matrix(~0+.-sex,data=cross[sex==0,..covar_names])),keep.names = "id"),"female_meta_2022_prs.txt",sep='\t', quote=F)
+```

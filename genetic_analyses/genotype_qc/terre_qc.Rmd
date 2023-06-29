@@ -1,0 +1,230 @@
+---
+title: "TERRE QC"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(data.table)
+Sys.setenv(lang = "en_US")
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Generating cluster file and other resources
+```{r}
+terre_fam <- read.delim("TERRE_QC/raw_data.fam", sep="", header=F)
+metadata_w_race <- read.delim("/home1/NEURO/SHARE_DECIPHER/Genetic_data/TERRE/_covar_terre.txt", sep="")%>% 
+  mutate(
+    FID = gsub("(PAE_[0-9]*_[1-9]*)_.*","\\1",FID),
+    IID = gsub("(PAE_[0-9]*_[1-9]*)_.*","\\1",IID)
+  )
+metadata <- read.csv("/home1/NEURO/SHARE_DECIPHER/terre_meta_master.csv") %>% 
+  mutate(
+    FID = gsub("(PAE_[0-9]*_[1-9]*)_.*","\\1",FID),
+    IID = gsub("(PAE_[0-9]*_[1-9]*)_.*","\\1",IID)
+  )
+terre_fam %>% 
+  left_join(
+    metadata_w_race,
+    c("V1"="FID","V2"="IID")
+  ) %>%
+  select(V1,V2,race1) %>% 
+  write_delim("TERRE_QC/raw_data.clst",col_names=F,quote=F)
+
+```
+
+
+# Pre-Imputation QC DIGPD Cases
+## individual filtering 
+
+```{bash}
+source ~/miniconda3/bin/activate
+conda activate snakemake
+snakemake --configfile config.yaml -j4 TERRE_QC/raw_data.geno.maf.mind.sex_check.het_filter.fam
+cat TERRE_QC/raw_data_precleaning.log
+cat TERRE_QC/raw_data_individual_qc.log
+```
+## Plot Fhet within Cluster
+```{r}
+het_clst <- fread("TERRE_QC/raw_data.clst")
+het_data <- fread("TERRE_QC/raw_data.geno.maf.mind.sex_check.het")
+het_plot <- merge(het_data,het_clst,by.x=c("FID","IID"),by.y=c("V1","V2"))
+ggplot(het_plot %>% mutate(race1=as.factor(V3)),aes(F,fill=race1)) + geom_histogram(bins=30) + ggtitle(expression(F[het]~DIGPD~Cases))
+```
+## IBD filtering
+```{bash}
+source ~/miniconda3/bin/activate
+conda activate snakemake
+snakemake --configfile config.yaml -j4 TERRE_QC/raw_data.geno.maf.mind.sex_check.het_filter.ibd_filter.fam
+```
+### Distribution of PI_HAT
+```{r}
+ibd_report <- fread("TERRE_QC/raw_data.genome.gz")
+ggplot(ibd_report, aes(PI_HAT)) + geom_histogram(bins=100)
+ibd_report[PI_HAT > 0.2]
+```
+
+## PCA
+```{bash}
+source ~/miniconda3/bin/activate
+conda activate snakemake
+snakemake --configfile config.yaml -j4 TERRE_QC/raw_data.1kg_pca.pcs
+```
+
+First check my populations:
+```{r}
+plot_pcs <- function(dat,pc_col1,pc_col2,pc,perc){
+    p1 <- dat %>%  
+      ggplot(aes(.data[[pc_col1]],.data[[pc_col2]],color=`Reported ethnicity`))+ 
+        geom_point() +
+        scale_color_manual(values=c("Caucasian"= "black","North African"="dark red"))+
+        labs(x=sprintf("PC%d (%2.2f%%)",pc, perc[1]),y=sprintf("PC%d (%2.2f%%)",pc+1,perc[2])) +
+        theme_minimal(base_size = 16)
+    return(p1)
+    print(p1)
+}
+terre_pcs <- fread("TERRE_QC/raw_data.geno.maf.mind.sex_check.het_filter.ibd_filter.eigenvec")
+terre_val <- fread("TERRE_QC/raw_data.geno.maf.mind.sex_check.het_filter.ibd_filter.eigenval")
+metadata_w_race <- as.data.table(metadata_w_race)
+terre_pcs$`Reported ethnicity` <- recode_factor(metadata_w_race[IID %in% terre_pcs$V2][match(IID,terre_pcs$V2,)]$race1,`1`="Caucasian", `6`="North African")
+terre_perc <- terre_val$V1 / sum(terre_val$V1) *100
+control_pcs <- fread("DIGPD_control_QC/raw_data.geno.maf.mind.sex_check.het_filter.ibd_filter.eigenvec")
+control_val <- fread("DIGPD_control_QC/raw_data.geno.maf.mind.sex_check.het_filter.ibd_filter.eigenval")
+control_perc <- control_val$V1 / sum(control_val$V1) *100
+cases_pcs <- fread("DIGPD_case_QC/raw_data.geno.maf.mind.sex_check.het_filter.ibd_filter.eigenvec")
+cases_val <- fread("DIGPD_case_QC/raw_data.geno.maf.mind.sex_check.het_filter.ibd_filter.eigenval")
+cases_perc <- cases_val$V1 / sum(cases_val$V1) *100
+p1 <- plot_pcs(terre_pcs,"V3","V4",1,terre_perc[1:2])
+p2 <- plot_pcs(terre_pcs,"V4","V5",2,terre_perc[2:3])
+p3 <- plot_pcs(cases_pcs,"V3","V4",1,cases_perc[1:2])
+p4 <- plot_pcs(cases_pcs,"V4","V5",2,cases_perc[2:3])
+p5 <- plot_pcs(control_pcs,"V3","V4",1,control_perc[1:2])
+p6 <- plot_pcs(control_pcs,"V4","V5",2,control_perc[2:3])
+print(p1)
+print(p2)
+print(p3)
+print(p4)
+print(p5)
+print(p6)
+```
+
+### Projected data:
+```{r}
+panel_file <- fread("~/1000G_plink/integrated_call_samples_v3.20130502.ALL.panel")
+kg_case_matched_pcs <- fread("TERRE_QC/raw_data.1kg_pca.pcs") %>% inner_join(panel_file, by=c("IID"="sample")) %>% select(FID,IID,contains("PC"),pop,super_pop)
+cases_projected <- fread("TERRE_QC/raw_data.kg_projection.txt")%>% inner_join(metadata,by = c("FID","IID"))  %>% select(FID,IID,contains("PC"),race1)%>% rename(pop=race1) %>% mutate(super_pop="TERRE_DATA")
+kg_case_pcs <- rbind(kg_case_matched_pcs,cases_projected) 
+just_eur_kg_case_pcs <- kg_case_pcs%>% filter(super_pop  %in% c("EUR","TERRE_DATA"))
+ggplot(kg_case_pcs,aes(PC1,PC2,color=super_pop)) + geom_point()
+ggplot(kg_case_pcs,aes(PC2,PC3,color=super_pop)) + geom_point()
+ggplot(kg_case_pcs,aes(PC3,PC4,color=super_pop)) + geom_point()
+ggplot(kg_case_pcs,aes(PC4,PC5,color=super_pop)) + geom_point()
+ggplot(just_eur_kg_case_pcs,aes(PC1,PC2,color=pop,shape=super_pop)) + geom_point()
+ggplot(just_eur_kg_case_pcs,aes(PC2,PC3,color=pop,shape=super_pop)) + geom_point()
+ggplot(just_eur_kg_case_pcs,aes(PC3,PC4,color=pop,shape=super_pop)) + geom_point()
+ggplot(just_eur_kg_case_pcs,aes(PC4,PC5,color=pop,shape=super_pop)) + geom_point()
+ggplot(just_eur_kg_case_pcs,aes(PC5,PC6,color=pop,shape=super_pop)) + geom_point()
+write_delim(data.frame(population=unique(panel_file$pop[panel_file$super_pop =="EUR"]),is_super_pop=F),"TERRE_QC/raw_data.ancestry_clusters.txt")
+```
+### ancestry assignment and filtering
+```{bash}
+source ~/miniconda3/bin/activate
+conda activate snakemake
+snakemake --configfile config.yaml -j4 TERRE_QC/raw_data_assigned_ancestry.clst
+```
+
+## Batch association
+get covariates to associate:
+```{r}
+read.delim("TERRE_QC/raw_data.geno.maf.mind.sex_check.het_filter.ibd_filter.ancestry.fam",sep="",header=F) %>%
+  left_join(metadata,by = c("V1"="FID","V2"="IID")) %>% select(plate) %>% write_delim("TERRE_QC/raw_data_sample_batches.txt")
+```
+```{bash}
+source ~/miniconda3/bin/activate
+conda activate snakemake
+snakemake --configfile config.yaml -j4 TERRE_QC/raw_data.geno.maf.mind.sex_check.het_filter.ibd_filter.ancestry.batch.bed
+```
+```{r}
+library(qqman)
+fnames <- dir("TERRE_QC", pattern = "raw_data.*.assoc.logistic", full.names = TRUE)
+reg <- lapply(fnames, function(x)fread(x)[TEST == "ADD"])
+batch  <- gsub(".*raw_data_(.*).assoc.logistic","\\1",fnames)
+names(reg) <-batch
+lapply(batch, function(x){
+  qq(reg[[x]]$P,main=x)
+  manhattan(na.omit(reg[[x]]),main=x)
+})
+
+```
+## Hardy weinberg 
+```{bash}
+source ~/miniconda3/bin/activate
+conda activate snakemake
+snakemake --configfile config.yaml -j4 TERRE_QC/raw_data.geno.maf.mind.sex_check.het_filter.ibd_filter.ancestry.batch.hwe.bed
+```
+## pre-imputation prep
+```{bash}
+source ~/miniconda3/bin/activate
+conda activate snakemake
+snakemake --configfile config.yaml -j4  TERRE_QC/raw_data.pre_imputation.vcf.gz
+```
+# Post imputation QC
+Concatenate MIS output, check cumulative frequency plot of R2 scores, and filter out variants with an R2 < 0.3:
+```{bash}
+<!-- source ~/miniconda3/bin/activate -->
+conda activate snakemake
+snakemake --configfile config.yaml -j4 TERRE_QC/info_plot.png
+```
+
+![](TERRE_QC/info_plot.png)
+
+## MAF matching
+```{bash}
+source ~/miniconda3/bin/activate
+conda activate snakemake
+snakemake --configfile config.yaml -j20 TERRE_QC/raw_data.imputed.r2_30.maf_mismatch.traw
+```
+Plotting this matched data out:
+```{r}
+kg_freq <- fread("TERRE_QC/imputed_freq_dosages_1kg_IBS.afreq")
+my_freq <- fread("TERRE_QC/imputed_freq_dosages_IBS.afreq")
+merged_freq <- merge(my_freq,kg_freq,by=c("#CHROM","ID"))
+ggplot(merged_freq, aes(ALT_FREQS.x,ALT_FREQS.y)) + geom_bin2d()
+```
+
+## Batch association
+## check batch association
+```{r}
+read.delim("TERRE_QC/all_imputed_r2_30_rsid.sample",sep="") %>% left_join(metadata,by = c("ID_1"="FID","ID_2"="IID")) %>% filter(ID_1 != 0) %>% mutate(PD=status) %>% select(PD) %>% write_delim("TERRE_QC/imputed_sample_batches.txt")
+```
+
+```{bash}
+source ~/miniconda3/bin/activate
+conda activate snakemake
+snakemake --configfile config.yaml -j20 TERRE_QC/raw_data.imputed.r2_30.maf_mismatch.batch.gen
+```
+```{r}
+library(qqman)
+library(data.table)
+reg_results <- fread("TERRE_QC/imputed_dosage_batch_0.PD0.glm.logistic.hybrid.gz")
+reg_results <- reg_results[TEST == "ADD"]
+qq(reg_results$P)
+reg_results$CHR <- reg_results$`#CHROM`
+reg_results$BP <- reg_results$POS
+manhattan(reg_results)
+```
+```{r}
+reg_results <- fread("TERRE_QC/imputed_dosage_batch_0.PD0.glm.logistic.hybrid.gz")
+reg_results <- reg_results[TEST == "ADD"]
+
+median(reg_results$Z_STAT^2)/ qchisq(0.5, 1)
+```
+
+## hard calling
+
+```{bash}
+source ~/miniconda3/bin/activate
+conda activate snakemake
+snakemake --configfile config.yaml -j20 TERRE_QC/raw_data.imputed.r2_30.hard_call.maf_mismatch.bed
+```
+

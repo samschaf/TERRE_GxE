@@ -1,0 +1,410 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(data.table)
+
+Sys.setlocale("LC_MESSAGES", "en_US.utf8")
+knitr::opts_chunk$set(echo = TRUE, cache = FALSE, eval = TRUE, autodep = TRUE)
+```
+
+# Process for whole- model testing
+- Step 1: read in data, run multiple test correction
+- step 2: remove those which don't pass a significance threshold
+- step 3: rank by AIC
+Loading in all experiments
+```{r}
+f_dmrs <- fread("/home1/NEURO/SHARE_DECIPHER/processed_DNAm_data/2022/TERRE_processed_2022/4-rlm_F_adjDB_042023.csv")[threshold_adjDB==  TRUE]
+f_dmrs <- f_dmrs[,-c("Index","TargetID.1")]
+m_dmrs <- fread("/home1/NEURO/SHARE_DECIPHER/processed_DNAm_data/2022/TERRE_processed_2022/4-rlm_M_adjDB_042023.csv")[threshold_adjDB == TRUE]
+m_dmrs <- m_dmrs[,-c("threshold0.1_adjDB")]
+female_imputations <- fread("imputations_female.csv")
+mean_female <-colMeans(female_imputations[,-c("X_imputation_","num")],na.rm=T)
+male_imputations <- fread("imputations_male.csv")
+mean_male <-colMeans(male_imputations[,-c("X_imputation_","num")],na.rm=T)
+males_pd <- rbindlist(
+  lapply(
+    Sys.glob("male_*_dnam_breakdown.txt"),
+    function(f) fread(f, fill = TRUE)
+  ),
+  fill = TRUE
+)[m_dmrs,on=c("cpg"="NAME"),nomatch=0][env %in% names(mean_male[mean_male >= 0.1]) | is.na(env)]
+males_pd[, `:=`(f_q = p.adjust(f_p, method = "BH")), by = c("model", "env")]
+females_pd <- rbindlist(
+  lapply(
+    Sys.glob("female_*_dnam_breakdown.txt"),
+    function(f) fread(f, fill = TRUE)
+  ),
+  fill = TRUE
+)[f_dmrs,on=c("cpg"="NAME"),nomatch=0][env %in% names(mean_female[mean_female >= 0.1]) | is.na(env)]
+females_pd[, `:=`(f_q = p.adjust(f_p, method = "BH")), by = c("model", "env")]
+males_pd$Sex <- "Male"
+females_pd$Sex <- "Female"
+combined_pd <- rbind(females_pd,males_pd)
+fwrite(rbind(f_dmrs, m_dmrs), "sex_combined_pd_cmrs.csv")
+fwrite(rbind(f_dmrs, m_dmrs)[,.(cpg=TargetID)], "sex_combined_pd_cmr_cpgs.txt")
+```
+
+## Exploring data
+Get average change in AIC per each model per sex:
+```{r}
+ggplot(combined_pd[, .(mean_delta_aic = mean(delta_aic)), by = c("cpg", "model", "Sex")], aes(model, mean_delta_aic, fill = Sex)) +
+  scale_fill_manual(values = c("Female" = "pink","Male" = "lightblue")) +
+  geom_dotplot(position = "dodge", binaxis = "y", binwidth = 1, stackgroups = TRUE, stackdir = "center", dotsize = 0.8) +
+  geom_hline(linetype = "dashed", yintercept = -2) +
+  theme_classic()
+
+
+ggplot(combined_pd[, .(min_delta_aic = min(delta_aic)), by = c("cpg", "model", "Sex")], aes(model, min_delta_aic, fill = Sex)) +
+  geom_dotplot(position = "dodge", binaxis = "y", binwidth = 1, stackgroups = TRUE, stackdir = "center", dotsize = 2) +
+  scale_fill_manual(values = c("Female" = "pink","Male" = "lightblue")) +
+  geom_hline(linetype = "dashed", yintercept = -2) +
+  theme_classic()
+```
+## Minimum AIC model
+```{r}
+males_aic <- males_pd[, .SD[which.min(aic)], by = "cpg"]
+males_aic$Sex <- "Male"
+females_aic <- females_pd[, .SD[which.min(aic)], by = "cpg"]
+females_aic$Sex <- "Female"
+
+
+ggplot(rbind(males_aic, females_aic)[f_q < 0.05], aes(model, fill = Sex)) +
+  geom_bar(position = position_dodge(width = 0.9)) +
+  geom_text(position = position_dodge(width = 0.9), stat = "count", aes(label = ..count..), vjust = -0.5) +
+  scale_fill_manual(values = c("Female" = "pink","Male" = "lightblue")) +
+  labs(x="",y="Number of CMRs")+
+  coord_cartesian(ylim = c(0, 40)) +
+  theme_classic(base_size = 16)
+ggplot(rbind(males_aic, females_aic)[f_q < 0.05], aes(model, delta_aic, fill = Sex)) +
+  geom_dotplot(position = "dodge", binaxis = "y", binwidth = 1, stackgroups = TRUE, stackdir = "center", dotsize = 3) +
+  scale_fill_manual(values = c("Female" = "pink","Male" = "lightblue")) +
+  labs(x="",y=bquote(Delta~"AIC from Baseline Model"))+
+  theme_classic(base_size = 16)
+rbind(males_aic, females_aic)[f_q > 0.05]
+rbind(males_aic, females_aic)[f_q < 0.05]
+fwrite(rbind(males_aic, females_aic)[f_q < 0.05], "top_cmr_models_aic_f_q05.csv", quote = F)
+
+rbind(males_aic, females_aic)[f_q < 0.05] %>% dplyr::select(cmrGR,env,matches(c("^E","^G[a-z]","^GxE"),ignore.case = F),aic,delta_aic,f_q)%>% write.csv(row.names = F,quote=F)
+rbind(males_aic, females_aic)[f_q < 0.05] %>% mutate(gene = sapply(UCSC_REFGENE_NAME,function(x)paste0(unique(strsplit(x,";")[[1]]),collapse="; "))) %>% dplyr::select(cmrGR,SNP,gene,env,Eest,Ese,Gest,Gse,GxEest,GxEse,aic,delta_aic,f_q,Sex,model)%>% write.csv(row.names = F,quote=F)
+```
+```{r}
+manifest <- IlluminaHumanMethylationEPICanno.ilm10b4.hg19::Other %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "cpg")
+
+males_aic %>%
+  left_join(
+    manifest %>% dplyr::select(cpg,contains("UCSC_RefGene")),
+    by="cpg"
+  ) %>%
+  dplyr::select(-starts_with("G"),-starts_with("E",ignore.case = FALSE),-starts_with("GxE"))
+females_aic %>%
+  left_join(
+    manifest %>% dplyr::select(cpg,contains("UCSC_RefGene")),
+    by="cpg"
+  ) %>%
+  dplyr::select(-starts_with("G"),-starts_with("E",ignore.case = FALSE),-starts_with("GxE"))
+```
+```{r}
+pd_sumstats <- fread("~/nallsEtAl2019_excluding23andMe_allVariants.tab.gz")
+```
+
+
+## SNP nearest gene info
+```{r}
+snp_pos <- fread("~/prs_ewas_integration/cis_mQTL_analyses/terre_data/snp_pos.txt")
+refgene <- fread("~/refgene.tsv")
+```
+```{r}
+male_pos <-snp_pos[males_aic[f_q < 0.05],on="SNP"]
+female_pos <-snp_pos[females_aic[f_q < 0.05],on="SNP"]
+male_pos[,.(cmrGR,geneSymbol,SNP,nearestGene=refgene[chrom == CHR]$name2[which.min(abs(POS-refgene[chrom == CHR]$txStart))],Eest,Gest,GxEest,R2=NA,aic,delta_aic,pd_change,f_q),on=c("CHR"="chrom"),by="CHR"][order(f_q)] %>% write.csv(quote=F)
+female_pos[,.(chr=gsub(":.*","",cmrGR),start=gsub(".*:([0-9]*)-.*","\\1",cmrGR),end=gsub(".*:[0-9]*-(.*)","\\1",cmrGR),geneSymbol,SNP,nearestGene=refgene[chrom == CHR]$name2[which.min(abs(POS-refgene[chrom == CHR]$txStart))],env,Eest,Gest,GxEest,R2=NA,aic,delta_aic,pd_change,f_q),on=c("CHR"="chrom"),by="CHR"][order(f_q)] %>% write.csv(quote=F)
+```
+
+## Changes in PD effect observed
+```{r}
+# top_all_models <- rbind(males_aic, females_aic)[f_q < 0.05]
+# top_male_pd_change <- males_aic#fread("male_top_models_pd_change.txt")
+# top_male_pd_change[, which(duplicated(names(top_male_pd_change))) := NULL]
+# top_male_pd_change$Sex <- "Male"
+# top_female_pd_change <- females_aic#fread("female_top_models_pd_change.txt")
+# top_female_pd_change[, which(duplicated(names(top_female_pd_change))) := NULL]
+# 
+# top_female_pd_change$Sex <- "Female"
+# top_female_pd_change <- top_female_pd_change[cpg %in% top_all_models[Sex == "Female"]$cpg]
+# 
+# top_male_pd_change <- top_male_pd_change[cpg %in% top_all_models[Sex == "Male"]$cpg]
+
+
+# ggplot(rbind(females_aic,males_aic), aes(model, pd_percent_change, color = Sex)) +
+#   geom_point(position = position_dodge(width = 0.5)) +
+#   ggrepel::geom_text_repel(position = position_dodge(width = 0.5), max.overlaps = Inf, size = 3, mapping = aes(label = cpg), data = rbind(top_male_pd_change, top_female_pd_change)[abs(pd_percent_change) >20]) +
+#   scale_color_manual(values = c("Male" = "lightblue", "Female" = "lightpink")) +
+#   labs(y = "% Change in PD Coefficient") +
+#   theme_classic()
+library(ggrepel)
+to_plot <- melt(rbind(females_aic, males_aic), measure.vars = c("pd_alt", "pd_base"),by=c("cpg"="NAME"))
+to_plot$variable <- factor(to_plot$variable, levels = c("pd_base", "pd_alt"))
+to_plot$Sex <- factor(to_plot$Sex, levels = c("Female", "Male"))
+to_plot <- to_plot[!duplicated(to_plot[,.(cpg,Sex,variable)])]
+ggplot(to_plot[f_q < 0.05] %>% arrange(cpg, variable), aes(model, value, group = cpg, color = Sex)) +
+  geom_path(position = position_dodge(width = 0.75), arrow = arrow(length = unit(1, "mm")), linewidth = 1) +
+  geom_text_repel(position=position_dodge(width = 0.75),size = 3, color = "gray70", mapping = aes(y=value,label = cmrGR), data = to_plot[variable == "pd_alt"][abs(pd_change) > 0.03]) +
+  facet_grid(~Sex,scales = "free_x",space="free") +
+  scale_color_manual(values = c("Female" = "pink","Male" = "lightblue")) +
+  labs(x="",y = "Change in PD Coefficient") +
+  theme_classic()+
+  theme(legend.position="none",strip.text.x=element_text(size=12),axis.text.x=element_text(size=12),axis.title.y=element_text(size=16))
+```
+```{r}
+rbind(males_aic,females_aic)[f_q < 0.05 & (abs(pd_alt) - abs(pd_base)) < 0,]
+rbind(males_aic,females_aic)[f_q < 0.05,.(uniqueN(cpg)),by="Sex"]
+females_aic[f_q < 0.05 & (abs(pd_alt) - abs(pd_base)) < 0,]
+males_aic[f_q < 0.05 & (abs(pd_alt) - abs(pd_base)) < 0,]
+females_aic[f_q < 0.05 & (abs(pd_alt) - abs(pd_base)) > 0,]
+females_aic[f_q < 0.05 & (abs(pd_alt) - abs(pd_base)) > 0,][order(abs(pd_alt) - abs(pd_base))] %>% mutate(change_perc_fixed = abs(pd_alt) - abs(pd_base) / abs(pd_base) * 100, change_fixed = abs(pd_alt) - abs(pd_base) ) %>% select(cmrGR,SNP,model,env,geneSymbol,contains("fixed"))
+```
+```{r}
+pd_sumstats
+```
+```{r}
+to_match <-rbind(males_aic,females_aic)[,.(
+  cmrGR,
+  geneSymbol,
+  chr=gsub("chr(.*):.*","\\1",cmrGR),
+  start=as.numeric(gsub("chr.*:(.*)-.*","\\1",cmrGR)),
+  end=as.numeric(gsub("chr.*:.*-(.*)","\\1",cmrGR)))]
+```
+```{r}
+pd_sig <- pd_sumstats[p < 5e-8]
+pd_sig[,`:=`(CHR =gsub("chr(.*):.*","\\1",SNP),pos=as.numeric(gsub("chr.*:(.*)","\\1",SNP)) )]
+ix <- sapply(1:nrow(to_match),
+       function(i){
+         cur_pd <- pd_sig[CHR == to_match$chr[i]]
+         any((abs(cur_pd$pos - to_match$start[i]) <=1e6) | (abs(cur_pd$pos - to_match$end[i]) <=1e6))
+       })
+ix
+```
+
+## More AIC exploration
+```{r}
+males_aic <- males_pd[delta_aic < -2, .(count = uniqueN(cpg)), by = c("model")]
+males_aic$Sex <- "Male"
+females_aic <- females_pd[delta_aic < -2, .(count = uniqueN(cpg)), by = c("model")]
+females_aic$Sex <- "Female"
+ggplot(rbind(males_aic, females_aic), aes(model, count, fill = Sex)) +
+  geom_col(position = position_dodge(width = 0.9)) +
+  geom_text(position = position_dodge(width = 0.9), aes(label = count), vjust = -0.5) +
+  scale_fill_manual(values = c("Male" = "lightblue", "Female" = "pink")) +
+  theme_classic()
+
+males_aic <- males_pd[f_q < 0.05 & delta_aic < -2, .(count = uniqueN(cpg)), by = c("model")]
+males_aic$Sex <- "Male"
+females_aic <- females_pd[f_q < 0.05 & delta_aic < -2, .(count = uniqueN(cpg)), by = c("model")]
+females_aic$Sex <- "Female"
+ggplot(rbind(males_aic, females_aic), aes(model, count, fill = Sex)) +
+  geom_col(position = position_dodge(width = 0.9)) +
+  geom_text(position = position_dodge(width = 0.9), aes(label = count), vjust = -0.5) +
+  scale_fill_manual(values = c("Male" = "lightblue", "Female" = "pink")) +
+  labs(x="",y="Number of CMRs")+
+  theme_classic()
+males_aic <- males_pd[delta_aic < -2 & model == "E", .SD[which.min(aic)], by = "cpg"]
+males_aic$Sex <- "Male"
+females_aic <- females_pd[delta_aic < -2 & model == "E", .SD[which.min(aic)], by = "cpg"]
+females_aic$Sex <- "Female"
+rbind(males_aic, females_aic)
+```
+```{r}
+rbind(males_aic[cpg %in% m_dmrs[threshold == TRUE]$NAME], females_aic[cpg %in% f_dmrs[threshold0.1 == TRUE]$NAME])[delta_aic < -2 & grepl("E", model)]
+rbind(males_aic[cpg %in% m_dmrs[threshold== TRUE]$NAME], females_aic[cpg %in% f_dmrs[threshold == TRUE]$NAME])[delta_aic < -2 & grepl("E", model)]
+tmp <- rbind(males_aic[cpg %in% m_dmrs[threshold == TRUE]$NAME], females_aic[cpg %in% f_dmrs[threshold == TRUE]$NAME])[delta_aic < -2][, .(cpg, SNP, env, model, delta_aic, Gest, Gp, Eest, Ep, GxEest, GxEp)]
+to_print <- tmp[rbind(m_dmrs[, .(cpg = NAME, UCSC_REFGENE_NAME, pval, adjP_BH, DB, sex = "Male")], f_dmrs[, .(cpg = NAME, UCSC_REFGENE_NAME, pval, adjP_BH, DB, sex = "Female")]), on = "cpg", nomatch = 0]
+to_print
+write.csv(to_print[order(sex, env, pval)], row.names = F, quote = F)
+```
+
+```{r}
+length(na.omit(unique(males_pd$env)))
+length(na.omit(unique(females_pd$env)))
+all_exposures <- unique(c(na.omit(unique(males_pd$env)),na.omit(unique(females_pd$env))))
+data.frame("Exposure"=all_exposures,"Tested in Males"=all_exposures %in% na.omit(unique(males_pd$env)),"Tested in Females"=all_exposures %in% na.omit(unique(females_pd$env)))
+```
+```{r}
+males_tmp <- males_pd
+males_tmp$Sex <- "Male"
+females_tmp <- females_pd
+females_tmp$Sex <- "Female"
+to_plot <- rbind(males_tmp, females_tmp)[f_q < 0.05, .SD[which.min(f_p)], by = c("cpg", "env", "model", "Sex")]
+ggplot(to_plot, aes(model, fill = Sex)) +
+  geom_bar(position = position_dodge(width = 0.9)) +
+  geom_text(position = position_dodge(width = 0.9), stat = "count", aes(label = ..count..), vjust = -0.5) +
+  scale_fill_manual(values = c("Male" = "lightblue", "Female" = "pink")) +
+  theme_classic()
+to_plot[, .(uniqueN(env)), by = c("cpg", "model", "Sex")]
+```
+
+## Mendelian randomization
+
+```{r}
+library(glue)
+library(MendelianRandomization)
+library(LDlinkR)
+
+gwas_sumstats <- fread("~/nalls_PD.QC.gz", key = "SNP")
+male_sumstats <- fread("~/Blauwendraat_male_female_GWAS/MALE_PD_filtered_sumstats_no_multi_allelics_RSID.QC.txt.gz", key = "SNP")
+female_sumstats <- fread("~/Blauwendraat_male_female_GWAS/FEMALE_PD_filtered_sumstats_no_multi_allelics_RSID.QC.txt.gz", key = "SNP")
+male_mqtl <- fread("male_2022_mQTL_cmr_cpgs.txt", key = "V1")
+female_mqtl <- fread("female_2022_mQTL_cmr_cpgs.txt", key = "V1")
+run_mr_per_cpg <- function(mQTL, cur_gwas) {
+  mQTL <- mQTL[grepl("rs", V1)]
+  cur_gwas <- cur_gwas[mQTL$V1, on = "SNP", nomatch = 0][p < 5e-4]
+  cur_mQTL <- mQTL[cur_gwas$SNP, on = "V1", nomatch = 0]
+  if (nrow(cur_mQTL) <= 2) {
+    return("No GWAS LOCI")
+  } else {
+    cor_table <- LDmatrix(
+      snps = cur_mQTL$V1,
+      pop = "EUR",
+      genome_build = "grch37",
+      token = gsub("\n", "", readr::read_file("ldlink_token.txt"))
+    )
+    cor_mat <- as.matrix(cor_table[, -c(1)])
+    rownames(cor_mat) <- as.character(cor_table$RS_number)
+    cur_mQTL <- cur_mQTL[rownames(cor_mat), on = "V1"]
+    cur_gwas <- cur_gwas[rownames(cor_mat), on = "SNP"]
+
+    EggerObject <- try(
+      mr_egger(
+        mr_input(
+          bx = cur_mQTL$V3,
+          bxse = cur_mQTL$V3 / cur_mQTL$V4,
+          by = cur_gwas$b,
+          byse = cur_gwas$se,
+          correlation = cor_mat
+        ),
+        correl = TRUE,
+        distribution = "t-dist",
+        alpha = 0.05
+      ),
+      silent = TRUE
+    )
+    if (class(EggerObject) == "try-error") {
+      return(glue("{nrow(cur_mQTL)} mQTL, MR not fit"))
+    } else {
+      return(EggerObject)
+    }
+  }
+}
+```
+
+Apply to all CMR CpGs:
+```{r}
+female_mr_results <- list()
+for (cpg in unique(female_mqtl$V2)) {
+  female_mr_results[[cpg]] <- run_mr_per_cpg(female_mqtl[V2 == cpg], female_sumstats)
+}
+
+male_mr_results <- list()
+for (cpg in unique(male_mqtl$V2)) {
+  male_mr_results[[cpg]] <- run_mr_per_cpg(male_mqtl[V2 == cpg], male_sumstats)
+}
+```
+
+```{r}
+males_aic[m_dmrs, on = .(cpg)]
+females_aic[f_dmrs, on = .(cpg)]
+males_aic$Sex <- "Male"
+females_aic$Sex <- "Female"
+ggplot(rbind(males_aic, females_aic), aes(model, fill = Sex)) +
+  geom_bar(position = "dodge") +
+  geom_text(stat = "count", aes(label = ..count..), position = position_dodge(width = 0.9), vjust = 0) +
+  scale_fill_manual(values = c("Male" = "lightblue2", "Female" = "pink")) +
+  theme_classic()
+f_dmrs$Sex <- "Female"
+m_dmrs$Sex <- "Male"
+all_dmr <- rbind(m_dmrs, f_dmrs)
+all_aic <- rbind(males_aic, females_aic)
+to_plot <- all_aic[all_dmr, on = .(cpg, Sex), nomatch = 0]
+ggplot(to_plot[!duplicated(paste0(dmr, model, Sex))], aes(model, fill = Sex)) +
+  geom_bar(position = "dodge") +
+  geom_text(stat = "count", aes(label = ..count..), position = position_dodge(width = 0.9), vjust = 0) +
+  scale_fill_manual(values = c("Male" = "lightblue2", "Female" = "pink")) +
+  theme_classic()
+```
+
+## Effect size comparisons
+Take all significant models, compare G vs E vs GxE effect sizes:
+
+### Differences test per SNP-CpG-exposure trio
+
+```{r}
+males_pd$Sex <- "Male"
+females_pd$Sex <- "Female"
+gxe_tests <- rbind(males_pd, females_pd)[model == "GxE"]
+gxe_tests[, `:=`(Zge = (abs(Gest) - abs(Eest)) / sqrt(Gse^2 + Ese^2))]
+gxe_tests[, `:=`(Zp = 2 * (pnorm(-abs(Zge))))]
+gxe_tests[, `:=`(Z_q = p.adjust(Zp, method = "fdr")), by = c("env", "Sex")]
+
+gxe_tests[, `:=`(Zggxe = (abs(Gest) - abs(GxEest)) / sqrt(Gse^2 + GxEse^2))]
+gxe_tests[, `:=`(Zggxep = 2 * (pnorm(-abs(Zggxe))))]
+gxe_tests[, `:=`(Zggxe_q = p.adjust(Zggxep, method = "fdr")), by = c("env", "Sex")]
+
+gxe_tests[, `:=`(Zegxe = (abs(Eest) - abs(GxEest)) / sqrt(Ese^2 + GxEse^2))]
+gxe_tests[, `:=`(Zegxep = 2 * (pnorm(-abs(Zegxe))))]
+gxe_tests[, `:=`(Zegxe_q = p.adjust(Zegxep, method = "fdr")), by = c("env", "Sex")]
+```
+
+```{r}
+gxe_tests[
+  f_q < 0.1,
+  .(
+    ge_hits = uniqueN(.SD[Z_q < 0.1]$cpg),
+    ge_cpg = paste0(unique(.SD[Z_q < 0.1]$cpg), collapse = ","),
+    ge_env_hits = uniqueN(.SD[Z_q < 0.1]$env),
+    ggxe_hits = uniqueN(.SD[Zggxe_q < 0.1]$cpg),
+    ggxe_cpg = paste0(unique(.SD[Zggxe_q < 0.1]$cpg), collapse = ","),
+    ggxe_env_hits = uniqueN(.SD[Zggxe_q < 0.1]$env),
+    egxe_hits = uniqueN(.SD[Zegxe_q < 0.1]$cpg),
+    egxe_cpg = paste0(unique(.SD[Zegxe_q < 0.1]$cpg), collapse = ","),
+    egxe_env_hits = uniqueN(.SD[Zegxe_q < 0.1]$env)
+  )
+] %>% transpose(keep.names = "var")
+```
+
+
+```{r}
+ggplot(melt(gxe_tests[f_q < 0.1, .(Sex, Zge, Zegxe, Zggxe)], variable.name = "Score"), aes(Score, value, color = Sex)) +
+  geom_boxplot() +
+  scale_color_manual(values = c("Male" = "lightblue", "Female" = "pink")) +
+  scale_x_discrete(labels = c("Zge" = "G vs. E", "Zegxe" = "E vs. GxE", "Zggxe" = "G vs. GxE")) +
+  labs(y = "Z-Score", x = "") +
+  theme_classic()
+
+ggplot(, aes(Score, value, color = Sex)) +
+  geom_boxplot() +
+  scale_color_manual(values = c("Male" = "lightblue", "Female" = "pink")) +
+  scale_x_discrete(labels = c("Zge" = "G vs. E", "Zegxe" = "E vs. GxE", "Zggxe" = "G vs. GxE")) +
+  labs(y = "Z-Score", x = "") +
+  theme_classic()
+
+ggplot(melt(gxe_tests[f_q < 0.1, .(Sex, Zge = uniqueN(.SD[Z_q < 0.1]$cpg), Zegxe = uniqueN(.SD[Zegxe_q < 0.1]$cpg), Zggxe = uniqueN(.SD[Zggxe_q < 0.1]$cpg))], variable.name = "Score"), aes(Score, value, fill = Sex)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Male" = "lightblue", "Female" = "pink")) +
+  scale_x_discrete(labels = c("Zge" = "G vs. E", "Zegxe" = "E vs. GxE", "Zggxe" = "G vs. GxE")) +
+  labs(y = "CpGs", x = "") +
+  theme_classic()
+```
+```{r}
+tmp <- melt(gxe_tests[f_q < 0.1, .(Sex, Zge, Zegxe, Zggxe, Z_q, Zegxe_q, Zggxe_q)], measure.vars = patterns("Z.*e$", ".*_q$"))
+varnames <- c("G vs. E", "E vs. GxE", "G vs. GxE")
+tmp$variable <- varnames[tmp$variable]
+ggplot(tmp[value2 < 0.1], aes(variable, value1, color = Sex)) +
+  geom_boxplot() +
+  scale_color_manual(values = c("Male" = "lightblue", "Female" = "pink")) +
+  theme_classic()
+```

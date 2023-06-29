@@ -1,0 +1,1047 @@
+---
+title: "Post mQTL analysis Terre"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+library(coloc)
+library(data.table)
+library(parallel)
+library(qqman)
+library(qvalue)
+library(readxl)
+library(Gviz)
+library(glue)
+library(tidyverse)
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE)
+knitr::opts_chunk$set(cache = TRUE)
+```
+## Replication of Cross-sex mQTL
+```{r,eval=FALSE}
+library(dbplyr)
+library(DBI)
+ntests <- 126904049
+con <- dbConnect(RSQLite::SQLite(), "terre_and_digpd_cis_all_impute_mQTL_9_methy_PC.db")
+mQTL_results <- tbl(con, "terre")
+ntests_digpd <- 100363748
+mQTL_results_digpd <- tbl(con, "digpd")
+```
+```{r,eval=FALSE}
+mQTL_results %>%
+  filter(FDR < 0.05) %>%
+  summarize(total = n(), cpgs = n_distinct(gene))
+mQTL_results %>%
+  filter(`p-value` < (0.05 / ntests)) %>%
+  summarize(total = n(), cpgs = n_distinct(gene))
+
+mQTL_results_digpd %>%
+  filter(FDR < 0.05) %>%
+  summarize(total = n(), cpgs = n_distinct(gene))
+mQTL_results_digpd %>%
+  filter(`p-value` < (0.05 / ntests)) %>%
+  summarize(total = n(), cpgs = n_distinct(gene))
+
+library(dbplot)
+mQTL_results %>% dbplot_histogram(`p-value`)
+# qq(mQTL_results$`p-value`)
+```
+
+### Checking replication
+$\pi_1$ statistics
+```{r,eval=FALSE}
+to_check_replication <- mQTL_results_digpd %>%
+  inner_join(mQTL_results %>% filter(`p-value` < 0.05 / ntests), by = c("SNP", "gene"), copy = TRUE) %>%
+  collect() %>%
+  as.data.table()
+
+pi0res <- pi0est(na.omit(as.numeric(to_check_replication$`p-value.x`)), lambda = seq(0, 0.245, 0.005), pi0.method = "bootstrap")
+1 - pi0res$pi0
+plot(pi0res$pi0.lambda, pi0res$lambda, xlab = bquote(pi[0]), ylab = bquote(lambda))
+abline(v = pi0res$pi0)
+qvalres <- qvalue_truncp(na.omit(as.numeric(to_check_replication$`p-value.x`)))
+1 - qvalres$pi0
+abline(v = qvalres$pi0)
+pi0est(as.numeric(to_check_replication$`p-value.x`) / 0.25)
+```
+### Replication between TERRE and GoDMC
+```{r}
+terre_mqtl <- fread("all_2022_prs_mQTL.txt.gz")
+go_dmc_mqtl <- fread("~/cis_mqtl_godmc.txt.gz")
+```
+```{r}
+merged_terre <- terre_mqtl[`p-value` < (0.05 / 126904049)][go_dmc_mqtl, on = c("SNP", "gene" = "Probe"), nomatch = 0]
+merged_godmc <- go_dmc_mqtl[p < (0.05 / .N)][terre_mqtl, on = c("SNP", "Probe" = "gene"), nomatch = 0]
+```
+```{r}
+qvalue_truncp(as.numeric(merged_terre$`p-value`))$pi0
+qvalue_truncp(as.numeric(merged_godmc$p))$pi0
+```
+
+# Colocalization with parkinson's loci and overlap with ewas hits
+```{r}
+load("../prs_analyses/prs_nalls_cross_w_sex_stratified.RData")
+manifest <- IlluminaHumanMethylationEPICanno.ilm10b4.hg19::Other %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "name")
+
+positions <- IlluminaHumanMethylationEPICanno.ilm10b4.hg19::Locations %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "name")
+```
+## cross-sex GWAS
+```{r}
+cross_coloc <- fread("cross_mqtl_cross_sumstats_pd_snp_colocalization_ph4.txt.gz")
+godmc_coloc <- fread("cis_mqtl_godmc_pd_snp_colocalization_ph4.txt.gz")
+male_coloc <- fread("male_mqtl_cross_sumstats_pd_snp_colocalization_ph4.txt.gz")
+female_coloc <- fread("female_mqtl_cross_sumstats_pd_snp_colocalization_ph4.txt.gz")
+```
+
+### GoDMC mQTL
+```{r}
+sig_bonf_cross <- top_prs_hits %>% filter(p.adjust(P.Value, method = "BH") < 0.05)
+godmc_coloc %>%
+  filter(PP.H4.abf > 0.9, probe %in% sig_bonf_cross$ID) %>%
+  group_by(probe) %>%
+  dplyr::slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name"))
+
+godmc_coloc_probes <- godmc_coloc %>%
+  filter(PP.H4.abf > 0.9, probe %in% sig_bonf_cross$ID) %>%
+  group_by(probe) %>%
+  dplyr::slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name")) %>%
+  select(probe)
+
+godmc_coloc %>%
+  filter(PP.H4.abf < 0.9, probe %in% sig_bonf_cross$ID) %>%
+  group_by(probe) %>%
+  dplyr::slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name"))
+
+godmc_coloc %>%
+  filter(PP.H4.abf > 0.9, !probe %in% sig_bonf_cross$ID) %>%
+  group_by(probe) %>%
+  dplyr::slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest %>% mutate(Gene = gsub(";.*","",UCSC_RefGene_Name),`Gene region` = gsub(";.*","",UCSC_RefGene_Group))%>% select(name,Gene, `Gene region`), by = c("probe" = "name"))%>%
+  left_join(positions %>% select(name,chr,pos),by=c("probe" = "name")) %>%
+  arrange(desc(PP.H4.abf)) %>%
+  write_csv("coloc_mQTL_summary.csv")
+```
+
+### Cross-sex mQTL
+```{r}
+sig_bonf_cross <- top_prs_hits %>% filter(p.adjust(P.Value, method = "BH") < 0.05)
+cross_coloc %>%
+  filter(PP.H4.abf > 0.9, probe %in% sig_bonf_cross$ID) %>%
+  group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name"))
+
+cross_coloc_probes <- cross_coloc %>%
+  filter(PP.H4.abf > 0.9, probe %in% sig_bonf_cross$ID) %>%
+  group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name")) %>%
+  select(probe)
+
+cross_coloc %>%
+  filter(PP.H4.abf < 0.9, probe %in% sig_bonf_cross$ID) %>%
+  group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name"))
+
+cross_coloc %>%
+  filter(PP.H4.abf > 0.9, !probe %in% sig_bonf_cross$ID) %>%
+  group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name"))
+```
+```{r}
+(non_colocalized_cross <- sig_bonf_cross %>% left_join(manifest, by = c("ID" = "name")) %>% left_join(positions, by = c("ID" = "name")) %>% filter(!ID %in% cross_coloc_probes$probe) %>% arrange(chr, pos) %>% select(ID, UCSC_RefGene_Name, chr, pos))
+
+non_colocalized_cross %>% count(gsub(";.*", "", UCSC_RefGene_Name))
+```
+
+
+### Male mQTL
+```{r}
+sig_bonf_male <- top_male_prs_hits %>% filter(adj.P.Val < 0.05)
+male_coloc %>%
+  filter(PP.H4.abf > 0.9, probe %in% sig_bonf_male$ID) %>%
+  group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name"))
+male_coloc %>%
+  filter(PP.H4.abf > 0.9, probe %in% sig_bonf_male$ID, probe %in% cross_coloc_probes$probe) %>%
+  group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name"))
+male_coloc %>%
+  filter(PP.H4.abf < 0.9, probe %in% sig_bonf_male$ID) %>%
+  group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name"))
+
+male_coloc %>%
+  filter(PP.H4.abf > 0.9, !probe %in% sig_bonf_male$ID) %>%
+  group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name"))
+```
+
+### Female mQTL
+```{r}
+sig_bonf_female <- top_female_prs_hits %>% filter(adj.P.Val < 0.05)
+female_coloc %>%
+  filter(PP.H4.abf > 0.9, probe %in% sig_bonf_female$ID) %>%
+  group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name"))
+female_coloc %>%
+  filter(PP.H4.abf > 0.9, probe %in% sig_bonf_female$ID, probe %in% cross_coloc_probes$probe) %>%
+  group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name"))
+female_coloc %>%
+  filter(PP.H4.abf < 0.9, probe %in% sig_bonf_female$ID) %>%
+  group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name"))
+
+female_coloc %>%
+  filter(PP.H4.abf > 0.9, !probe %in% sig_bonf_female$ID) %>%
+  group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name"))
+
+
+female_coloc %>%
+  filter(PP.H4.abf > 0.9, probe %in% sig_bonf_female$ID, !probe %in% cross_coloc_probes$probe) %>%
+  group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name"))
+```
+## Brief compare and contrast in genes at hits
+```{r}
+summary_male <- top_male_prs_hits %>%
+  filter(adj.P.Val < 0.05) %>%
+  left_join(manifest, by = c("ID" = "name")) %>%
+  left_join(positions, by = c("ID" = "name")) %>%
+  filter(chr != "chr17")
+summary_female <- top_male_prs_hits %>%
+  filter(adj.P.Val < 0.05) %>%
+  left_join(manifest, by = c("ID" = "name")) %>%
+  left_join(positions, by = c("ID" = "name")) %>%
+  filter(chr != "chr17")
+
+top_prs_hits %>%
+  filter(adj.P.Val < 0.05) %>%
+  left_join(manifest, by = c("ID" = "name")) %>%
+  left_join(positions, by = c("ID" = "name")) %>%
+  filter(chr != "chr17") %>%
+  select(ID, chr, pos, UCSC_RefGene_Name, adj.P.Val)
+summary_male %>% select(ID, chr, pos, UCSC_RefGene_Name, adj.P.Val)
+summary_female %>% select(ID, chr, pos, UCSC_RefGene_Name, adj.P.Val)
+```
+```{r}
+rbind(
+  top_prs_hits %>% mutate(Category = "Cross-sex"),
+  top_male_prs_hits %>% mutate(Category = "Male"),
+  top_female_prs_hits %>% mutate(Category = "Female")
+) %>%
+  left_join(manifest %>% mutate(gene = gsub(";.*", "", UCSC_RefGene_Name)) %>% select(name, gene), by = c("ID" = "name")) %>%
+  left_join(positions %>% select(name, chr, pos), by = c("ID" = "name")) %>%
+  filter(adj.P.Val < 0.05) %>%
+  write.csv(quote = F, row.names = F)
+```
+### Colocalized CpG counts
+```{r}
+pd_loci <- fread("~/nalls_PD.clumped") %>% mutate(Chromosome = factor(CHR, labels = 1:22,levels=1:22))
+ggplot(pd_loci,aes(Chromosome)) +
+  geom_bar(fill="gray70")+
+  geom_text(aes(label=..count..),stat="count",vjust=-0.3)+
+  labs(y="No. GWAS loci")+
+  scale_x_discrete(drop=FALSE) +
+  theme_minimal(base_size = 16)
+godmc_coloc %>%
+  filter(PP.H4.abf > 0.9) %>%
+  group_by(probe) %>%
+  dplyr::slice(which.max(PP.H4.abf)) %>%
+  left_join(positions, by = c("probe" = "name")) %>%
+  mutate(Chromosome = factor(chr, labels = 1:22,levels=paste0("chr",1:22))) %>%
+  ggplot(aes(x=Chromosome)) +
+    geom_bar(fill="gray70") +
+    geom_text(aes(label=..count..),stat="count",vjust=-0.3)+
+    labs(y="No. CpGs with colocalized mQTL")+
+    scale_x_discrete(drop=FALSE) +
+    theme_minimal(base_size = 16)
+```
+
+### Colocalized CpGs vs GRS hits
+
+```{r}
+library(ggrepel)
+library(glue)
+godmc_coloc %>%
+  filter(PP.H4.abf > 0.9) %>%
+  group_by(probe) %>%
+  dplyr::slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name")) %>%
+  mutate(
+    `Gene region`= ifelse(UCSC_RefGene_Group != "", gsub(";.*","",UCSC_RefGene_Group), "Intergenic")
+  ) %>%
+  group_by(`Gene region`) %>%
+  summarize(value = n()) %>%ungroup() %>% arrange(desc(`Gene region`)) %>%
+  mutate(
+    text_y=cumsum(value) - value/2,
+    perc= glue("{value} ({scales::percent(value/ sum(value))})")
+  )%>%
+  ggplot(aes(x="",y=value,fill=`Gene region`))+
+    geom_col() +
+    coord_polar("y",start=0) +
+    geom_label_repel(
+      aes(label = perc,y=text_y),
+      nudge_x=0.6,
+      show.legend = FALSE,
+      min.segment.length = Inf
+    ) +
+    ggsci::scale_fill_ucscgb()+
+    labs(x="",y="")+
+    theme_classic(base_size = 16)+
+    theme(axis.line = element_blank(),axis.text = element_blank())
+
+
+top_prs_hits %>%
+  filter(adj.P.Val < 0.05) %>%
+  left_join(manifest, by = c("ID" = "name")) %>%
+  mutate(
+    `Gene region`= ifelse(UCSC_RefGene_Group != "", gsub(";.*","",UCSC_RefGene_Group), "Intergenic")
+  ) %>%
+  group_by(`Gene region`) %>%
+  summarize(value = n()) %>%ungroup() %>% arrange(desc(`Gene region`)) %>%
+  mutate(
+    text_y=cumsum(value) - value/2,
+    perc= glue("{value} ({scales::percent(value/ sum(value))})")
+  )%>%
+  ggplot(aes(x="",y=value,fill=`Gene region`))+
+    geom_col() +
+    coord_polar("y",start=0) +
+    geom_label_repel(
+      aes(label = perc,y=text_y),
+      nudge_x=0.6,
+      show.legend = FALSE,
+      min.segment.length = Inf
+      ) +
+    ggsci::scale_fill_ucscgb()+
+    labs(x="",y="")+
+    theme_classic(base_size = 16 )+
+    theme(axis.line = element_blank(),axis.text = element_blank())
+
+
+
+top_prs_hits %>%
+  filter(adj.P.Val < 0.05) %>%
+  left_join(manifest, by = c("ID" = "name")) %>%
+  filter(Methyl450_Loci ==  TRUE) %>%
+  mutate(
+    `Gene region`= ifelse(UCSC_RefGene_Group != "", gsub(";.*","",UCSC_RefGene_Group), "Intergenic")
+  ) %>%
+  group_by(`Gene region`) %>%
+  summarize(value = n()) %>%ungroup() %>% arrange(desc(`Gene region`)) %>%
+  mutate(
+    text_y=cumsum(value) - value/2,
+    perc= glue("{value} ({scales::percent(value/ sum(value))})")
+  )%>%
+  ggplot(aes(x="",y=value,fill=`Gene region`))+
+    geom_col() +
+    coord_polar("y",start=0) +
+    geom_label_repel(
+      aes(label = perc,y=text_y),
+      nudge_x=0.6,
+      show.legend = FALSE,
+      min.segment.length = Inf
+      ) +
+    ggsci::scale_fill_ucscgb()+
+    labs(x="",y="")+
+    theme_classic(base_size = 16 )+
+    theme(axis.line = element_blank(),axis.text = element_blank())
+
+   top_prs_hits %>%
+  filter(adj.P.Val < 0.05) %>%
+  left_join(positions %>% select(name,chr,pos), by=c("ID"="name")) %>%
+  left_join(manifest %>%
+    mutate(
+        Gene = gsub(";.*","",UCSC_RefGene_Name),
+        `Gene region`= ifelse(UCSC_RefGene_Group != "", gsub(";.*","",UCSC_RefGene_Group), "Intergenic"),
+    ) %>%
+    select(name,Gene, `Gene region`,Methyl450_Loci), by = c("ID" = "name"))  %>% filter(Methyl450_Loci != TRUE) %>% count(chr,`Gene region`)
+```
+### Match regulatory regions from locus plot
+```{r}
+library(biomaRt)
+ensembl <- useEnsembl(biomart = "regulation",dataset="hsapiens_regulatory_feature",GRCh = 37)
+attr <- listAttributes(ensembl)$name
+godmc_regulation <- godmc_coloc %>%
+  filter(PP.H4.abf > 0.9) %>%
+  group_by(probe) %>%
+  dplyr::slice(which.max(PP.H4.abf)) %>%
+  left_join(positions, by = c("probe" = "name"))
+prs_regulation <- top_prs_hits %>%
+  filter(adj.P.Val < 0.05) %>%
+  left_join(positions,by=c("ID"="name"))
+cross_mf_prs_hits <- rbind(
+  top_prs_hits %>% mutate(Sex="Cross-sex"),
+  top_male_prs_hits %>% mutate(Sex = "Male"),
+  top_female_prs_hits %>% mutate(Sex = "Female")
+)
+prs_mf_regulation <- cross_mf_prs_hits %>%
+  filter(adj.P.Val < 0.05) %>%
+  left_join(positions,by=c("ID"="name"))
+coord_filter <- unique(
+  c(
+    glue("{gsub('chr','',godmc_regulation$chr)}:{godmc_regulation$pos}:{godmc_regulation$pos+1}"),
+    glue("{gsub('chr','',prs_regulation$chr)}:{prs_regulation$pos}:{prs_regulation$pos+1}"),
+    glue("{gsub('chr','',prs_mf_regulation$chr)}:{prs_mf_regulation$pos}:{prs_mf_regulation$pos+1}")
+  )
+)
+regulation_features <- getBM(
+  attributes = attr,
+  filters = c("chromosomal_region"),
+  values=coord_filter,
+  mart=ensembl
+) %>% filter(epigenome_name == "GM12878")
+godmc_regulation <- godmc_regulation  %>% ungroup() %>%
+  mutate(
+    regulatory_feature= sapply(
+      1:n(),
+      function(i) unique((regulation_features %>% filter(chromosome_name == gsub("chr","",chr[i]),chromosome_start <= pos[i], chromosome_end >= pos[i]+1))$feature_type_name)
+    )
+  )%>%
+  mutate(regulatory_feature = sapply(regulatory_feature,paste0,collapse=",")) %>%
+  left_join(manifest,by=c("probe"="name"))
+prs_regulation <- prs_regulation  %>% ungroup() %>%
+  mutate(
+    regulatory_feature= sapply(
+      1:n(),
+      function(i) unique((regulation_features %>% filter(chromosome_name == gsub("chr","",chr[i]),chromosome_start <= pos[i], chromosome_end >= pos[i]+1))$feature_type_name)
+    )
+  ) %>%
+  mutate(regulatory_feature = sapply(regulatory_feature,paste0,collapse=",") ) %>%
+  left_join(manifest,by=c("ID"="name"))
+prs_mf_regulation <- prs_mf_regulation  %>% ungroup() %>%
+  mutate(
+    regulatory_feature= sapply(
+      1:n(),
+      function(i) unique((regulation_features %>% filter(chromosome_name == gsub("chr","",chr[i]),chromosome_start <= pos[i], chromosome_end >= pos[i]+1))$feature_type_name)
+    )
+  ) %>%
+  mutate(regulatory_feature = sapply(regulatory_feature,paste0,collapse=",") ) %>%
+  left_join(manifest,by=c("ID"="name"))
+```
+
+### Same as above but stacked bar chart
+```{r}
+godmc_prop_plot <- godmc_regulation %>%
+  mutate(
+    regulatory_feature = ifelse(regulatory_feature == "",ifelse(UCSC_RefGene_Group =="","Intergenic",gsub(";.*", "", UCSC_RefGene_Group)),regulatory_feature)
+  ) %>%
+  mutate(
+    regulatory_feature=recode_factor(regulatory_feature,`Enhancer`="Enhancer",`CTCF Binding Site,Enhancer`="Enhancer",`CTCF Binding Site`="CTCF binding site",`TSS1500`="TSS1500",`TSS200`="TSS200",`Promoter Flanking Region` = "Promoter flanking region", `Promoter Flanking Region,CTCF Binding Site`="Promoter flanking region",`Promoter`="Promoter",`CTCF Binding Site,Promoter`="Promoter", `Promoter,CTCF Binding Site`="Promoter",`5'UTR`="5'UTR",`1stExon`="1stExon",`Body`="Gene body",`3'UTR`="3'UTR",`Intergenic`="Intergenic")
+  )  %>%
+  group_by(regulatory_feature) %>%
+  summarize(value = n()) %>% ungroup() %>%
+  mutate(
+    y_pos = value/ sum(value) * 100,
+    perc= glue("{scales::percent(value/ sum(value))} ({value})"),
+    test = "Colocalized CpGs"
+  )
+prs_prop_plot <- prs_regulation %>%
+  mutate(
+    regulatory_feature = ifelse(regulatory_feature == "",ifelse(UCSC_RefGene_Group =="","Intergenic",gsub(";.*", "", UCSC_RefGene_Group)),regulatory_feature)
+  )  %>%
+  mutate(
+    regulatory_feature=recode_factor(regulatory_feature,`Enhancer`="Enhancer",`CTCF Binding Site,Enhancer`="Enhancer",`CTCF Binding Site`="CTCF binding site",`TSS1500`="TSS1500",`TSS200`="TSS200",`Promoter Flanking Region` = "Promoter flanking region", `Promoter Flanking Region,CTCF Binding Site`="Promoter flanking region",`Promoter`="Promoter",`CTCF Binding Site,Promoter`="Promoter", `Promoter,CTCF Binding Site`="Promoter",`5'UTR`="5'UTR",`1stExon`="1stExon",`Body`="Gene body",`3'UTR`="3'UTR",`Intergenic`="Intergenic")
+  )  %>%
+  group_by(regulatory_feature)%>%
+  summarize(value = n()) %>% ungroup() %>%
+  mutate(
+    y_pos = value/ sum(value) * 100,
+    perc= glue("{scales::percent(value/ sum(value))} ({value})"),
+    test= "GRS-associated CpGs"
+  )
+color_key <- c(
+  "Enhancer"="#E6AB02",
+  "CTCF binding site"="#66A61E",
+  "TSS1500"="#CC33FF",
+  "TSS200"="#FF0000",
+  "Promoter flanking region"="#E7298A",
+  "Promoter"="#1B9E77",
+  "5'UTR"="#99991E",
+  "1stExon"="#FFCCCC",
+  "Gene body"="#6699FF",
+  "3'UTR"="#FECB00",
+  "Intergenic"="gray80"
+  )
+to_plot <- rbind(godmc_prop_plot, prs_prop_plot) %>% mutate(`Regulatory feature` = factor(regulatory_feature, levels=names(color_key)))
+ggplot(to_plot,aes(x=test,y=y_pos,fill=`Regulatory feature`, label=perc))+
+  geom_col(position="stack") +
+  geom_text(position=position_stack(vjust=0.5),size=3)+
+  scale_fill_manual(values=color_key)+
+  labs(x="", y="Percentage of associations (count)")+
+  theme_classic(base_size = 14)+
+  # theme(axis.text.x=element_text(angle=20,vjust=1,hjust=1))
+
+```
+### Counting by array type
+```{r}
+godmc_regulation %>%  mutate(
+    regulatory_feature = ifelse(regulatory_feature == "",ifelse(UCSC_RefGene_Group =="","Intergenic",gsub(";.*", "", UCSC_RefGene_Group)),regulatory_feature)
+  )  %>%
+  mutate(
+    regulatory_feature=recode_factor(regulatory_feature,`Enhancer`="Enhancer",`CTCF Binding Site,Enhancer`="Enhancer",`CTCF Binding Site`="CTCF binding site",`TSS1500`="TSS1500",`TSS200`="TSS200",`Promoter Flanking Region` = "Promoter flanking region", `Promoter Flanking Region,CTCF Binding Site`="Promoter flanking region",`Promoter`="Promoter",`CTCF Binding Site,Promoter`="Promoter", `Promoter,CTCF Binding Site`="Promoter",`5'UTR`="5'UTR",`1stExon`="1stExon",`Body`="Gene body",`3'UTR`="3'UTR",`Intergenic`="Intergenic")
+  ) %>%  count(regulatory_feature)
+
+prs_regulation %>%  mutate(
+    regulatory_feature = ifelse(regulatory_feature == "",ifelse(UCSC_RefGene_Group =="","Intergenic",gsub(";.*", "", UCSC_RefGene_Group)),regulatory_feature)
+  )  %>%
+  mutate(
+    regulatory_feature=recode_factor(regulatory_feature,`Enhancer`="Enhancer",`CTCF Binding Site,Enhancer`="Enhancer",`CTCF Binding Site`="CTCF binding site",`TSS1500`="TSS1500",`TSS200`="TSS200",`Promoter Flanking Region` = "Promoter flanking region", `Promoter Flanking Region,CTCF Binding Site`="Promoter flanking region",`Promoter`="Promoter",`CTCF Binding Site,Promoter`="Promoter", `Promoter,CTCF Binding Site`="Promoter",`5'UTR`="5'UTR",`1stExon`="1stExon",`Body`="Gene body",`3'UTR`="3'UTR",`Intergenic`="Intergenic")
+  ) %>% group_by(Methyl450_Loci,regulatory_feature) %>% summarize(ct = n()) %>% mutate(freq = ct/ sum(ct))
+```
+### Paper Supplementary Tables
+```{r}
+prs_mf_regulation %>%
+  mutate(
+    regulatory_feature = ifelse(regulatory_feature == "",ifelse(UCSC_RefGene_Group =="","Intergenic",gsub(";.*", "", UCSC_RefGene_Group)),regulatory_feature)
+  )  %>%
+  mutate(
+    regulatory_feature=recode_factor(regulatory_feature,`Enhancer`="Enhancer",`CTCF Binding Site,Enhancer`="Enhancer",`CTCF Binding Site`="CTCF binding site",`TSS1500`="TSS1500",`TSS200`="TSS200",`Promoter Flanking Region` = "Promoter flanking region", `Promoter Flanking Region,CTCF Binding Site`="Promoter flanking region",`Promoter`="Promoter",`CTCF Binding Site,Promoter`="Promoter", `Promoter,CTCF Binding Site`="Promoter",`5'UTR`="5'UTR",`1stExon`="1stExon",`Body`="Gene body",`3'UTR`="3'UTR",`Intergenic`="Intergenic"),
+    Gene = gsub(";.*", "",UCSC_RefGene_Name)
+  )  %>% mutate(Sex = factor(Sex,levels=c("Cross-sex","Male","Female"))) %>%
+  dplyr::select(1:10,Gene,regulatory_feature) %>% arrange(Sex,P.Value) %>% write.csv(file=,row.names=F,quote=F)
+
+godmc_regulation %>%
+  mutate(
+    regulatory_feature = ifelse(regulatory_feature == "",ifelse(UCSC_RefGene_Group =="","Intergenic",gsub(";.*", "", UCSC_RefGene_Group)),regulatory_feature)
+  ) %>%
+  mutate(
+    regulatory_feature=recode_factor(regulatory_feature,`Enhancer`="Enhancer",`CTCF Binding Site,Enhancer`="Enhancer",`CTCF Binding Site`="CTCF binding site",`TSS1500`="TSS1500",`TSS200`="TSS200",`Promoter Flanking Region` = "Promoter flanking region", `Promoter Flanking Region,CTCF Binding Site`="Promoter flanking region",`Promoter`="Promoter",`CTCF Binding Site,Promoter`="Promoter", `Promoter,CTCF Binding Site`="Promoter",`5'UTR`="5'UTR",`1stExon`="1stExon",`Body`="Gene body",`3'UTR`="3'UTR",`Intergenic`="Intergenic"),
+    Gene = gsub(";.*", "",UCSC_RefGene_Name)
+  )  %>% dplyr::select(probe,locus_snp,Gene,regulatory_feature,chr,pos,nsnps,PP.H0.abf:PP.H4.abf) %>% write.csv(file="",row.names=F,col.names=F,quote=F)
+
+```
+
+## Sex stratified GWAS colocalization
+```{r}
+load("../prs_analyses/prs_blau_sex_stratified.RData")
+male_stratified_coloc <- fread("male_mqtl_male_sumstats_pd_snp_colocalization_ph4.txt.gz")
+female_stratified_coloc <- fread("female_mqtl_female_sumstats_pd_snp_colocalization_ph4.txt.gz")
+```
+```{r}
+rbind(
+  top_male_ewas %>% mutate(Category = "Male"),
+  top_female_ewas %>% mutate(Category = "Female")
+) %>%
+  left_join(manifest %>% mutate(gene = gsub(";.*", "", UCSC_RefGene_Name)) %>% select(name, gene), by = c("ID" = "name")) %>%
+  left_join(positions %>% select(name, chr, pos), by = c("ID" = "name")) %>%
+  filter(adj.P.Val < 0.25) %>%
+  write.csv(quote = F, row.names = F)
+```
+
+See [Script](run_colocalization.R).
+### Male results at CpG level
+```{r}
+sig_FDR_male <- top_male_ewas %>% filter(adj.P.Val < 0.25)
+male_stratified_coloc %>%
+  filter(PP.H4.abf > 0.9, probe %in% sig_FDR_male$ID) %>%
+  group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name")) %>%
+  select(contains("PP.H"), probe, locus, locus_snp, UCSC_RefGene_Name)
+
+male_stratified_coloc %>%
+  filter(PP.H4.abf < 0.9, probe %in% sig_FDR_male$ID) %>%
+  group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name"))
+
+male_stratified_coloc %>%
+  filter(PP.H4.abf > 0.9, !probe %in% sig_FDR_male$ID) %>%
+  group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name"))
+```
+```{r}
+sig_FDR_male %>%
+  group_by(ID) %>%
+  left_join(manifest, by = c("ID" = "name")) %>%
+  left_join(positions, by = c("ID" = "name")) %>%
+  select(ID, chr, pos, UCSC_RefGene_Name) %>%
+  arrange(chr, pos)
+```
+
+```{r}
+sig_FDR_female <- top_female_ewas %>% filter(adj.P.Val < 0.25)
+female_stratified_coloc %>%
+  filter(PP.H4.abf > 0.9, probe %in% sig_FDR_female$ID) %>%
+  group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name"))
+
+female_stratified_coloc %>%
+  filter(PP.H4.abf < 0.9, probe %in% sig_FDR_female$ID) %>%
+  group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name"))
+
+female_stratified_coloc %>%
+  filter(PP.H4.abf > 0.9, !probe %in% sig_FDR_female$ID) %>%
+  group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>%
+  left_join(manifest, by = c("probe" = "name"))
+```
+```{r}
+(sig_summary_FDR_female <- sig_FDR_female %>%
+  group_by(ID) %>%
+  left_join(manifest, by = c("ID" = "name")) %>%
+  left_join(positions, by = c("ID" = "name")) %>%
+  select(ID, chr, pos, UCSC_RefGene_Name) %>%
+  arrange(as.numeric(gsub("chr", "", chr)), pos))
+```
+```{r,eval=FALSE}
+fdr_female_gostres <- gprofiler2::gost(gsub(";.*", "", sig_summary_FDR_female$UCSC_RefGene_Name), organism = "hsapiens", custom_bg = gsub(";.*", "", manifest$UCSC_RefGene_Name), correction_method = "fdr", user_threshold = 0.1)
+gprofiler2::gostplot(fdr_female_gostres)
+```
+
+## plot summaries of colocalization
+```{r}
+all_coloc_hits <- rbind(
+  cross_coloc[PP.H4.abf > 0.9, .(nsnps, probe, locus, locus_snp, PP.H4.abf, Sex = "Cross-sex GWAS, Cross-sex mQTL")][!duplicated(probe)],
+  male_coloc[PP.H4.abf > 0.9, .(nsnps, probe, locus, locus_snp, PP.H4.abf, Sex = "Cross-sex GWAS, Male mQTL")][!duplicated(probe)][!probe %in% cross_coloc_probes$probe],
+  female_coloc[PP.H4.abf > 0.9, .(nsnps, probe, locus, locus_snp, PP.H4.abf, Sex = "Cross-sex GWAS, Female mQTL")][!duplicated(probe)][!probe %in% cross_coloc_probes$probe],
+  male_stratified_coloc[PP.H4.abf > 0.9, .(nsnps, probe, locus, locus_snp, PP.H4.abf, Sex = "Male GWAS, Male mQTL")][!duplicated(probe)][!probe %in% cross_coloc_probes$probe],
+  female_stratified_coloc[PP.H4.abf > 0.9, .(nsnps, probe, locus, locus_snp, PP.H4.abf, Sex = "Female GWAS, Female mQTL")][!duplicated(probe)][!probe %in% cross_coloc_probes$probe]
+)
+all_coloc_hits$Sex <- factor(all_coloc_hits$Sex, levels = unique(all_coloc_hits$Sex))
+ggplot(all_coloc_hits, aes(Sex)) +
+  geom_bar() +
+  geom_text(aes(label = stat(count)), stat = "count", vjust = -0.25) +
+  coord_cartesian(ylim = c(0, 50)) +
+  labs(x = "", y = "Number of Colocalized CpG Sites") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1))
+```
+
+```{r}
+snp_pos <- fread("terre_data/snp_pos.txt")
+probe_pos <- fread("terre_data/probe_pos.txt")
+```
+
+```{r}
+rbindlist(
+  list(
+    "Cross-sex GWAS, Cross-sex mQTL" = cross_coloc[PP.H4.abf > 0.9, ][!duplicated(probe)],
+    "Cross-sex GWAS, Male mQTL" = male_coloc[PP.H4.abf > 0.9, ][!duplicated(probe)],
+    "Cross-sex GWAS, Female mQTL" = female_coloc[PP.H4.abf > 0.9, ][!duplicated(probe)],
+    "Male GWAS, Male mQTL" = male_stratified_coloc[PP.H4.abf > 0.9, ][!duplicated(probe)],
+    "Female GWAS, Female mQTL" = female_stratified_coloc[PP.H4.abf > 0.9, ][!duplicated(probe)]
+  ),
+  idcol = "Category"
+) %>%
+  left_join(snp_pos[, .(SNP, SNP_CHR = CHR, SNP_POS = POS)], by = c("locus_snp" = "SNP")) %>%
+  left_join(probe_pos[, .(geneid, probe_CHR = chr, probe_pos = s1)], by = c("probe" = "geneid")) %>%
+  left_join(manifest %>% mutate(gene = gsub(";.*", "", UCSC_RefGene_Name)) %>% select(name, gene), by = c("probe" = "name")) %>%
+  write.table(sep = "\t", quote = F, row.names = F)
+```
+
+```{r}
+display_venn <- function(x, ...) {
+  library(VennDiagram)
+  grid.newpage()
+  venn_object <- venn.diagram(x, filename = NULL, ...)
+  grid.draw(venn_object)
+}
+
+display_venn(list(
+  cross = cross_coloc[PP.H4.abf > 0.9]$probe,
+  male = male_coloc[PP.H4.abf > 0.9]$probe,
+  female = female_coloc[PP.H4.abf > 0.9]$probe
+), fill = c("gray80", "lightblue", "lightpink"))
+
+display_venn(list(
+  cross = cross_coloc[PP.H4.abf > 0.9]$probe,
+  male_stratified = male_stratified_coloc[PP.H4.abf > 0.9]$probe,
+  female_stratified = female_stratified_coloc[PP.H4.abf > 0.9]$probe
+), fill = c("gray80", "lightblue", "lightpink"))
+
+
+display_venn(list(
+  cross = cross_coloc[PP.H4.abf > 0.9]$probe,
+  male = male_coloc[PP.H4.abf > 0.9]$probe,
+  female = female_coloc[PP.H4.abf > 0.9]$probe,
+  male_stratified = male_stratified_coloc[PP.H4.abf > 0.9]$probe,
+  female_stratified = female_stratified_coloc[PP.H4.abf > 0.9]$probe
+), fill = c("gray80", "lightblue2", "lightpink2", "lightblue4", "lightpink4"))
+display_venn(list(
+  male = male_coloc[PP.H4.abf > 0.9][!duplicated(probe)][!probe %in% cross_coloc_probes$probe]$probe,
+  female = female_coloc[PP.H4.abf > 0.9][!duplicated(probe)][!probe %in% cross_coloc_probes$probe]$probe
+), fill = c("lightblue2", "lightpink2"))
+display_venn(list(
+  male = male_coloc[PP.H4.abf > 0.9][!duplicated(probe)][!probe %in% cross_coloc_probes$probe]$probe,
+  male_stratified = male_stratified_coloc[PP.H4.abf > 0.9][!duplicated(probe)][!probe %in% cross_coloc_probes$probe]$probe
+), fill = c("lightblue2", "lightblue4"))
+display_venn(list(
+  female = female_coloc[PP.H4.abf > 0.9][!duplicated(probe)][!probe %in% cross_coloc_probes$probe]$probe,
+  female_stratified = female_stratified_coloc[PP.H4.abf > 0.9][!duplicated(probe)][!probe %in% cross_coloc_probes$probe]$probe
+), fill = c("lightpink2", "lightpink4"))
+```
+
+## Mendelian Randomization
+```{r,eval=FALSE}
+library(MendelianRandomization)
+library(LDlinkR)
+library(glue)
+run_mr_per_cpg <- function(mQTL, cur_gwas) {
+  require(MendelianRandomization)
+  require(LDlinkR)
+  require(glue)
+  mQTL <- mQTL[grepl("rs", SNP)]
+  cur_gwas <- cur_gwas[mQTL$SNP, on = "SNP", nomatch = 0]
+  cur_mQTL <- mQTL[cur_gwas$SNP, on = "SNP", nomatch = 0]
+  mqtl_rep <- !duplicated(signif(cur_mQTL$beta, 1))
+  cur_gwas <- cur_gwas[mqtl_rep]
+  cur_mQTL <- cur_mQTL[mqtl_rep]
+  if (nrow(cur_mQTL) < 1) {
+    return("No overlapping loci")
+  } else if (nrow(cur_mQTL) == 1) {
+    mr_nocor_input <- mr_input(
+      bx = cur_mQTL$beta,
+      bxse = cur_mQTL$beta / cur_mQTL$`t-stat`,
+      by = cur_gwas$b,
+      byse = cur_gwas$se
+    )
+    IVWObject <- try(
+      mr_ivw(
+        mr_nocor_input,
+        correl = FALSE,
+        distribution = "normal",
+        alpha = 0.05
+      ),
+      silent = FALSE
+    )
+  } else {
+    attempt <- 1
+    cor_table <- NULL
+    print(nrow(cur_mQTL))
+    while (is.null(cor_table) & attempt < 5) {
+      try(cor_table <-
+        LDmatrix(
+          snps = cur_mQTL$SNP,
+          pop = "EUR",
+          genome_build = "grch37",
+          token = gsub("\n", "", readr::read_file("~/analysis_of_pd_dnam/ldlink_token.txt")),
+        ),
+      silent = FALSE
+      )
+      if (is.null(cor_table)) {
+        Sys.sleep(5)
+        attempt <- attempt + 1
+      }
+    }
+    cor_mat <- as.matrix(cor_table[, -c(1)])
+    rownames(cor_mat) <- as.character(cor_table$RS_number)
+    cur_mQTL <- cur_mQTL[rownames(cor_mat), on = "SNP"]
+    cur_gwas <- cur_gwas[rownames(cor_mat), on = "SNP"]
+    if (nrow(cur_mQTL) < 1) {
+      return("No overlapping loci after corr missing")
+    }
+    mr_cor_input <- mr_input(
+      bx = cur_mQTL$beta,
+      bxse = cur_mQTL$beta / cur_mQTL$`t-stat`,
+      by = cur_gwas$b,
+      byse = cur_gwas$se,
+      correlation = cor_mat
+    )
+    IVWObject <- try(
+      mr_ivw(
+        mr_cor_input,
+        correl = TRUE,
+        distribution = "normal",
+        alpha = 0.05
+      ),
+      silent = FALSE
+    )
+  }
+
+  if (class(IVWObject) == "try-error") {
+    return(list(msg = glue("{nrow(cur_mQTL)} mQTL, MR not fit"), obj = mr_cor_input))
+  } else {
+    return(IVWObject)
+  }
+}
+```
+
+#### run MR per colocalized CpG site
+```{r,eval=FALSE}
+cur_GWAS <- fread("~/nalls_PD.QC.gz", key = "SNP")
+cross_mQTL <- fread("all_2022_prs_mQTL.txt", key = "SNP")
+```
+```{r,eval=FALSE}
+cur_GWAS <- cur_GWAS[p < 5e-8]
+cross_mQTL <- cross_mQTL[`p-value` < 5e-8]
+cross_mr_res <- list()
+for (probe in unique(cross_coloc[PP.H4.abf > 0.9]$probe)) {
+  print(probe)
+  cross_mr_res[[probe]] <- run_mr_per_cpg(cross_mQTL[gene == probe], cur_GWAS)
+}
+```
+```{r,eval=FALSE}
+saveRDS(cross_mr_res, file = "cross_mr_res.RData")
+```
+
+## Summary Mendelian Randomization
+### GoDMC mQTL
+```{r}
+all_godmc_smr <- fread("~/all_mqtl_godmc.smr")
+load("../prs_analyses/prs_nalls_cross_w_sex_stratified.RData")
+```
+#### Match regions
+```{r}
+go_dmc_sig <- all_godmc_smr[p_SMR < (0.05 / .N)]
+coord_filter <- unique(c(glue("{gsub('chr','',go_dmc_sig$topSNP_chr)}:{go_dmc_sig$Probe_bp}:{go_dmc_sig$Probe_bp}")))
+regulation_features_smr <- getBM(
+  attributes = attr,
+  filters = c("chromosomal_region"),
+  values=coord_filter,
+  mart=ensembl
+) %>% filter(epigenome_name == "GM12878")
+godmc_regulation_smr <- go_dmc_sig  %>%
+  mutate(
+    regulatory_feature= sapply(
+      1:n(),
+      function(i) unique((regulation_features_smr %>% filter(chromosome_name == gsub("chr","",topSNP_chr[i]),chromosome_start <= Probe_bp[i], chromosome_end >= Probe_bp[i]+1))$feature_type_name)
+    )
+  )%>%
+  mutate(regulatory_feature = sapply(regulatory_feature,paste0,collapse=",")) %>%
+  left_join(manifest,by=c("probeID"="name"))
+```
+#### Table for paper
+```{r}
+  godmc_regulation_smr %>% mutate(
+    regulatory_feature = ifelse(regulatory_feature == "",ifelse(UCSC_RefGene_Group =="","Intergenic",gsub(";.*", "", UCSC_RefGene_Group)),regulatory_feature)
+  ) %>%
+  mutate(
+    regulatory_feature=recode_factor(regulatory_feature,`Enhancer`="Enhancer",`CTCF Binding Site,Enhancer`="Enhancer",`CTCF Binding Site`="CTCF binding site",`TSS1500`="TSS1500",`TSS200`="TSS200",`Promoter Flanking Region` = "Promoter flanking region", `Promoter Flanking Region,CTCF Binding Site`="Promoter flanking region",`Promoter`="Promoter",`CTCF Binding Site,Promoter`="Promoter", `Promoter,CTCF Binding Site`="Promoter",`5'UTR`="5'UTR",`1stExon`="1stExon",`Body`="Gene body",`3'UTR`="3'UTR",`Intergenic`="Intergenic"),
+    Gene = gsub(";.*", "",UCSC_RefGene_Name)
+  )%>% left_join(godmc_coloc %>%   group_by(probe) %>%
+  dplyr::slice(which.max(PP.H4.abf)) %>% dplyr::select(probe,nsnps,PP.H4.abf),by=c("probeID"="probe")) %>% replace(. == 0,.Machine$double.xmin)%>% replace_na(list(nsnps=0,colocalized=FALSE))  %>% mutate(Colocalized = PP.H4.abf > 0.9) %>% dplyr::select(-contains("HEIDI")) %>% arrange(desc(as.character(Colocalized)), p_SMR) %>% dplyr::select(probeID,ProbeChr,Probe_bp,topSNP,topSNP_chr,topSNP_bp, A1,A2,Freq,b_GWAS,se_GWAS,p_GWAS,b_eQTL,se_eQTL,p_eQTL,b_SMR,se_SMR,p_SMR,nsnps,PP.H4.abf,Colocalized,Gene,regulatory_feature) %>% write.csv(file="",row.names=F,col.names=F,quote=F)
+```
+
+
+```{r}
+all_godmc_smr[p_SMR < (0.05 / .N)]
+all_godmc_smr[p_SMR < (0.05 / .N) & probeID %in% godmc_coloc[PP.H4.abf > 0.9]$probe] # harmonize
+all_godmc_smr[p_SMR < (0.05 / .N)] %>% select(-Gene) %>% left_join(godmc_coloc %>%   group_by(probe) %>%
+  slice(which.max(PP.H4.abf)) %>% select(probe,nsnps,PP.H4.abf),by=c("probeID"="probe")) %>% replace(. == 0,.Machine$double.xmin)%>% replace_na(list(nsnps=0,colocalized=FALSE))  %>% mutate(Colocalized = PP.H4.abf > 0.9) %>% select(-contains("HEIDI")) %>% arrange(desc(as.character(Colocalized)), p_SMR) %>% left_join(manifest %>% mutate(Gene = gsub(";.*","",UCSC_RefGene_Name),`Gene region` = gsub(";.*","",UCSC_RefGene_Group)) %>% select(name,Gene,`Gene region`),by=c("probeID"="name")) %>% write_csv("godmc_all_smr_result.csv")
+```
+
+```{r}
+prs_hits <- top_prs_hits[top_prs_hits$adj.P.Val < 0.05, ]$ID
+prs_hits_w_pos <- top_prs_hits %>%
+  filter(adj.P.Val < 0.05) %>%
+  left_join(positions %>% mutate(chr = as.numeric(gsub("chr", "", chr))), by = c("ID" = "name"))
+all_godmc_smr[p_SMR < (0.05 / .N) &  probeID %in% prs_hits & probeID %in% godmc_coloc[PP.H4.abf > 0.9]$probe] # none
+all_godmc_smr[p_SMR < (0.05 / .N) & probeID %in% godmc_coloc[PP.H4.abf > 0.9]$probe]
+go_dmc_dist_smr <- all_godmc_smr[p_SMR < (0.05 / .N) & probeID %in% godmc_coloc[PP.H4.abf > 0.9]$probe][prs_hits_w_pos, on = c("ProbeChr" = "chr"), allow.cartesian = TRUE]
+go_dmc_dist_smr <- go_dmc_dist_smr[, .SD[which.min(abs(Probe_bp - pos))], by = "probeID"][abs(Probe_bp - pos) < 1e6]
+go_dmc_dist_smr <- go_dmc_dist_smr[, .(probeID, ProbeChr, Probe_bp, ID, pos, dist = Probe_bp - pos)]
+all_godmc_smr[p_SMR < (0.05 / .N)& probeID %in% godmc_coloc[PP.H4.abf > 0.9]$probe][manifest[, c("name", "UCSC_RefGene_Name", "UCSC_RefGene_Group")], on = c("probeID" = "name"), nomatch = 0][order(p_SMR)]
+(smr_neighbor_cpg <- all_godmc_smr[go_dmc_dist_smr, on = "probeID"] %>% mutate(
+  SMR_Gene = manifest[match(probeID, manifest$name), ]$UCSC_RefGene_Name,
+  SMR_Group = manifest[match(probeID, manifest$name), ]$UCSC_RefGene_Group,
+  near_Gene = manifest[match(ID, manifest$name), ]$UCSC_RefGene_Name,
+  near_Group = manifest[match(ID, manifest$name), ]$UCSC_RefGene_Group
+) %>% arrange(p_SMR))
+```
+```{r,dpi=300}
+ggplot(all_godmc_smr[p_SMR < (0.05/ .N)],aes(
+  xmin=b_eQTL -se_eQTL,
+  xmax=b_eQTL + se_eQTL,
+  ymin=b_GWAS - se_GWAS,
+  ymax=b_GWAS + se_GWAS,
+  x= b_eQTL,
+  y=b_GWAS,
+  color = probeID %in% godmc_coloc[PP.H4.abf > 0.9]$probe)) +
+  geom_hline(linetype="dashed",yintercept = 0) +
+  geom_vline(linetype="dashed",xintercept = 0)+
+  geom_point(show.legend=F)+
+  geom_errorbar(show.legend = F) +
+  geom_errorbarh(show.legend = F) +
+  # ggrepel::geom_text_repel(
+  #   data=all_godmc_smr[p_SMR < (0.05/ .N) & probeID %in% godmc_coloc[PP.H4.abf > 0.9]$probe][manifest[, c("name", "UCSC_RefGene_Name", "UCSC_RefGene_Group")], on = c("probeID" = "name"), nomatch = 0],
+  #   aes(label=paste0(probeID," (",gsub(";.*","",ifelse(UCSC_RefGene_Name != "",UCSC_RefGene_Name,"Intergenic")),")")),
+  #   show.legend=F,
+  #   max.overlaps = Inf,
+  #   force = 2
+  # )+
+  labs(y= "GWAS Effect", x="mQTL Effect")+
+  coord_cartesian(ylim=c(-0.5,0.5))+
+  scale_color_manual(values=c("gray70","red"))+
+  theme_minimal()
+ggplot(all_godmc_smr[p_SMR < (0.05/ .N) & probeID %in% godmc_coloc[PP.H4.abf > 0.9]$probe][manifest[, c("name", "UCSC_RefGene_Name", "UCSC_RefGene_Group")], on = c("probeID" = "name"), nomatch = 0]%>% mutate(name=paste0(probeID," (",gsub(";.*","",ifelse(UCSC_RefGene_Name != "",UCSC_RefGene_Name,"Intergenic")),")")) %>% mutate(name=factor(name,levels=name[order(-b_SMR)])),aes(y=name, x=b_SMR,xmin=b_SMR-se_SMR,xmax =b_SMR + se_SMR))+
+  geom_point()+
+  labs(y="",x="SMR Effect")+
+  geom_errorbarh()+
+  theme_minimal()
+
+```
+
+#### Locus Plots
+```{r}
+source("~/plot/plot_SMR.r")
+SMRData <- ReadSMRData("~/plot/cg15072306_IMP5.cg15072306.txt")
+SMRData$SMR$V4 <- gsub(";.*", "", manifest$UCSC_RefGene_Name[match(SMRData$SMR$V1, manifest$name)])
+SMRData$SMR$V4 <- ifelse(SMRData$SMR$V4 == "", "Intergenic", SMRData$SMR$V4)
+SMRLocusPlot(data = SMRData, smr_thresh = signif(0.05 / nrow(all_godmc_smr), 3), heidi_thresh = 0.01, plotWindow = 15, max_anno_probe = 5)
+```
+```{r}
+SMRData <- ReadSMRData("~/plot/cg08473090_CRHR1.cg08473090.txt")
+SMRData$SMR$V4 <- gsub(";.*", "", manifest$UCSC_RefGene_Name[match(SMRData$SMR$V1, manifest$name)])
+SMRData$SMR$V4 <- ifelse(SMRData$SMR$V4 == "", "Intergenic", SMRData$SMR$V4)
+SMRLocusPlot(data = SMRData, smr_thresh = signif(0.05 / nrow(all_godmc_smr), 3), heidi_thresh = 0.01, plotWindow = 15, max_anno_probe = 5)
+```
+```{r}
+SMRData <- ReadSMRData("~/plot/cg24677220_MAPT.cg24677220.txt")
+SMRData$SMR$V4 <- gsub(";.*", "", manifest$UCSC_RefGene_Name[match(SMRData$SMR$V1, manifest$name)])
+SMRData$SMR$V4 <- ifelse(SMRData$SMR$V4 == "", "Intergenic", SMRData$SMR$V4)
+SMRLocusPlot(data = SMRData, smr_thresh = signif(0.05 / nrow(all_godmc_smr), 3), heidi_thresh = 0.01, plotWindow = 15, max_anno_probe = 6)
+```
+
+### TERRE mQTL
+```{r}
+cross_smr <- fread("~/all_2022_dnam_pd.smr")
+cross_smr$set <- "Cross-sex GWAS, Cross-sex mQTL"
+male_nalls_smr <- fread("~/male_nalls_2022_dnam_pd.smr")
+male_nalls_smr$set <- "Cross-sex GWAS, Male mQTL"
+female_nalls_smr <- fread("~/female_nalls_2022_dnam_pd.smr")
+female_nalls_smr$set <- "Cross-sex GWAS, Female mQTL"
+male_blau_smr <- fread("~/male_blauwendraat_2022_dnam_pd.smr")
+male_blau_smr$set <- "Male GWAS, Male mQTL"
+female_blau_smr <- fread("~/female_blauwendraat_2022_dnam_pd.smr")
+female_blau_smr$set <- "Female GWAS, Female mQTL"
+```
+
+```{r}
+(cross_smr_hits <- cross_smr[p_SMR < (0.05 / .N)])
+(cross_smr_hits_heidi <- cross_smr[p_SMR < (0.05 / .N) & p_HEIDI > 0.01])
+
+(male_nalls_smr_hits <- male_nalls_smr[p_SMR < (0.05 / .N)])
+(male_nalls_smr_hits_heidi <- male_nalls_smr[p_SMR < (0.05 / .N) & p_HEIDI > 0.01])
+
+(female_nalls_smr_hits <- female_nalls_smr[p_SMR < (0.05 / .N)])
+(female_nalls_smr_hits_heidi <- female_nalls_smr[p_SMR < (0.05 / .N) & p_HEIDI > 0.01])
+
+(male_blau_smr_hits <- male_blau_smr[p_SMR < (0.05 / .N)])
+(male_blau_smr_hits_heidi <- male_blau_smr[p_SMR < (0.05 / .N) & p_HEIDI > 0.01])
+
+(female_blau_smr_hits <- female_blau_smr[p_SMR < (0.05 / .N)])
+(female_blau_smr_hits_heidi <- female_blau_smr[p_SMR < (0.05 / .N) & p_HEIDI > 0.01])
+# rbindlist(list(
+#   "Cross-sex GWAS, cross-sex mQTL"=cross_smr_hits_heidi,
+#   "Cross-sex GWAS, male mQTL"=male_nalls_smr_hits_heidi,
+#   "Cross-sex GWAS, female mQTL"=female_nalls_smr_hits_heidi,
+#   "Male GWAS, Male mQTL"=male_blau_smr_hits_heidi,
+#   "Female GWAS, Female mQTL"=female_blau_smr_hits_heidi
+# ),
+# idcol="Category" ) %>%
+#   mutate(probe=Gene) %>%
+#   select(-Gene) %>%
+#   left_join(manifest %>% mutate(gene=gsub(";.*","",UCSC_RefGene_Name)) %>% select(name,gene),by=c("probe"="name")) %>%  write.table(sep='\t',quote=F,row.names=F)
+```
+
+```{r}
+display_venn <- function(x, ...) {
+  library(VennDiagram)
+  grid.newpage()
+  venn_object <- venn.diagram(x, filename = NULL, ...)
+  grid.draw(venn_object)
+}
+
+display_venn(list(
+  cross = cross_smr_hits$probeID,
+  male = male_nalls_smr_hits$probeID,
+  female = female_nalls_smr_hits$probeID
+), fill = c("gray80", "lightblue", "lightpink"))
+
+display_venn(list(
+  cross = cross_smr_hits_heidi$probeID,
+  male = male_nalls_smr_hits_heidi$probeID,
+  female = female_nalls_smr_hits_heidi$probeID
+), fill = c("gray80", "lightblue", "lightpink"))
+
+display_venn(list(
+  cross = cross_smr_hits$probeID,
+  male = male_blau_smr_hits$probeID,
+  female = female_blau_smr_hits$probeID
+), fill = c("gray80", "lightblue", "lightpink"))
+
+display_venn(list(
+  cross = cross_smr_hits_heidi$probeID,
+  male = male_blau_smr_hits_heidi$probeID,
+  female = female_blau_smr_hits_heidi$probeID
+), fill = c("gray80", "lightblue", "lightpink"))
+
+
+display_venn(list(
+  male_nalls = male_nalls_smr_hits_heidi$probeID,
+  female_nalls = female_nalls_smr_hits_heidi$probeID,
+  male_blau = male_blau_smr_hits$probeID,
+  female_blau = female_blau_smr_hits$probeID
+), fill = c("lightblue2", "lightpink2", "lightblue4", "lightpink4"))
+
+display_venn(list(
+  male_nalls = male_nalls_smr_hits_heidi$probeID,
+  female_nalls = female_nalls_smr_hits_heidi$probeID,
+  male_blau = male_blau_smr_hits_heidi$probeID,
+  female_blau = female_blau_smr_hits_heidi$probeID
+), fill = c("lightblue2", "lightpink2", "lightblue4", "lightpink4"))
+```
+```{r}
+to_plot <- rbind(cross_smr_hits, male_nalls_smr_hits[!probeID %in% cross_smr_hits$probeID], female_nalls_smr_hits[!probeID %in% cross_smr_hits$probeID], male_blau_smr_hits[!probeID %in% cross_smr_hits$probeID], female_blau_smr_hits[!probeID %in% cross_smr_hits$probeID])
+to_plot$set <- factor(
+  to_plot$set,
+  levels = c(
+    "Cross-sex GWAS, Cross-sex mQTL",
+    "Cross-sex GWAS, Male mQTL",
+    "Cross-sex GWAS, Female mQTL",
+    "Male GWAS, Male mQTL",
+    "Female GWAS, Female mQTL"
+  )
+)
+ggplot(to_plot %>% mutate(`HEIDI Test` = ifelse(p_HEIDI > 0.01, "Passed", "Failed")) %>% na.omit(), aes(set, fill = `HEIDI Test`)) +
+  geom_bar() +
+  scale_fill_manual(values = c("Passed" = "gray20", "Failed" = "gray70"), drop = FALSE) +
+  scale_x_discrete(drop = FALSE) +
+  geom_text(stat = "count", position = "stack", mapping = aes(label = after_stat(count), group = set), vjust = -0.25) +
+  coord_cartesian(ylim = c(0, 80)) +
+  labs(y = "Number of DNAm-mediated\nAssociations", x = "") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1))
+```
+```{r}
+to_plot[grepl("Male mQTL", set)]
+```
+
+### Locus plots
+```{r}
+source("~/plot/plot_SMR.r")
+SMRData <- ReadSMRData("~/plot/top-cross.cg18228076.txt")
+SMRData$SMR$V4 <- gsub(";.*", "", manifest$UCSC_RefGene_Name[match(SMRData$SMR$V1, manifest$name)])
+SMRData$SMR$V4 <- ifelse(SMRData$SMR$V4 == "", "Intergenic", SMRData$SMR$V4)
+SMRLocusPlot(data = SMRData, smr_thresh = signif(0.05 / nrow(cross_smr), 3), heidi_thresh = 0.01, plotWindow = 10, max_anno_probe = 20)
+
+SMR_Male_Data <- ReadSMRData("~/plot/male-mqtl.cg02182504.txt")
+SMR_Male_Data$SMR$V4 <- gsub(";.*", "", manifest$UCSC_RefGene_Name[match(SMR_Male_Data$SMR$V1, manifest$name)])
+SMR_Male_Data$SMR$V4 <- ifelse(SMR_Male_Data$SMR$V4 == "", "Intergenic", SMR_Male_Data$SMR$V4)
+SMRLocusPlot(data = SMR_Male_Data, smr_thresh = signif(0.05 / nrow(male_nalls_smr), 3), heidi_thresh = 0.01, plotWindow = 10, max_anno_probe = 3)
+```
