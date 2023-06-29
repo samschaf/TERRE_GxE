@@ -1,0 +1,207 @@
+### Samantha Schaffner
+### Apr 17, 2023
+
+## Reading in and formatting GTEx data
+```{r}
+library(CePa) #for reading gct files
+library(biomaRt)
+
+GTEx <- read.gct("~/3-posthoc/brain_blood/GTEx_Analysis_2017-06-05_v8_RNASeQCv1.1.9_gene_median_tpm.gct")
+colnames(GTEx)[grep("Brain",colnames(GTEx))]
+# [1] "Brain...Amygdala"                         
+# [2] "Brain...Anterior.cingulate.cortex..BA24." 
+# [3] "Brain...Caudate..basal.ganglia."          
+# [4] "Brain...Cerebellar.Hemisphere"            
+# [5] "Brain...Cerebellum"                       
+# [6] "Brain...Cortex"                           
+# [7] "Brain...Frontal.Cortex..BA9."             
+# [8] "Brain...Hippocampus"                      
+# [9] "Brain...Hypothalamus"                     
+#[10] "Brain...Nucleus.accumbens..basal.ganglia."
+#11] "Brain...Putamen..basal.ganglia."          
+#[12] "Brain...Spinal.cord..cervical.c.1."       
+#[13] "Brain...Substantia.nigra"    
+
+colnames(GTEx)[grep("Blood",colnames(GTEx))]
+#[1] "Whole.Blood"
+
+ncol(GTEx_brain_blood <- GTEx[,c(grep("Brain",colnames(GTEx)), grep("Blood",colnames(GTEx)))]) #14
+head(rownames(GTEx_brain_blood))
+
+###ensembl versioning removed
+GTEx_ens_gene <- sapply(1:nrow(GTEx_brain_blood), function(x) unlist(strsplit(rownames(GTEx_brain_blood)[x], split="\\."))[1])
+
+#convert Ensembl gene IDs
+mart <- useMart("ENSEMBL_MART_ENSEMBL", dataset="hsapiens_gene_ensembl")
+ext_genes <- getBM(mart, filters="ensembl_gene_id", values=GTEx_ens_gene, attributes=c("ensembl_gene_id","external_gene_name"),useCache = FALSE)
+
+length(GTEx_ens_gene[GTEx_ens_gene %in% ext_genes$ensembl_gene_id]) #55,551 (Sept 26, 2022)
+GTEx_brain_blood <- cbind(as.data.frame(GTEx_brain_blood), ens_gene=GTEx_ens_gene)
+
+GTEx_bb_sub <- GTEx_brain_blood[match(ext_genes$ensembl_gene_id, GTEx_brain_blood$ens_gene),]
+all.equal(as.character(GTEx_bb_sub$ens_gene), ext_genes$ensembl_gene_id) #TRUE
+GTEx_bb_sub$ext_gene <- ext_genes$external_gene_name
+
+colnames(GTEx_bb_sub)
+# [1] "Brain...Amygdala"                          "Brain...Anterior.cingulate.cortex..BA24."  "Brain...Caudate..basal.ganglia."          
+# [4] "Brain...Cerebellar.Hemisphere"             "Brain...Cerebellum"                        "Brain...Cortex"                           
+# [7] "Brain...Frontal.Cortex..BA9."              "Brain...Hippocampus"                       "Brain...Hypothalamus"                     
+#[10] "Brain...Nucleus.accumbens..basal.ganglia." "Brain...Putamen..basal.ganglia."           "Brain...Spinal.cord..cervical.c.1."       
+#[13] "Brain...Substantia.nigra"                  "Whole.Blood"                               "ens_gene"                                 
+#[16] "ext_gene"  
+
+write.csv(GTEx_bb_sub, file="~/3-posthoc/brain_blood/GTEx_brain_blood_annotated.csv", row.names=FALSE)
+```
+
+## Preparing background EPIC gene annotation
+```{r bg anno, eval=F}
+#need to get a data frame of all EPIC probes measured for differential methylation in this study, annotated to one gene each
+load("~/2-EWAS_CMRs/TERRE/refCMR_medB_F.RData")
+load("~/kobor_shared_coding_resource/EPIC_fdat.RData")
+annEPIC <- read.delim("~/kobor_shared_coding_resource/annEPIC_GO_v4.txt") #one gene to one CpG annotation (created by Maggie Fu)
+
+#subset the fDat to filtered probes
+nrow(fdat_sub <- fData_EPIC[fData_EPIC$TargetID %in% colnames(refCMR_medB_F),]) #42,776 probes
+#add single-gene annotation
+annEPIC_sub <- annEPIC[annEPIC$CpG %in% fdat_sub$TargetID,]
+nrow(fdat_genes <- fdat_sub[match(annEPIC_sub$CpG, fdat_sub$TargetID),]) #32,050 probes with gene annotations
+fdat_genes$annEPIC_gene <- annEPIC_sub$Gene_name
+fdat_nogene <- fdat_sub[-which(fdat_sub$TargetID %in% annEPIC_sub$CpG),]
+fdat_nogene$annEPIC_gene <- NA
+nrow(fdat_sub <- rbind(fdat_genes, fdat_nogene)) #42,776
+
+write.csv(fdat_sub, file="~/3-posthoc/brain_blood/TERRE_refCMR_one_gene_per_CpG_becon_anno_0.3.csv", row.names=F)
+```
+
+## Female CMRs
+```{r}
+# differentially methylated CMRs
+CMRs <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_F_adjDB_042023.csv") #contains all variable F probes
+CMR_genes <- unique(c(unlist(strsplit(as.character(CMRs[CMRs$threshold_adjDB==TRUE,"geneSymbol"]), split=",")), unlist(strsplit(as.character(CMRs[CMRs$threshold_adjDB==TRUE,"UCSC_REFGENE_NAME"]), split=";"))))
+length(CMR_genes <- CMR_genes[complete.cases(CMR_genes)]) #50
+
+# background annotation
+fdat_sub2 <- fdat_sub[fdat_sub$TargetID %in% CMRs$TargetID,]
+length(bg_genes <- as.character(unique(fdat_sub2$annEPIC_gene[complete.cases(fdat_sub2$annEPIC_gene)]))) #12,347 genes
+
+# GTEx coexpression information
+GTEx <- read.csv("~/3-posthoc/brain_blood/GTEx_brain_blood_annotated.csv")
+
+##### Retrieving the number of genes co-expressed in brain and blood
+
+#subset GTEx data to CMR genes
+GTEx_sub <- GTEx[GTEx$ext_gene %in% CMR_genes,]
+
+#check how many of the CMR genes are expressed in blood
+nrow(blood_expr <- GTEx_sub[GTEx_sub$Whole.Blood>0.5,]) #14
+blood_expr$ext_gene
+# [1] "TCF19"   "CCHCR1"  "SLC35A1" "ASRGL1"  "BCL11B"  "NUP88"   "FXR2"    "MPDU1"   "NFATC1"  "CRTC1"  
+#[11] "ABHD8"   "NTSR1"   "ARAF"    "VSIG1"  
+
+#check how many of the CMR genes are expressed in brain
+nrow(brain_expr <- GTEx_sub[GTEx_sub$Brain...Amygdala>0.5 | GTEx_sub$Brain...Anterior.cingulate.cortex..BA24.>0.5 | GTEx_sub$Brain...Caudate..basal.ganglia.>0.5 | GTEx_sub$Brain...Cerebellar.Hemisphere>0.5 | GTEx_sub$Brain...Cerebellum>0.5 | GTEx_sub$Brain...Cortex>0.5 | GTEx_sub$Brain...Frontal.Cortex..BA9.>0.5 | GTEx_sub$Brain...Hippocampus>0.5 | GTEx_sub$Brain...Hypothalamus>0.5 | GTEx_sub$Brain...Nucleus.accumbens..basal.ganglia.>0.5 | GTEx_sub$Brain...Putamen..basal.ganglia.>0.5 | GTEx_sub$Brain...Spinal.cord..cervical.c.1.>0.5 | GTEx_sub$Brain...Substantia.nigra>0.5,]) #34
+brain_expr$ext_gene
+# [1] "SLC1A7"   "ERBB4"    "TCF19"    "CCHCR1"   "SLC35A1"  "CFAP206"  "SNTG1"    "ADARB2"   "BBOX1"   
+#[10] "NAV2"     "KLHL35"   "ASRGL1"   "MYBPC1"   "TPTE2P1"  "SLITRK5"  "BCL11B"   "ACTC1"    "GREM1"   
+#[19] "CACNA1H"  "NUP88"    "SHBG"     "FXR2"     "MPDU1"    "DLGAP1"   "NFATC1"   "CRTC1"    "ABHD8"   
+#[28] "MIR7-3HG" "KCNG1"    "NTSR1"    "MYT1"     "SLC25A18" "ARAF"     "VSIG1"   
+
+nrow(brain_blood_expr <- blood_expr[blood_expr$ens_gene %in% brain_expr$ens_gene,]) #14 (28% of all CMR genes)
+all(blood_expr$ens_gene %in% brain_expr$ens_gene) #TRUE
+
+write.csv(blood_expr, file="~/3-posthoc/brain_blood/TERRE_CMRs_adjDB_F_brain_blood_coexpr_042023.csv", row.names=F)
+
+# permuting
+source('~/3-posthoc/brain_blood/GTEx_blood_brain_permutation.R')
+brain_blood_expr_perm(CMR_genes, bg_genes, 1000)
+#[1] "Permutation P values for enrichment and depletion"
+#[1] "Enrichment: 0.938; Depletion 0.102"
+
+# plotting only coexpressed genes
+library(reshape2)
+library(ggplot2)
+library(ggrepel)
+colnames(blood_expr)
+colnames(blood_expr) <- gsub("Brain...", "", colnames(blood_expr))
+blood_expr_melt <- melt(blood_expr, id.vars=c("Whole.Blood","ens_gene","ext_gene"))
+
+summary(blood_expr_melt[-which(blood_expr_melt$variable %in% c("Cerebellum","Cerebellar.Hemisphere")),"value"])
+
+# plotting all genes
+colnames(GTEx_sub)
+colnames(GTEx_sub) <- gsub("Brain...", "", colnames(GTEx_sub))
+GTEx_sub_melt <- melt(GTEx_sub, id.vars=c("Whole.Blood","ens_gene","ext_gene"))
+
+summary(GTEx_sub_melt$value)
+#    Min.  1st Qu.   Median     Mean  3rd Qu.     Max. 
+#  0.0000   0.2922   2.2447  10.1653  10.0267 150.2920
+  
+summary(GTEx_sub_melt[-which(GTEx_sub_melt$variable %in% c("Cerebellum","Cerebellar.Hemisphere")),"value"])
+#    Min.  1st Qu.   Median     Mean  3rd Qu.     Max. 
+#  0.0000   0.3091   2.2196   9.0524   9.2015 114.8310 
+
+GTEx_sub_melt$TPM_cat <- "< 0.5" 
+GTEx_sub_melt[abs(GTEx_sub_melt$value)>=0.5,6] <- ">= 0.5"
+GTEx_sub_melt$TPM_cat <- as.factor(GTEx_sub_melt$TPM_cat)
+
+#all brain regions
+png("~/3-posthoc/brain_blood/GTEx_adjDB_F_allregions_042023.png", width=1000, height=621)
+ggplot(GTEx_sub_melt, aes(x=Whole.Blood, y=value)) + geom_hline(yintercept=0.5, linetype="dashed") + geom_vline(xintercept=0.5, linetype="dashed") + geom_point( aes(alpha=TPM_cat,col="pink"), show.legend = FALSE) + geom_text_repel(label=GTEx_sub_melt[,"ext_gene"], col="black", size=3) + theme_bw() + facet_wrap(~variable, nrow=3) + ylab("TPM (Brain)") + xlab("TPM (Whole Blood)")+ scale_color_manual(values=c("lightpink4")) + scale_alpha_manual(values=c(0.5,1))
+dev.off()
+```
+![Brain and blood expression levels for female CMR genes](/home1/NEURO/schaffner/3-posthoc/brain_blood/GTEx_adjDB_F_allregions_042023.png)
+
+## Male CMRs
+```{r}
+# differentially methylated CMRs
+CMRs <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_M_adjDB_042023.csv") #contains all variable M probes
+CMR_genes <- unique(c(unlist(strsplit(as.character(CMRs[CMRs$threshold_adjDB==TRUE,"geneSymbol"]), split=",")), unlist(strsplit(as.character(CMRs[CMRs$threshold_adjDB==TRUE,"UCSC_REFGENE_NAME"]), split=";"))))
+length(CMR_genes <- CMR_genes[complete.cases(CMR_genes)]) #3
+
+# background annotation
+fdat_sub2 <- fdat_sub[fdat_sub$TargetID %in% CMRs$TargetID,]
+length(bg_genes <- as.character(unique(fdat_sub2$annEPIC_gene[complete.cases(fdat_sub2$annEPIC_gene)]))) #12,308 genes
+
+##### Retrieving the number of genes co-expressed in brain and blood
+
+#subset GTEx data to CMR genes
+GTEx_sub <- GTEx[GTEx$ext_gene %in% CMR_genes,]
+
+#check how many of the CMR genes are expressed in blood
+nrow(blood_expr <- GTEx_sub[GTEx_sub$Whole.Blood>0.5,]) #2
+GTEx_sub[,c("ext_gene","Whole.Blood")]
+#      ext_gene Whole.Blood
+#46801     ANO8   2.9274600
+#46971     DDA1  11.5206000
+
+#check how many of the CMR genes are expressed in brain
+nrow(brain_expr <- GTEx_sub[GTEx_sub$Brain...Amygdala>0.5 | GTEx_sub$Brain...Anterior.cingulate.cortex..BA24.>0.5 | GTEx_sub$Brain...Caudate..basal.ganglia.>0.5 | GTEx_sub$Brain...Cerebellar.Hemisphere>0.5 | GTEx_sub$Brain...Cerebellum>0.5 | GTEx_sub$Brain...Cortex>0.5 | GTEx_sub$Brain...Frontal.Cortex..BA9.>0.5 | GTEx_sub$Brain...Hippocampus>0.5 | GTEx_sub$Brain...Hypothalamus>0.5 | GTEx_sub$Brain...Nucleus.accumbens..basal.ganglia.>0.5 | GTEx_sub$Brain...Putamen..basal.ganglia.>0.5 | GTEx_sub$Brain...Spinal.cord..cervical.c.1.>0.5 | GTEx_sub$Brain...Substantia.nigra>0.5,]) #4
+brain_expr$ext_gene #"[1] "ANO8"  "DDA1" 
+
+# permuting
+brain_blood_expr_perm(CMR_genes, bg_genes, 1000)
+#[1] "Permutation P values for enrichment and depletion"
+#[1] "Enrichment: 0.344; Depletion 0.939"
+
+# plotting all genes
+colnames(GTEx_sub)
+colnames(GTEx_sub) <- gsub("Brain...", "", colnames(GTEx_sub))
+GTEx_sub_melt <- melt(GTEx_sub, id.vars=c("Whole.Blood","ens_gene","ext_gene"))
+
+summary(GTEx_sub_melt$value)
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#  10.60   17.66   20.38   24.10   25.87   72.29 
+
+summary(GTEx_sub_melt[-which(GTEx_sub_melt$variable %in% c("Cerebellum","Cerebellar.Hemisphere")),"value"])
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#  10.60   17.22   20.02   20.33   24.62   32.76 
+
+GTEx_sub_melt$TPM_cat <- "< 0.5" 
+GTEx_sub_melt[abs(GTEx_sub_melt$value)>=0.5,6] <- ">= 0.5"
+GTEx_sub_melt$TPM_cat <- as.factor(GTEx_sub_melt$TPM_cat)
+
+png("~/3-posthoc/brain_blood/GTEx_adjDB_M_allregions_042023.png", width=1000, height=621)
+ggplot(GTEx_sub_melt, aes(x=Whole.Blood, y=value)) + geom_hline(yintercept=0.5, linetype="dashed") + geom_vline(xintercept=0.5, linetype="dashed") + geom_point( aes(col="pink"), show.legend = FALSE) + geom_text_repel(label=GTEx_sub_melt[,"ext_gene"], col="black", size=3) + theme_bw() + facet_wrap(~variable, nrow=3) + ylab("TPM (Brain)") + xlab("TPM (Whole Blood)") + xlim(c(0,75)) + ylim(c(0,75)) + scale_color_manual(values=c("lightsteelblue4"))
+dev.off()
+```
+![Brain and blood expression levels for male CMR genes](/home1/NEURO/schaffner/3-posthoc/brain_blood/GTEx_adjDB_M_allregions_042023.png)

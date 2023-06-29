@@ -1,0 +1,225 @@
+### Samantha Schaffner
+### Apr 17, 2023
+From manuscript:
+
+DNAm levels of DMR CpGs in brain and blood were retrieved by querying all DMR CpG IDs with the BECon web tool. DMRs were considered co-methylated in blood and brain if blood DNAm in at least one CpG within the DMR was correlated to brain DNAm in at least one brain region at Spearman’s ρ ≥ 0.5.
+
+## Preparing background EPIC gene annotation
+```{r bg anno, eval=F}
+#need to get a data frame of all EPIC probes measured for differential methylation in this study, annotated to one gene each
+fdat_sub <- read.csv("~/3-posthoc/brain_blood/TERRE_refCMR_one_gene_per_CpG_becon_anno.csv")
+
+becon_ref <- read.csv("~/3-posthoc/brain_blood/BECon_BLBR_cor.csv")
+becon_ref <- becon_ref[becon_ref$CpG %in% fdat_sub$TargetID,]
+fdat_becon <- fdat_sub[match(becon_ref$CpG, fdat_sub$TargetID),]
+fdat_becon <- cbind(fdat_becon, becon_ref[,2:4])
+fdat_nobecon <- fdat_sub[-which(fdat_sub$TargetID %in% becon_ref$CpG),]
+fdat_nobecon <- cbind(fdat_nobecon, data.frame(BRAIN7=NA, BRAIN10=NA, BRAIN20=NA))
+nrow(fdat2 <- rbind(fdat_becon, fdat_nobecon)) #42,776
+fdat2$cor_becon <- (abs(fdat2$BRAIN7)>=0.3|abs(fdat2$BRAIN10)>=0.3|abs(fdat2$BRAIN20)>=0.3)
+
+write.csv(fdat2, file="~/3-posthoc/brain_blood/TERRE_refCMR_one_gene_per_CpG_becon_anno_0.3.csv")
+```
+
+## Female CMRs
+```{r}
+CMRs <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_F_adjDB_042023.csv")
+CMRs$cmr <- as.character(CMRs$cmr)
+
+CMRs_sub <- CMRs[CMRs$threshold_adjDB==TRUE,]
+
+#split up so each CpG is one row
+CMRs_sub$cmr <- as.character(CMRs_sub$cmr)
+length(cpgs <- unlist(strsplit(CMRs_sub$cmr, split=","))) #227
+cmr_df <- lapply(1:length(cpgs), function(x){
+  CMR_row <- CMRs_sub[grep(cpgs[x], CMRs_sub$cmr),]
+  CMR_row$cpg <- cpgs[x]
+  return(CMR_row)
+})
+cmr_df <- do.call(rbind, cmr_df)
+
+### calculate correlation statistics across each CMR: min, max, mean, median
+
+#subset becon_ref data to CMR genes
+becon_ref <- read.csv("~/3-posthoc/brain_blood/BECon_BLBR_cor.csv")
+becon_ref_sub <- becon_ref[becon_ref$CpG %in% cmr_df$cpg,]
+all(becon_ref_sub$CpG %in% cmr_df$cpg) #TRUE
+all(cmr_df$cpg %in% becon_ref_sub$CpG) #FALSE
+nrow(cmr_df_sub <- cmr_df[match(as.character(becon_ref_sub$CpG), cmr_df$cpg),]) #178
+all.equal(as.character(becon_ref_sub$CpG), cmr_df_sub$cpg) #TRUE
+nrow(becon_ref_sub <- cbind(becon_ref_sub, cmr_df_sub[,57:64])) #178
+
+#summarize correlation over the CMR
+CMRs_sub$min_BRAIN7 <- NA
+CMRs_sub$max_BRAIN7 <- NA
+CMRs_sub$mean_BRAIN7 <- NA
+CMRs_sub$median_BRAIN7 <- NA
+CMRs_sub$min_BRAIN10 <- NA
+CMRs_sub$max_BRAIN10 <- NA
+CMRs_sub$mean_BRAIN10 <- NA
+CMRs_sub$median_BRAIN10 <- NA
+CMRs_sub$min_BRAIN20 <- NA
+CMRs_sub$max_BRAIN20 <- NA
+CMRs_sub$mean_BRAIN20 <- NA
+CMRs_sub$median_BRAIN20 <- NA
+CMRs_sub$num_probes_in_becon <- NA
+
+for (i in 1:nrow(CMRs_sub)){
+  cmr_becon <- becon_ref_sub[becon_ref_sub$cmr==CMRs_sub$cmr[i],]
+  CMRs_sub$num_probes_in_becon[i] <- nrow(cmr_becon)
+  if(CMRs_sub$num_probes_in_becon[i]>0){
+  
+  CMRs_sub$min_BRAIN7[i] <- min(cmr_becon$BRAIN7)
+  CMRs_sub$max_BRAIN7[i] <- max(cmr_becon$BRAIN7)
+  CMRs_sub$mean_BRAIN7[i] <- mean(cmr_becon$BRAIN7)
+  CMRs_sub$median_BRAIN7[i] <- median(cmr_becon$BRAIN7)
+  CMRs_sub$min_BRAIN10[i] <- min(cmr_becon$BRAIN10)
+  CMRs_sub$max_BRAIN10[i] <- max(cmr_becon$BRAIN10)
+  CMRs_sub$mean_BRAIN10[i] <- mean(cmr_becon$BRAIN10)
+  CMRs_sub$median_BRAIN10[i] <- median(cmr_becon$BRAIN10)
+  CMRs_sub$min_BRAIN20[i] <- min(cmr_becon$BRAIN20)
+  CMRs_sub$max_BRAIN20[i] <- max(cmr_becon$BRAIN20)
+  CMRs_sub$mean_BRAIN20[i] <- mean(cmr_becon$BRAIN20)
+  CMRs_sub$median_BRAIN20[i] <- median(cmr_becon$BRAIN20) }
+}
+
+write.csv(CMRs_sub, file="~/3-posthoc/brain_blood/CMRs_adjDB_F_becon_anno_042023.csv", row.names=F)
+
+library(gridExtra)
+library(ggplot2)
+library(ggrepel)
+
+CMRs_sub$lab <- as.character(CMRs_sub$geneSymbol)
+CMRs_sub$lab[is.na(CMRs_sub$lab)] <- as.character(CMRs_sub[is.na(CMRs_sub$lab),"cmrGR"])
+summary(c(CMRs_sub$median_BRAIN7, CMRs_sub$median_BRAIN10, CMRs_sub$median_BRAIN20))
+#    Min.  1st Qu.   Median     Mean  3rd Qu.     Max.     NA's 
+#-0.45735 -0.12868  0.06912  0.07874  0.24154  0.68088       63 
+
+library(reshape2)
+CMRs_sub_melt <- melt(CMRs_sub[,c("lab","median_BRAIN7","median_BRAIN10","median_BRAIN20")], id.vars="lab")
+CMRs_sub_melt$variable <- gsub("median_BRAIN7", "Brodmann area 7 (parietal cortex)", gsub("median_BRAIN10", "Brodmann area 10 (anterior prefrontal cortex)", gsub("median_BRAIN20", "Brodmann area 20 (temporal cortex)", CMRs_sub_melt$variable)))
+colnames(CMRs_sub_melt)[2] <- "Brain region"
+CMRs_sub_melt <- CMRs_sub_melt[complete.cases(CMRs_sub_melt$value),]
+CMRs_sub_melt$`Absolute median correlation` <- "< 0.3" 
+CMRs_sub_melt[abs(CMRs_sub_melt$value)>=0.3,4] <- ">= 0.3"
+
+png("~/3-posthoc/brain_blood/BECon_CMRmeds_adjDB_F_042023.png", width=1000, height=535)
+ggplot(CMRs_sub_melt, aes(x=lab, y=value, col=`Brain region`, alpha=`Absolute median correlation`)) + theme_bw() + theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1)) + geom_hline(yintercept=0) + geom_hline(yintercept=0.3, linetype="dashed") + geom_hline(yintercept=-0.3, linetype="dashed") + geom_point(size=5) + xlab("CMR") + ylab("Median CMR blood-brain Spearman correlation") + scale_color_manual(values=c("lightpink2","lightpink3","lightpink4")) + scale_alpha_manual(values=c(0.5,1)) + ggtitle("Blood-brain concordance for female CMRs")
+dev.off()
+
+CMRs_sub$cor_becon <- (abs(CMRs_sub$median_BRAIN7)>=0.3|abs(CMRs_sub$median_BRAIN10)>=0.3|abs(CMRs_sub$median_BRAIN20)>=0.3)
+becon_tbl <- table(as.character(CMRs_sub$cmrGR), CMRs_sub$cor_becon)
+
+becon_tbl <- data.frame(CMRs_cometh=becon_tbl[,2], CMRs_notcometh=becon_tbl[,1])
+nCMRs <- nrow(becon_tbl)
+
+#check how many of the CMRs covered in BECon have the representative CpG co-methylated in brain
+nbrain <- nrow(becon_tbl[becon_tbl$CMRs_cometh>0,]) #20
+
+#check how many DM-CMRs are covered in BECon
+length(unique(cmr_df_sub$cmrGR)) #48
+
+#permuting
+source('~/3-posthoc/brain_blood/BECon_blood_brain_permutation_medianCMR.R')
+
+#background variable CMRs
+fdat_CMR_bg <- fdat2[fdat2$TargetID %in% CMRs$TargetID,]
+length(unique(CMRs_sub$cmrGR)) #69
+
+brain_blood_meth_perm(nbrain_real=20, nCMRs=69, bg_CMRs=CMRs, becon_ref=becon_ref, permutation_number=1000, verbose=TRUE)
+#[1] "Permutation P values for enrichment and depletion"
+#[1] "Enrichment: 1; Depletion 0"
+
+#write table for BECon web tool input
+write.csv(CMRs$TargetID, file="~/3-posthoc/brain_blood/CMRs_probes_for_BECon_adjDB_F_042023.csv", row.names=F)
+```
+
+
+## Male CMRs
+```{r}
+CMRs <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_M_adjDB_042023.csv")
+CMRs_sub <- CMRs[CMRs$threshold_adjDB==TRUE,] #2 CMRs
+
+#split up so each CpG is one row
+CMRs_sub$cmr <- as.character(CMRs_sub$cmr)
+length(cpgs <- unlist(strsplit(CMRs_sub$cmr, split=","))) #7
+cmr_df <- lapply(1:length(cpgs), function(x){
+  CMR_row <- CMRs_sub[grep(cpgs[x], CMRs_sub$cmr),]
+  CMR_row$cpg <- cpgs[x]
+  return(CMR_row)
+})
+cmr_df <- do.call(rbind, cmr_df)
+
+### calculate correlation statistics across each CMR: min, max, mean, median
+
+#### calculate the proportion of input CMRs with the representative CpG co-methylated in blood and brain at rho >= 0.5
+#subset becon_ref data to CMR genes
+becon_ref <- read.csv("~/3-posthoc/brain_blood/BECon_BLBR_cor.csv")
+becon_ref_sub <- becon_ref[becon_ref$CpG %in% cmr_df$cpg,]
+all(becon_ref_sub$CpG %in% cmr_df$cpg) #TRUE
+all(cmr_df$cpg %in% becon_ref_sub$CpG) #FALSE
+nrow(cmr_df_sub <- cmr_df[match(as.character(becon_ref_sub$CpG), cmr_df$cpg),]) #7
+all.equal(as.character(becon_ref_sub$CpG), cmr_df_sub$cpg) #TRUE
+nrow(becon_ref_sub <- cbind(becon_ref_sub, cmr_df_sub[,57:64])) #7
+
+#summarize correlation over the CMR
+CMRs_sub$min_BRAIN7 <- NA
+CMRs_sub$max_BRAIN7 <- NA
+CMRs_sub$mean_BRAIN7 <- NA
+CMRs_sub$median_BRAIN7 <- NA
+CMRs_sub$min_BRAIN10 <- NA
+CMRs_sub$max_BRAIN10 <- NA
+CMRs_sub$mean_BRAIN10 <- NA
+CMRs_sub$median_BRAIN10 <- NA
+CMRs_sub$min_BRAIN20 <- NA
+CMRs_sub$max_BRAIN20 <- NA
+CMRs_sub$mean_BRAIN20 <- NA
+CMRs_sub$median_BRAIN20 <- NA
+CMRs_sub$num_probes_in_becon <- NA
+
+for (i in 1:nrow(CMRs_sub)){
+  cmr_becon <- becon_ref_sub[becon_ref_sub$cmr==CMRs_sub$cmr[i],]
+  CMRs_sub$num_probes_in_becon[i] <- nrow(cmr_becon)
+  if(CMRs_sub$num_probes_in_becon[i]>0){
+  
+  CMRs_sub$min_BRAIN7[i] <- min(cmr_becon$BRAIN7)
+  CMRs_sub$max_BRAIN7[i] <- max(cmr_becon$BRAIN7)
+  CMRs_sub$mean_BRAIN7[i] <- mean(cmr_becon$BRAIN7)
+  CMRs_sub$median_BRAIN7[i] <- median(cmr_becon$BRAIN7)
+  CMRs_sub$min_BRAIN10[i] <- min(cmr_becon$BRAIN10)
+  CMRs_sub$max_BRAIN10[i] <- max(cmr_becon$BRAIN10)
+  CMRs_sub$mean_BRAIN10[i] <- mean(cmr_becon$BRAIN10)
+  CMRs_sub$median_BRAIN10[i] <- median(cmr_becon$BRAIN10)
+  CMRs_sub$min_BRAIN20[i] <- min(cmr_becon$BRAIN20)
+  CMRs_sub$max_BRAIN20[i] <- max(cmr_becon$BRAIN20)
+  CMRs_sub$mean_BRAIN20[i] <- mean(cmr_becon$BRAIN20)
+  CMRs_sub$median_BRAIN20[i] <- median(cmr_becon$BRAIN20) }
+}
+
+write.csv(CMRs_sub, file="~/3-posthoc/brain_blood/CMRs_adjDB_M_becon_anno_042023.csv", row.names=F)
+
+CMRs_sub$lab <- as.character(CMRs_sub$geneSymbol)
+CMRs_sub$lab[is.na(CMRs_sub$lab)] <- as.character(CMRs_sub[is.na(CMRs_sub$lab),"UCSC_REFGENE_NAME"])
+CMRs_sub[,c("cmrGR","UCSC_REFGENE_NAME","geneSymbol","median_BRAIN7","median_BRAIN10","median_BRAIN20")]
+#                        cmrGR UCSC_REFGENE_NAME geneSymbol median_BRAIN7 median_BRAIN10 median_BRAIN20
+#9399  chr19:17433773-17434268              DDA1  ANO8,DDA1   -0.02058824     0.06911765      0.1514706
+#15438  chr6:32294470-32295230           C6orf10       <NA>   -0.06470588    -0.16176471      0.1323529
+
+CMRs_sub_melt <- melt(CMRs_sub[,c("lab","median_BRAIN7","median_BRAIN10","median_BRAIN20")], id.vars="lab")
+CMRs_sub_melt$variable <- gsub("median_BRAIN7", "Brodmann area 7 (parietal cortex)", gsub("median_BRAIN10", "Brodmann area 10 (anterior prefrontal cortex)", gsub("median_BRAIN20", "Brodmann area 20 (temporal cortex)", CMRs_sub_melt$variable)))
+colnames(CMRs_sub_melt)[2] <- "Brain region"
+CMRs_sub_melt <- CMRs_sub_melt[complete.cases(CMRs_sub_melt$value),]
+CMRs_sub_melt$`Absolute median correlation` <- "< 0.3" 
+CMRs_sub_melt[abs(CMRs_sub_melt$value)>=0.3,4] <- ">= 0.3"
+
+png("~/3-posthoc/brain_blood/BECon_CMRmeds_adjDB_M_042023.png", width=500, height=535)
+ggplot(CMRs_sub_melt, aes(x=lab, y=value, col=`Brain region`, alpha=`Absolute median correlation`)) + theme_bw() + theme(axis.text.x=element_text(angle=90, vjust=0.5, hjust=1)) + geom_hline(yintercept=0) + geom_hline(yintercept=0.3, linetype="dashed") + geom_hline(yintercept=-0.3, linetype="dashed") + geom_point(size=5) + xlab("CMR") + ylab("median CMR blood-brain Spearman correlation") + scale_color_manual(values=c("lightsteelblue2","lightsteelblue3","lightsteelblue4")) + scale_alpha_manual(values=c(0.5,1)) + ggtitle("Blood-brain concordance for male CMRs") + ylim(c(-0.46,0.69))
+dev.off()
+
+brain_blood_meth_perm(nbrain_real=0, nCMRs=2, bg_CMRs=CMRs, becon_ref=becon_ref, permutation_number=1000, verbose=TRUE)
+#[1] "Permutation P values for enrichment and depletion"
+#[1] "Enrichment: 1; Depletion 0.156"
+
+#write table for BECon web tool input
+write.csv(CMRs$TargetID, file="~/3-posthoc/brain_blood/CMRs_probes_for_BECon_adjDB_M.csv", row.names=F)
+```
