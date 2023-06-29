@@ -1,0 +1,315 @@
+---
+itle: "SGPD_plots"
+author: "SS"
+date: "10/24/2022"
+output:
+  html_document:
+    df_print: paged
+  rmdformats::readthedown:
+    fig_caption: yes
+    gallery: no
+    highlight: kate
+    lightbox: yes
+    self_contained: yes
+    thumbnails: no
+---
+SGPD Cell Type PCs Calculation
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: Oct 24, 2022
+
+### Libraries and outside functions
+```{r results='hide', warning=FALSE, message=FALSE, eval=F}
+setwd("~/")
+library(sva)
+library(Metrics)
+library(methylumi)
+library(dendextend)
+library(locfdr)
+library(gplots)
+library(lattice)
+#library(wateRmelon) #problem with lumi, can't load wateRmelon
+library("RColorBrewer")
+library(plyr)
+library(VennDiagram)
+library(ggplot2)
+library(qvalue)
+library("sva")
+library(parallel)
+library(gridExtra)
+library(grid)
+library("reshape2")
+library("corrplot")
+library(rgr)
+library(viridis)
+#library(lumi) #can't load
+library(missMethyl)
+library(hydroGOF)
+library(quadprog)
+library(genefilter)
+library(matrixStats)
+library(limma)
+library(FlowSorted.Blood.450k)
+library(FlowSorted.Blood.EPIC)
+library(ewastools)
+library(ggrepel)
+library(conumee)
+library(doParallel)
+library(ggplotify)
+library(cowplot)
+library(ggpubr)
+#library(tidyverse)
+#library(robCompositions)
+
+#custom functions
+source("~/kobor_shared_coding_resource/PCA_Plot_Function.R")
+source("~/kobor_shared_coding_resource/correlation_pval.R") #modified slightly so that corr between perfectly confounded variables (PD with dis_duration and age_onset) is 0; also made function verbose
+source("/home1/NEURO/schaffner/kobor_shared_coding_resource/pcaCoDa_NG.R")
+```
+
+## Load data 
+```{r load data, eval=F}
+load("~/4-replication/Vallerga_2020/SGPD_betas_combat.RData")
+SGPD_meta <- read.csv("~/4-replication/Vallerga_2020/SGPD_meta_cellprop.csv")
+```
+
+## Add cell type PCs
+
+### Robust PCA of cell type data
+
+This code was written by Dr. Sarah Merrill.
+  
+Compositional data is unique, and as such, cannot be easily used in ANCOVAs, linear regressions, or Principle Components Analysis (PCA) due to breaking necessary assumptions - specifically the assumptions of independence and little multicolinearity. Compositional data are strictly positive and multivariate that are constrained to have a unit sum (Aitchison, 1982). Therefore, predicted cell type proportions using reference methods like Houseman et al. (2012) are compositional data. 
+
+With compositional data, you can perform a PCA of the orthonormal relative structure (isometric logratio transformation) of the proportions instead of the values of their original components to create linearly uncorrelated variables to include in your standard model (Filzmoser, Hron & Reimann, 2009). This approach uses the principles of compositional data (scale invariance, subcompositional coherence, and permutation invariance) to maintain relative distances among the components. PCA is then performed to reduce data into the variability in the relative distances among the cell type proportions. 
+
+The Robust PCA method for compositional data also uses Minimum Covariance Determinant (MCD) estimators of location and covariance inquire ILR coordinates to obtain full rank data in order to get the MCD estimate of the covariance matrix and the respective matrix of eigenvectors. This is to reduce the potential affect of outliers (Filzmoser, Hron & Reimann, 2009). 
+
+```{r celltype, eval=F}
+CompMatrix <- abs(SGPD_meta[,c("CD8T","CD4T","NK","Bcell","Mono","Neu")]) #Take the absolute value because sometimes extremely small values can be estimated as negative, which is not actually possible for a proportion. 
+rownames(CompMatrix) <- SGPD_meta$Sample_Name
+
+#Because some of the proportions can be estimated to be exactly 0, this is a problem for the log transformation. Therefore, for the values that are 0, we need to add a small offset
+sum(CompMatrix==0) #Are there any proportions predicted to be 0? 212
+CompMatrix <- (CompMatrix + 0.001) #If necessary, add the offset of 0.001
+min(CompMatrix) # Cannot be = or < 0
+#0.001
+
+pca_object <- pcaCoDa_NG(CompMatrix)
+summary(pca_object$princompOutputClr)
+#Importance of components:
+#                          Comp.1    Comp.2    Comp.3    Comp.4     Comp.5
+#Standard deviation     0.7638105 0.7152920 0.6905162 0.4450961 0.34622534
+#Proportion of Variance 0.3087061 0.2707327 0.2523026 0.1048290 0.06342956
+#Cumulative Proportion  0.3087061 0.5794388 0.8317414 0.9365704 1.00000000
+
+plot(pca_object$princompOutputClr)
+
+CTP_ilrPCAScores <- as.data.frame(pca_object$scores) #Pull the PC scores out of the pca_object
+CTP_ilrPCAScores$Sample_ID <- rownames(CompMatrix)
+colnames(CTP_ilrPCAScores) <- c("CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4", "CTP_PC5", "Sample_ID") #Rename your PCs before adding into your methylumi object and to join Sample_ID
+all.equal(as.character(SGPD_meta$Sample_Name), CTP_ilrPCAScores$Sample_ID) #TRUE
+SGPD_meta <- cbind(SGPD_meta, CTP_ilrPCAScores[,1:5])
+write.csv(SGPD_meta, file="~/4-replication/Vallerga_2020/SGPD_meta_celltypePCs.csv")
+```
+![Robust PCA for cell type composition](/home1/NEURO/schaffner/4-replication/Vallerga_2020/pca_celltype_scree.png)
+
+## Stratifying meta data by sex
+```{r meta sex strat, eval=F}
+table(SGPD_meta$disease.state.ch1, SGPD_meta$reportedSex)
+#                        F   M
+#  Control             468 390
+#  Parkinson's disease 327 566
+
+nrow(SGPD_meta_F <- SGPD_meta[SGPD_meta$reportedSex=="F",]) #795
+summary(as.factor(SGPD_meta_F$disease.state.ch1))
+#            Control Parkinson's disease 
+#                468                 327 
+ncol(betas_F <- betas_combat[,colnames(betas_combat) %in% SGPD_meta_F$Sample_Name])
+#795
+
+nrow(SGPD_meta_M <- SGPD_meta[SGPD_meta$reportedSex=="M",]) #956
+summary(as.factor(SGPD_meta_M$disease.state.ch1))
+#            Control Parkinson's disease 
+#                390                 566 
+ncol(betas_M <- betas_combat[,colnames(betas_combat) %in% SGPD_meta_M$Sample_Name])
+#956
+```
+
+# Meta data correlation matrix
+```{r meta data cor, eval=F}
+#Create correlation matrix
+SGPD_meta_cor <- SGPD_meta[,c(32,33,39:42,44:56)]
+cormat <- correlation_pval(SGPD_meta_cor)
+
+# Get lower triangle of the correlation matrix
+get_lower_tri<-function(cormat){
+    cormat[upper.tri(cormat)] <- NA
+    return(cormat)
+  }
+# Get upper triangle of the correlation matrix
+get_upper_tri <- function(cormat){
+    cormat[lower.tri(cormat)]<- NA
+    return(cormat)
+  }
+
+upper_tri <- get_upper_tri(cormat)
+
+#colour if sig
+for(x in 1:nrow(upper_tri)){
+  for(y in 1:ncol(upper_tri)){
+    if(is.na(upper_tri[x,y])==FALSE){
+    if(as.numeric(upper_tri[x,y])<=0.001){upper_tri[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri[x,y])<=0.01){upper_tri[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri[x,y])<=0.05){upper_tri[x,y]<-"<=0.05"}else{upper_tri[x,y]<-">0.05"}}}}
+  }}
+melted_cormat <- reshape2::melt(upper_tri, na.rm = TRUE)
+png("~/4-replication/Vallerga_2020/meta_cor_CTPs.png", width=900, height=900)
+ggplot(data = melted_cormat, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+
+## females only
+SGPD_meta_F <- SGPD_meta[SGPD_meta$reportedSex=="F",]
+SGPD_meta_F_cor <- SGPD_meta_F[,c(32,39:42,44:56)]
+cormat_F <- correlation_pval(SGPD_meta_F_cor)
+upper_tri_F <- get_upper_tri(cormat_F)
+for(x in 1:nrow(upper_tri_F)){
+  for(y in 1:ncol(upper_tri_F)){
+    if(is.na(upper_tri_F[x,y])==FALSE){
+    if(as.numeric(upper_tri_F[x,y])<=0.001){upper_tri_F[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri_F[x,y])<=0.01){upper_tri_F[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri_F[x,y])<=0.05){upper_tri_F[x,y]<-"<=0.05"}else{upper_tri_F[x,y]<-">0.05"}}}}
+  }}
+melted_cormat_F <- reshape2::melt(upper_tri_F, na.rm = TRUE)
+png("~/4-replication/Vallerga_2020/meta_cor_CTPs_F.png", width=900, height=900)
+ggplot(data = melted_cormat_F, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+
+## males only
+SGPD_meta_M <- SGPD_meta[SGPD_meta$reportedSex=="M",]
+SGPD_meta_M_cor <- SGPD_meta_M[,c(32,39:42,44:56)]
+cormat_M <- correlation_pval(SGPD_meta_M_cor)
+upper_tri_M <- get_upper_tri(cormat_M)
+for(x in 1:nrow(upper_tri_M)){
+  for(y in 1:ncol(upper_tri_M)){
+    if(is.na(upper_tri_M[x,y])==FALSE){
+    if(as.numeric(upper_tri_M[x,y])<=0.001){upper_tri_M[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri_M[x,y])<=0.01){upper_tri_M[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri_M[x,y])<=0.05){upper_tri_M[x,y]<-"<=0.05"}else{upper_tri_M[x,y]<-">0.05"}}}}
+  }}
+melted_cormat_M <- reshape2::melt(upper_tri_M, na.rm = TRUE)
+png("~/4-replication/Vallerga_2020/meta_cor_CTPs_M.png", width=900, height=900)
+ggplot(data = melted_cormat_M, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+```
+![Meta data correlation in both sexes](/home1/NEURO/schaffner/4-replication/Vallerga_2020/meta_cor_CTPs.png)
+
+![Meta data correlation in females](/home1/NEURO/schaffner/4-replication/Vallerga_2020/meta_cor_CTPs_F.png)
+
+
+![Meta data correlation in males](/home1/NEURO/schaffner/4-replication/Vallerga_2020/meta_cor_CTPs_M.png)
+
+
+Cell type PCs correlate with PD status and sex.
+
+# Principal component analysis
+
+Next I'll use PCA to look at sources of variation in the data. Code from Nicole Gladish.
+
+## Pre-PCA set up
+```{r pca setup, eval=F}
+# Here are the arguments you can add (and their defaults): 
+# PCA_Plot(PCA_Object, type = c("All", "Sparse"), nPCs = 10, MTC = F, Discrete = T, label.y_size = 12, label.x_size = 12, angle.x = 30, vjust.x = 0.5)
+# Here is what some arguments do: 
+# type = c("All", "Sparse") - this is to tell it whether your PCA_Object results from a sparse or regular PCA (it does not do it for you it just tells the function what you have).
+# nPCs - how many PCs do you want to plot
+# MTC = F - do you want the associations multiple test corrected? BH is the method I include here
+# Discrete = T, do you want a continuous display of significane values or discrete?
+
+#restructing meta data and subsetting to categorical/continuous
+nrow(SGPD_meta <- SGPD_meta[SGPD_meta$Sample_Name %in% colnames(betas_combat),]) #1751
+SGPD_meta <- SGPD_meta[match(colnames(betas_combat), SGPD_meta$Sample_Name),]
+rownames(SGPD_meta) <- SGPD_meta$Sample_Name
+
+meta_categorical <- SGPD_meta[,c("disease.state.ch1", "reportedSex","Chip","Chip_Position")]
+
+meta_continuous <- SGPD_meta[,c("DNAmAge_Horvath", "xMed", "yMed","Average_intensity","CD8T", "CD4T", "NK", "Bcell", "Mono", "Neu", "CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4", "CTP_PC5")]
+
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+```
+
+## PCA on batch-corrrected data
+```{r pca norm, eval=F}
+all.equal(colnames(betas_combat), rownames(meta_categorical)) #TRUE
+
+#PCA on beta values: input
+PCA_full<-princomp(betas_combat[complete.cases(betas_combat),])
+
+PCA_Plot(PCA_full, type="sparse", MTC=T, Discrete=T)
+```
+![PCA - scree](/home1/NEURO/schaffner/4-replication/Vallerga_2020/pca_CTP_scree.png)
+
+![PCA - heat map](/home1/NEURO/schaffner/4-replication/Vallerga_2020/pca_CTP_heat_legend.png)
+
+## Females PCA
+```{r pca norm F, eval=F}
+#restructing meta data and subsetting to categorical/continuous
+nrow(SGPD_meta_F <- SGPD_meta_F[SGPD_meta_F$Sample_Name %in% colnames(betas_F),]) #232
+SGPD_meta_F <- SGPD_meta_F[match(colnames(betas_F), SGPD_meta_F$Sample_Name),]
+
+meta_categorical <- SGPD_meta_F[,c("disease.state.ch1", "ethnicity.ch1", "Chip","Chip_Position")]
+
+meta_continuous <- SGPD_meta_F[,c("age.ch1", "DNAmAge_Horvath", "xMed", "yMed", "outlier", "beadcount", "Average_intensity","CD8T", "CD4T", "NK", "Bcell", "Mono", "Neu", "CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4", "CTP_PC5")]
+
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+
+all.equal(colnames(betas_F), rownames(SGPD_meta_F)) #TRUE
+
+#PCA on beta values: input
+PCA_full<-princomp(betas_F[complete.cases(betas_F),])
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)
+```
+![PCA for females - scree](/home1/NEURO/schaffner/4-replication/Vallerga_2020/pca_CTP_F_scree.png)
+
+![PCA for females - heat map](/home1/NEURO/schaffner/4-replication/Vallerga_2020/pca_CTP_F_heat_legend.png)
+
+## Males PCA
+```{r pca norm M, eval=F}
+#restructing meta data and subsetting to categorical/continuous
+nrow(SGPD_meta_M <- SGPD_meta_M[SGPD_meta_M$Sample_Name %in% colnames(betas_M),]) #307
+SGPD_meta_M <- SGPD_meta_M[match(colnames(betas_M), SGPD_meta_M$Sample_Name),]
+
+meta_categorical <- SGPD_meta_M[,c("disease.state.ch1", "ethnicity.ch1", "Chip","Chip_Position")]
+
+meta_continuous <- SGPD_meta_M[,c("age.ch1", "DNAmAge_Horvath", "xMed", "yMed", "outlier", "beadcount", "Average_intensity","CD8T", "CD4T", "NK", "Bcell", "Mono", "Neu", "CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4", "CTP_PC5")]
+
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+
+all.equal(colnames(betas_M), rownames(SGPD_meta_M)) #TRUE
+
+#PCA on beta values: input
+PCA_full<-princomp(betas_M[complete.cases(betas_M),])
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)
+```
+![PCA for males - scree](/home1/NEURO/schaffner/4-replication/Vallerga_2020/pca_CTP_M_scree.png)
+
+![PCA for males - heat map](/home1/NEURO/schaffner/4-replication/Vallerga_2020/pca_CTP_M_heat_legend.png)

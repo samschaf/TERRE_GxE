@@ -1,0 +1,1524 @@
+---
+title: "SGPD_Preprocessing"
+author: "SS"
+date: "10/07/2022"
+output:
+  html_document:
+    df_print: paged
+  rmdformats::readthedown:
+    fig_caption: yes
+    gallery: no
+    highlight: kate
+    lightbox: yes
+    self_contained: yes
+    thumbnails: no
+---
+SGPD PreProcessing and Normalization
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: Oct 7, 2022
+
+The general steps we take, with methods included in this script, are:
+
+Removing outlier samples
+
+Cell type prediction (blood)
+
+Performing normalization using control probes (funnorm)
+
+Removing poor performing probes
+
+Removing variation due to batch effects (ComBat)
+
+### Libraries and outside functions
+```{r results='hide', warning=FALSE, message=FALSE, eval=F}
+setwd("~/")
+library(tibble)
+library(dplyr)
+library(sva)
+library(Metrics)
+library(methylumi)
+library(dendextend)
+library(locfdr)
+library(gplots)
+library(lattice)
+#library(wateRmelon) #problem with lumi, can't load wateRmelon
+library("RColorBrewer")
+library(plyr)
+library(VennDiagram)
+library(ggplot2)
+library(qvalue)
+library("sva")
+library(parallel)
+library(gridExtra)
+library(grid)
+library("reshape2")
+library("corrplot")
+library(rgr)
+library(viridis)
+#library(lumi) #can't load
+library(missMethyl)
+library(hydroGOF)
+library(quadprog)
+library(genefilter)
+library(matrixStats)
+library(limma)
+library(FlowSorted.Blood.450k)
+library(FlowSorted.Blood.EPIC)
+library(ewastools)
+library(ggrepel)
+library(conumee)
+library(doParallel)
+library(ggplotify)
+library(cowplot)
+library(ggpubr)
+
+#lumi and wateRmelon functions defined externally
+source('~/kobor_shared_coding_resource/lumi_detectOutlier.R')
+source('~/kobor_shared_coding_resource/lumi_plotSampleRelation.R')
+source('~/kobor_shared_coding_resource/wateRmelon_outlyx.R')
+source('~/kobor_shared_coding_resource/wateRmelon_adjustedFunnorm.R')
+source('~/kobor_shared_coding_resource/wateRmelon_beadcount.R')
+
+#custom functions
+source("~/kobor_shared_coding_resource/PCA_Plot_Function.R")
+#source("~/kobor_shared_coding_resource/BadProbe_Function.R")
+#source('~/kobor_shared_coding_resource/ECC11.R')
+source("~/kobor_shared_coding_resource/correlation_pval.R") #modified slightly so that corr between perfectly confounded variables (PD with dis_duration and age_onset) is 0; also made function verbose
+source("~/kobor_shared_coding_resource/heatmap.3_CK.R")
+source("~/kobor_shared_coding_resource/Age_Pred_Horvath_NG_SS.R")
+```
+
+## Load data and create objects for preprocessing
+```{r create RG obj, eval=F}
+#read in meta data to get chip IDs for SGPD
+SGPD_meta <- read.csv("~/4-replication/Vallerga_2020/Vallerga_2020_meta.csv")
+dim(SGPD_meta) #1,889 patients
+idats <- list.files("~/4-replication/Vallerga_2020/GSE145361/idat/")
+idats <- idats[-(grep("GPL", idats))]
+
+SGPD_meta$Basename <- paste(SGPD_meta$geo_accession, SGPD_meta$title, sep="_")
+SGPD_idat_sub <- gsub("_Grn.idat", "", gsub("_Red.idat", "", idats))
+length(SGPD_idats <- SGPD_idat_sub[SGPD_idat_sub %in% SGPD_meta$Basename]) #3778 (2 for each of 1889 samples)
+
+SGPD_meta$Basename <- file.path("~/4-replication/Vallerga_2020/GSE145361/idat", SGPD_meta$Basename) # Need to have the full pathnames without the ending _Grn.idat or _Red.idat
+
+SGPD_RG_Raw <- read.metharray(basenames = SGPD_meta$Basename, extended = T, force = T)
+
+# Replace sampleNames with simpler identifiers
+SGPD_meta$Sample_Name <- paste("SGPD", seq(1:nrow(SGPD_meta)), sep="_")
+identical(sampleNames(SGPD_RG_Raw), paste(SGPD_meta$geo_accession, SGPD_meta$title,sep="_")) #TRUE
+sampleNames(SGPD_RG_Raw) <- SGPD_meta$Sample_Name
+save(SGPD_RG_Raw, file="~/4-replication/Vallerga_2020/SGPD_RG_Raw.RData")
+
+# Creating object to use with ewastools
+meth <- read_idats(SGPD_meta$Basename)
+save(meth, file="~/4-replication/Vallerga_2020/SGPD_ewastools_obj_raw.RData")
+```
+
+# Sample quality control checks
+
+## ewastools
+This check uses the Illumina’s 636 control probes to assess technical parameters including array staining, extension, hybridization, target removal, specificity, and bisulfite conversion.
+```{r ewastools, eval=F}
+ctrls = control_metrics(meth)
+stripchart(ctrls$`Bisulfite Conversion II`,method="jitter",pch=4,xlab='Bisulfite Conversion II',xlim=c(0,10))
+abline(v=1,col=2,lty=3) # 3 samples fail
+
+SGPD_meta$failed = sample_failure(ctrls)
+table(SGPD_meta$failed)
+#FALSE  TRUE 
+# 1876    13 
+
+#checking individual metrics with the default pass/fail thresholds (reccommended by Illumina)
+length(ctrls$Restoration[ctrls$Restoration>0]) 
+length(ctrls$`Staining Green`[ctrls$`Staining Green`>5])  
+
+length(ctrls$`Staining Red`[ctrls$`Staining Red`>5])  #2 failed
+stnred <- ctrls$`Staining Red`
+names(stnred) <- meth$meta$sample_id
+stnred <- names(stnred[stnred<5&complete.cases(stnred)]) #"GSM4316764_200078650111_R04C01" "GSM4317201_200078650123_R05C02"
+
+length(ctrls$`Extension Green`[ctrls$`Extension Green`>5])  
+length(ctrls$`Extension Red`[ctrls$`Extension Red`>5])  
+length(ctrls$`Hybridization High/Medium`[ctrls$`Hybridization High/Medium`>1])  
+length(ctrls$`Hybridization Medium/Low`[ctrls$`Hybridization Medium/Low`>1]) 
+length(ctrls$`Target Removal 1`[ctrls$`Target Removal 1`>1]) 
+length(ctrls$`Target Removal 2`[ctrls$`Target Removal 2`>1]) 
+
+length(ctrls$`Bisulfite Conversion I Green`[ctrls$`Bisulfite Conversion I Green`>1]) #2 failed
+bsIgrn <- ctrls$`Bisulfite Conversion I Green`
+names(bsIgrn) <- meth$meta$sample_id
+bsIgrn <- names(bsIgrn[bsIgrn<1&complete.cases(bsIgrn)]) #""GSM4316118_100973270128_R05C02" "GSM4316125_100973270129_R06C01"
+
+length(ctrls$`Bisulfite Conversion I Red`[ctrls$`Bisulfite Conversion I Red`>1]) #1 failed
+bsIrd <- ctrls$`Bisulfite Conversion I Red`
+names(bsIrd) <- meth$meta$sample_id
+bsIrd <- names(bsIrd[bsIrd<1&complete.cases(bsIrd)]) #"GSM4316118_100973270128_R05C02"
+
+length(ctrls$`Bisulfite Conversion II`[ctrls$`Bisulfite Conversion II`>1]) #3 failed
+bsII <- ctrls$`Bisulfite Conversion II`
+names(bsII) <- meth$meta$sample_id
+bsII <- names(bsII[bsII<1&complete.cases(bsII)]) 
+#[1] "GSM4315729_101070190050_R06C02" "GSM4316118_100973270128_R05C02"
+#[3] "GSM4316213_100973330048_R02C01"
+
+length(ctrls$`Specificity I Green`[ctrls$`Specificity I Green`>1])
+length(ctrls$`Specificity I Red`[ctrls$`Specificity I Red`>1]) 
+length(ctrls$`Specificity II`[ctrls$`Specificity II`>1]) 
+
+length(ctrls$`Non-polymorphic Green`[ctrls$`Non-polymorphic Green`>5]) #6 failed
+npgrn <- ctrls$`Non-polymorphic Green`
+names(npgrn) <- meth$meta$sample_id
+npgrn <- names(npgrn[npgrn<5&complete.cases(npgrn)]) 
+#[1] "GSM4316208_100973330044_R02C02" "GSM4316688_200078650021_R02C01"
+#[3] "GSM4316814_200090270158_R03C02" "GSM4316883_200078650152_R02C01"
+#[5] "GSM4317004_200078650244_R02C01" "GSM4317094_200090280029_R03C02"
+
+length(ctrls$`Non-polymorphic Red`[ctrls$`Non-polymorphic Red`>5]) #2 failed
+nprd <- ctrls$`Non-polymorphic Red`
+names(nprd) <- meth$meta$sample_id
+nprd <- names(nprd[nprd<5&complete.cases(nprd)]) 
+#"GSM4315729_101070190050_R06C02" "GSM4316814_200090270158_R03C02"
+
+SGPD_meta[SGPD_meta$failed==TRUE,c("title","Sample_Name")]
+#                   title Sample_Name
+#325  101070190050_R06C02    SGPD_325
+#714  100973270128_R05C02    SGPD_714
+#721  100973270129_R06C01    SGPD_721
+#804  100973330044_R02C02    SGPD_804
+#809  100973330048_R02C01    SGPD_809
+#1284 200078650021_R02C01   SGPD_1284
+#1360 200078650111_R04C01   SGPD_1360
+#1410 200090270158_R03C02   SGPD_1410
+#1479 200078650152_R02C01   SGPD_1479
+#1600 200078650244_R02C01   SGPD_1600
+#1652 200078650189_R03C01   SGPD_1652
+#1690 200090280029_R03C02   SGPD_1690
+#1797 200078650123_R05C02   SGPD_1797
+
+dblfail <- unique(c(bsIgrn, bsII, bsIrd, npgrn, nprd)) #10
+ewastools <- SGPD_meta[paste(SGPD_meta$geo_accession, SGPD_meta$title, sep="_") %in% dblfail,"Sample_Name"]
+
+rm(meth)
+```
+![ewastools bisulfite conversion II](/home1/NEURO/schaffner/4-replication/Vallerga_2020/ewastools_bisulfiteII.png)
+13 samples are marked as "failed" by ewastools, with 10/13 failing two or more metrics.
+
+## M/U channel intensity
+```{r minfi, eval=F}
+# Creating MethylSet from RGSet to use with minfi
+MSet <- preprocessRaw(SGPD_RG_Raw) 
+save(MSet, file="~/4-replication/Vallerga_2020/SGPD_MSet_raw.RData")
+
+qc <- getQC(MSet)
+plotQC(qc)
+
+minfiqc <- rownames(qc[qc$mMed < 10.5 & qc$uMed < 10.5,]) #9
+```
+![Minfi plotQC](/home1/NEURO/schaffner/4-replication/Vallerga_2020/SGPD_plotQC_minfi.png)
+
+9 samples are flagged in minfi intensity check.
+
+# Sex checks
+
+## X chromosome PCA
+```{r sex matching, eval=F}
+#get the names of X and Y chromosome probes
+load("~/kobor_shared_coding_resource/Complete_450K_Annotation.RData")
+length(Xprobes <- Complete_450K_Annotation[Complete_450K_Annotation$CHR=="X","TargetID"]) #11,232
+length(Yprobes <- Complete_450K_Annotation[Complete_450K_Annotation$CHR=="Y","TargetID"]) #416
+
+#X chromosome PCA
+betas_raw <- getBeta(MSet)
+betas_X <- betas_raw[rownames(betas_raw) %in% Xprobes,]
+PCA_X <- princomp(betas_X[complete.cases(betas_X),])
+X_loadings <- as.data.frame(unclass(PCA_X$loadings))
+all.equal(rownames(X_loadings), as.character(SGPD_meta$Sample_Name)) #TRUE
+
+X_loadings$sex <- SGPD_meta$gender.ch1
+X_loadings$sex <- as.factor(X_loadings$sex)
+ggplot(X_loadings[,c(1,2,3,ncol(X_loadings))], aes(x=Comp.1, y=Comp.2, col=sex)) + theme_bw() + geom_text(label=rownames(X_loadings))
+#clustering looks good
+```
+![X chromosome PC1 vs PC2](/home1/NEURO/schaffner/4-replication/Vallerga_2020/Xchr_PCA.png)
+
+![X chromosome PC2 vs PC3](/home1/NEURO/schaffner/4-replication/Vallerga_2020/Xchr_PCA_2.png)
+
+SGPD_610, SGPD_476, and SGPD_733 cluster further from the male centroid on PC3.
+
+## Y chromosome missing values
+```{r Y missing, eval=F}
+#Y chromosome percent missing values per sample (fewer probes than samples, can't do PCA)
+betas_Y <- betas_raw[rownames(betas_raw) %in% Yprobes,]
+betas_Y_t <- as.data.frame(t(as.matrix(betas_Y)))
+all.equal(rownames(betas_Y_t), as.character(SGPD_meta$Sample_Name)) #TRUE
+betas_Y_t$missing <- rowSums(is.na(betas_Y_t))/ncol(betas_Y_t)
+betas_Y_t$sex <- SGPD_meta$gender.ch1
+
+betas_Y_missing <- betas_Y_t[,c("sex","missing")]
+ggplot(betas_Y_missing, aes(x=sex, y=missing, col=sex, group=sex)) + geom_jitter() + theme_bw()
+```
+![Y chromosome missing values](/home1/NEURO/schaffner/4-replication/Vallerga_2020/Ychr_missing.png)
+
+Most of the females have missing values and most of the males do not, as expected.
+
+## Sex prediction with minfi
+In this section, we infer the sex of all samples using minfi’s “getSex” function. getSex() works by comparing median total fluorescent intensity of the X chromosome probes and Y-chromosome probes. minfi separates the points by using a default cutoff of -2 for log2med(Y)−log2med(Y), although cutoff can be preferentially specified (use plotSex to get an idea of appropriate cutoffs). NOTE: Males and females should cluster seperately
+```{r pred sex, eval=F}
+Gset <- mapToGenome(ratioConvert(MSet))
+predictedSex <- getSex(Gset, cutoff = -2) #getSex() Estimates samples sex based on methylation data.
+predictedSex_dt <-as.data.frame(predictedSex)
+predictedSex_dt$id <- rownames(predictedSex_dt)
+colnames(predictedSex_dt)[3] <- "Predicted_Sex"
+
+sex_flagged_ids <- predictedSex_dt[predictedSex_dt$yMed > 10 &  predictedSex_dt$Predicted_Sex=="F" | predictedSex_dt$xMed < 12.5 &  predictedSex_dt$Predicted_Sex=="F" | predictedSex_dt$xMed < 12 &  predictedSex_dt$Predicted_Sex=="M" | predictedSex_dt$yMed < 12 &  predictedSex_dt$Predicted_Sex=="M","id"] #31 flagged
+# [1] "SGPD_163"  "SGPD_329"  "SGPD_334"  "SGPD_522"  "SGPD_579"  "SGPD_619"  "SGPD_640" 
+# [8] "SGPD_660"  "SGPD_710"  "SGPD_785"  "SGPD_787"  "SGPD_790"  "SGPD_927"  "SGPD_936" 
+#[15] "SGPD_940"  "SGPD_967"  "SGPD_1024" "SGPD_1099" "SGPD_1106" "SGPD_1111" "SGPD_1132"
+#[22] "SGPD_1179" "SGPD_1182" "SGPD_1293" "SGPD_1350" "SGPD_1513" "SGPD_1566" "SGPD_1600"
+#[29] "SGPD_1691" "SGPD_1788" "SGPD_1887"
+
+#plotting predicted vs reported
+nrow(predictedSex_dt) #1889
+SGPD_meta <- SGPD_meta[match(predictedSex_dt$id, SGPD_meta$Sample_Name),]
+SGPD_meta <- cbind(SGPD_meta, predictedSex_dt[,1:3])
+colnames(SGPD_meta)
+colnames(SGPD_meta)[33] <- "reportedSex"
+table(SGPD_meta$Predicted_Sex, SGPD_meta$reportedSex)
+#    Female Male
+#  F    850    0
+#  M      0 1039
+
+#no mismatches
+
+ggplot(SGPD_meta, aes(x=xMed, y=yMed, col=reportedSex)) + geom_point() + theme_bw() + ggtitle("minfi Sex Prediction")
+
+SGPD_meta$flag <- NA
+SGPD_meta[SGPD_meta$Sample_Name %in% sex_flagged_ids,"flag"] <- "Far from XY cluster centroid"
+minfi_check <- SGPD_meta[complete.cases(SGPD_meta$flag),"Sample_Name"] #31 to check
+```
+![Sex prediction based on minfi](/home1/NEURO/schaffner/4-replication/Vallerga_2020/minfi_sex_check.png)
+
+There are no mismatches between predicted and reported sex, though several samples in both males and females have low xMed values and were flagged. Check the sample quality.
+
+## Using CNVs to examine sex-flagged samples
+
+To further investigate the samples failing sex QC, we used CNV profiles to identify sex based on X and Y chromosomal copy number variations in the respective samples. For this analysis, we used the conumee R package that performs CNV analysis using Illumina 450k or EPIC DNA methylation arrays. CNV analysis is performed by normalizing the combined intensity values of both ‘methylated’ and ‘unmethylated’ channel of each CpG using a set of normal controls (i.e. with a flat genome, not showing any copy-number alterations).
+
+Code from Rebecca Asiimwe.
+
+#### Preparing data sets
+We want to choose a subset of controls (Rebecca did 50 for 17 samples) to compare samples to, since conumee is time intensive and produces an individual comparison plot for every control.
+```{r data_prep conumee, eval=F}
+#collecting samples to check
+length(minfi_check) #31
+
+#Subsetting dataset to exclude sex mismatched samples and samples failing control probe checks, and selecting only males as our controls
+controls <- SGPD_meta[-which(SGPD_meta$Sample_Name %in% minfi_check|SGPD_meta$Sample_Name %in% ewastools|SGPD_meta$Sample_Name %in% minfiqc),]
+controls_filtered <- controls[controls$reportedSex=="Male",]
+controls_filtered <- controls_filtered[1:50,] #selecting 50 controls for 33 cases
+
+#Creating one metadata object with selected controls and sex mismatched samples
+meta_sex_mismatch_control <- rbind(controls_filtered, SGPD_meta[SGPD_meta$Sample_Name %in% minfi_check,])
+rownames(meta_sex_mismatch_control) <- meta_sex_mismatch_control$Sample_Name
+
+#Filtering RGset to select control samples
+RGset_subset <- SGPD_RG_Raw[, sampleNames(SGPD_RG_Raw) %in% meta_sex_mismatch_control$Sample_Name]
+dim(RGset_subset) #622399     81
+
+#Matching sample names in control metadata with filtered RGset
+all(colnames(RGset_subset) %in% rownames(meta_sex_mismatch_control)) #TRUE
+meta_sex_mismatch_control <- meta_sex_mismatch_control[match(colnames(RGset_subset), rownames(meta_sex_mismatch_control)),]
+identical(colnames(RGset_subset), rownames(meta_sex_mismatch_control)) #TRUE
+
+#Creating an mset object required to run conumee
+mset_conumee <- preprocessIllumina(RGset_subset)
+```
+
+#### Identifying conumee controls and CNV calling
+```{r conumee_call, eval=F}
+#Conumee annotation 
+anno <- CNV.create_anno(array_type="450k", chrXY=TRUE, bin_minprobes=15, bin_minsize=50000)
+anno #482421 probes
+mranges_cnv <- mapToGenome(mset_conumee) 
+anno@probes <- subsetByOverlaps(anno@probes, granges(mranges_cnv)) # method to subset S4 object (anno)
+anno #482421 probes
+annoProbes <- as.data.frame(anno@probes)
+mset_conumee <- mset_conumee[which(rownames(mset_conumee) %in% rownames(annoProbes)), ] 
+dim(mset_conumee) #482421     81
+
+#Identify Conumee Controls
+#Telling conumee which samples in our data and metadata objects are our “karyotypically normal” control samples for comparison to.
+all.equal(colnames(mset_conumee), as.character(meta_sex_mismatch_control$Sample_Name)) # must be TRUE
+
+#Specifying which samples will be used as CNV controls
+meta_sex_mismatch_control$Status <- NA
+meta_sex_mismatch_control[meta_sex_mismatch_control$Sample_Name %in% minfi_check,"Status"] <- "MISMATCH"
+meta_sex_mismatch_control[-which(meta_sex_mismatch_control$Sample_Name %in% minfi_check),"Status"] <- "CONTROL"
+summary(as.factor(meta_sex_mismatch_control$Status))
+# CONTROL MISMATCH 
+#      50       31
+
+cnv_controls <-  meta_sex_mismatch_control$Status == "CONTROL"
+cnv_controls 
+
+#Parallel CNV Calling
+#Load into cnv calling format
+cnv_input <- CNV.load(mset_conumee) #intensities are abnormally low (< 5000).
+
+#Parallelizing the CNV calling so that multiple samples are called at once
+#Initialize cluster
+cl <- makeCluster(24)
+registerDoParallel(cl)
+
+#Parallel cnv fit
+cnv_calls <- foreach (i =  1:ncol(mset_conumee),
+                      .export = c("CNV.fit", "CNV.bin", "CNV.segment")) %dopar% 
+  CNV.segment(
+    CNV.bin(
+      CNV.fit(
+        cnv_input[i], ref = cnv_input[cnv_controls], anno = anno)))
+
+#Kill cluster
+stopCluster(cl)
+
+names(cnv_calls)
+names(cnv_calls) <- meta_sex_mismatch_control$Sample_Name
+```
+
+#### Samples flagged as mismatches or those far from cluster centroids 
+```{r flagged_samples_plac, eval=F}
+#Recall of samples flagged as ar from cluster centroids
+meta_sex_mismatch_control[meta_sex_mismatch_control$Status=="MISMATCH","Sample_Name"]
+# [1] "SGPD_163"  "SGPD_329"  "SGPD_334"  "SGPD_522"  "SGPD_579"  "SGPD_619" 
+# [7] "SGPD_640"  "SGPD_660"  "SGPD_710"  "SGPD_785"  "SGPD_787"  "SGPD_790" 
+#[13] "SGPD_927"  "SGPD_936"  "SGPD_940"  "SGPD_967"  "SGPD_1024" "SGPD_1099"
+#[19] "SGPD_1106" "SGPD_1111" "SGPD_1132" "SGPD_1179" "SGPD_1182" "SGPD_1293"
+#[25] "SGPD_1350" "SGPD_1513" "SGPD_1566" "SGPD_1600" "SGPD_1691" "SGPD_1788"
+#[31] "SGPD_1887"
+```
+
+#### CNV plots
+```{r cnv_plots, eval=F}
+#Function to loop through cnv_calls object and plot all samples (controls and mismatches)
+for(i in names(cnv_calls)){
+  
+  p1 <- as.grob(~CNV.genomeplot(cnv_calls[[i]], chr = "all", chrX = TRUE, chrY = TRUE, 
+                                centromere = TRUE, detail = TRUE, main = i,
+                                ylim = c(-1.25, 1.25), set_par = TRUE, cols = c("blue", "blue","gray", "red", "red")))
+  #chrX
+  p2 <- as.grob(~CNV.genomeplot(cnv_calls[[i]], chr = "chrX", 
+                                centromere = TRUE, detail = TRUE, main = "chrX",
+                                ylim = c(-1.25, 1.25), set_par = TRUE, cols = c("blue", "blue","gray", "red", "red")))
+  #chrY
+  p3 <- as.grob(~CNV.genomeplot(cnv_calls[[i]], chr = "chrY",  
+                                centromere = TRUE, detail = TRUE, main = "chrY",
+                                ylim = c(-1.25, 1.25), set_par = TRUE, cols = c("blue", "blue","gray", "red", "red"))) 
+  
+  grid1 <- plot_grid(p1, nrow = 1, ncol = 1, scale = c(.8))
+  merged_grids <- plot_grid(p2, p3, nrow = 1, ncol = 2, scale = c(.8))
+  plot <- plot_grid(grid1, merged_grids, nrow = 2, ncol = 1, align = "h", scale = c(.8))
+  
+  sample_id <- paste0("# ", i)
+  sample_id <- noquote(sample_id)
+  print(sample_id)
+  
+  if(i %in% minfi_check){ lab="FLAG_" } else { lab = "" }
+  
+  png(paste("~/4-replication/Vallerga_2020/conumee/", lab, i, ".png", sep=""))
+  print(plot)
+  dev.off()
+  
+}
+
+#examined resulting plots and recorded likely sex via CNV profiles
+#reading in conumee results and adding to metadata
+conumee <- read.csv("~/4-replication/Vallerga_2020/conumee/SGPD_conumee.csv", stringsAsFactors=FALSE)
+all(conumee$ID %in% SGPD_meta$Sample_Name) #TRUE
+
+meta_sub1 <- SGPD_meta[SGPD_meta$Sample_Name %in% conumee$ID,]
+meta_sub1 <- meta_sub1[match(conumee$ID, meta_sub1$Sample_Name),]
+all(meta_sub1$Sample_Name==conumee$ID) #TRUE
+meta_sub1$conumeeSex <- conumee$conumee
+
+meta_sub2 <- SGPD_meta[-which(SGPD_meta$Sample_Name %in% conumee$ID),]
+meta_sub2$conumeeSex <- NA
+
+SGPD_meta <- rbind(meta_sub1, meta_sub2)
+rm(meta_sub1, meta_sub2)
+SGPD_meta$reportedSex <- gsub("Female", "F", gsub("Male", "M", SGPD_meta$reportedSex))
+
+sex_mismatch <- SGPD_meta[SGPD_meta$reportedSex!=SGPD_meta$conumeeSex & complete.cases(SGPD_meta$conumeeSex),c("Sample_Name","reportedSex","Predicted_Sex","conumeeSex")]
+#    Sample_Name reportedSex Predicted_Sex   conumeeSex
+#660    SGPD_660           M             M inconclusive
+#790    SGPD_790           M             M inconclusive
+#927    SGPD_927           M             M inconclusive
+```
+![Example of normal male in conumee](/home1/NEURO/schaffner/4-replication/Vallerga_2020/conumee/SGPD_30.png)
+
+![Example of inconclusive sex in conumee](/home1/NEURO/schaffner/4-replication/Vallerga_2020/conumee/FLAG_SGPD_660.png)
+
+### Samples flagged for removal
+
+CNV analysis was able to confirm sex for some individuals who clustered away from centroids. Individuals with with inconclusive sex will be removed: 
+
+SGPD_660
+
+SGPD_790
+
+SGPD_927
+
+## SNP Control Probes Sample Clustering
+There are 65 control probes which measure single nucleotide polymorphisms which we use for quality control. These are stored in their own slot in the RGChannelSet object, so they don't need to be filtered out since we will use getBeta() to later pull out the information for non-SNP probes only.
+The SNP probe beta values can be pulled separately using getSnpBeta() for QC checks.
+
+```{r SNP probes, eval=F}
+length(locusNames <- getManifestInfo(SGPD_RG_Raw, "locusNames")) # Gets all probe names
+#485,512 probes are in the RGChannelSet
+
+#getSnpInfo() provides the columns with rs, maf info for each probe/CpG on the array
+#getSnpBeta() provides the DNAm values for the 65 SNP control probes
+rs.probes <- getSnpBeta(SGPD_RG_Raw)
+
+#very wide plot so sample names are readable
+png("~/4-replication/Vallerga_2020/SGPD_SNPcluster.png", width=20000, height=900)
+plotSampleRelation(rs.probes,cex=1,method="cluster")
+dev.off()
+
+plotSampleRelation(rs.probes,cex=1,method="cluster")
+
+SNPcluster <- c("SGPD_604","SGPD_1052")
+```
+![SNP probe clustering: all samples](/home1/NEURO/schaffner/4-replication/Vallerga_2020/SGPD_SNPcluster_small.png)
+
+Two samples, SGPD_604 and SGPD_1052, cluster tightly together and away from others. 
+
+## Contamination check
+```{r contamination, eval=F}
+# While ewastools implements the LOESS normalization (Heiss and Brenner, 2015), the developers of the package says not use the normalization "as it does little to protect against batch effects but can result in the removal of genuine biological signal". They recommended to adjust for relevant technical covariates in regression models later.
+
+#use ewastools object
+beta <- dont_normalize(meth)
+
+#pulling out the SNP probes
+snps <- meth$manifest[probe_type=="rs",index]
+snps <- beta[snps,]
+
+# These SNPs are then used as input for call_genotypes(). This function estimates the parameters of a mixture model consisting of three Beta distributions representing the heterozygous and the two homozygous genotypes, and a fourth component, a uniform distribution, representing outliers. The functions returns posterior probabilities used for soft classification. 
+#In simple words, we are determining the probability for every SNP whether they belong to 1 of 4 distributions, 3 of which correspond to the 3 expected genotypes (AA, AB, BB), and the 4th distribution corresponds to outside / in-between these expected genotype distributions. SNPs with a higher probability of belonging to this 4th distribution indicate mixing between more than one genotype
+
+genotypes_called <- call_genotypes(snps,learn=T)
+
+# fit mixture model to call genotypes
+snps_called <- call_genotypes(snps, learn = T)
+
+# call genotype clusters
+SGPD_meta <- SGPD_meta %>% mutate(genotype_cluster = as.factor(enumerate_sample_donors(genotypes_called)))
+
+# examine probability outlier
+plot(snp_outliers(genotypes_called) %>% sort)
+SGPD_meta$outlier = snp_outliers(genotypes_called)
+
+SGPD_meta <- SGPD_meta %>% 
+  mutate(Prob_SNP_outlier = colMeans(genotypes_called$outliers, na.rm = T),
+         Prob_SNP_outlier_Logodds = snp_outliers(genotypes_called))
+  
+  ggplot(SGPD_meta, aes(x = Sample_Name, y = Prob_SNP_outlier, fill = reportedSex)) +
+  geom_point(shape = 21, size = 2.5, alpha=0.8, col="black") + 
+  scale_fill_manual(values=c("#bd7b9f", "#2c7dab")) +
+  labs(x = 'Samples', y = "P", 
+       title = 'Average probability of SNP being an outlier') +
+  theme_bw() +
+  theme(axis.text.x=element_text(size=14),
+        axis.text.y=element_text(size=14),
+        axis.title.x=element_text(size=15, vjust=-0.3),
+        axis.title.y=element_text(size=15, vjust=2),
+        legend.position="none") +
+  scale_y_continuous(limits = c(0,1), breaks = seq(0,1,0.1)) +
+  scale_x_discrete(breaks = NULL, expand = c(0.02, 0.02)) + 
+  geom_hline(yintercept = 0.2, linetype = 'dashed', col = 'red') +
+    geom_text_repel(data = filter(SGPD_meta, Prob_SNP_outlier > 0.2), 
+            aes(label = Sample_Name), size = 3, force = 15, nudge_x = -0.1, nudge_y = 0.1)
+
+SNPoutliers <- SGPD_meta[SGPD_meta$Prob_SNP_outlier > 0.2,"Sample_Name"]
+#"SGPD_1179" "SGPD_178"  "SGPD_957"  "SGPD_1345" "SGPD_1740"
+```
+![ewastools genotype calling](/home1/NEURO/schaffner/4-replication/Vallerga_2020/SGPD_SNP_outlier_2.png)
+
+5 samples have probability >= 20% of being contaminated based on SNP genotype.
+
+## Detection p-value (minfi)
+
+Here we can define outlier samples simply if more than 5% of their probes have a pvalue below 0.01.
+
+```{r samples bad probes, eval=F}
+#1e-16 threshold
+detP <- detectionP.minfi(SGPD_RG_Raw)
+probe_num <- round(nrow(detP)*0.05)
+badDetP <- detP>=0.01
+avgPval <- as.data.frame(colSums(badDetP))
+avgPval$Sample <- rownames(avgPval)
+colnames(avgPval) <- c("Number_Bad_Probes", "Sample_ID")
+(badSamps <- avgPval$Sample_ID[avgPval$Number_Bad_Probes>=probe_num])
+# [1] "SGPD_660"  "SGPD_790"  "SGPD_927"  "SGPD_940"  "SGPD_957"  "SGPD_1106"
+# [7] "SGPD_1132" "SGPD_1179" "SGPD_1293" "SGPD_1350" "SGPD_1410" "SGPD_1566"
+#[13] "SGPD_1600" "SGPD_1788" "SGPD_1887"
+length(badSamps) #15
+
+# Visualization of outlier samples
+ggplot(avgPval)+  
+  geom_point(aes(as.factor(Sample_ID), Number_Bad_Probes, fill=Sample_ID), shape=21, size=3)+
+  geom_hline(yintercept = probe_num, linetype = "dashed", color = "red", size = 1)+
+  theme(legend.position = "none")
+```
+![Outlier Samp >5% bad probes at p > 0.01](/home1/NEURO/schaffner/4-replication/Vallerga_2020/badsamps_detP_0.01.png)
+## Bead count
+Every probe has multiple beads which serves as replicate readings/multiple measurements per sample. If a given sample has fewer than 3 beads/reads that value is given an NA(missing).
+```{r bead count, eval=F}
+# calculates the number of samples with bead count <3 for each probe in matrix of bead count values
+bead <- beadcount(SGPD_RG_Raw)
+all(colnames(bead)%in%SGPD_meta$Sample_Name) #TRUE
+bead <- bead[,match(SGPD_meta$Sample_Name, colnames(bead))]
+all(colnames(bead)==(SGPD_meta$Sample_Name)) #TRUE
+
+SGPD_meta <- SGPD_meta %>% mutate(beadcount = colSums(is.na(bead)))
+
+#plot
+SGPD_meta %>% 
+  mutate(SGPD_meta = factor(as.character(Sample_Name), levels = Sample_Name)) %>%
+  ggplot(aes(x = Sample_Name, y = beadcount)) +
+  geom_point(shape = 21, size = 2, alpha=0.8, col="black")+
+  geom_hline(yintercept = 0.01*nrow(bead), linetype = 'dashed', color = 'gray') +
+  geom_text(aes(x = 0, y = 0.01*nrow(bead)), 
+            label = '1%', vjust = -0.5, hjust = -0.5, color = 'gray')+
+  labs(x = 'Samples', y = '', title = '# samples with probes with bead count < 3') +
+  theme(axis.text.x = element_blank()) +
+  scale_y_continuous(limits = c(0, 14000), breaks = seq(0,14000, 2000)) +
+  theme_classic()+
+  theme(axis.text.x = element_blank())+
+  geom_label_repel(data = SGPD_meta %>% filter(beadcount > (0.01*nrow(bead))), 
+aes(label = Sample_Name), size = 4, force = 15, nudge_x = 0.8, nudge_y = 0.5) 
+
+lowbead <- SGPD_meta[SGPD_meta$beadcount > (0.01*nrow(bead)),"Sample_Name"] #"SGPD_974"
+```
+![Samples with bead count < 3](/home1/NEURO/schaffner/4-replication/Vallerga_2020/beadcount.png)
+One sample was flagged for low bead count.
+
+## Average intensity
+```{r avg intensity, eval=F}
+green <- getGreen(SGPD_RG_Raw)
+red <- getRed(SGPD_RG_Raw)
+greenred <- green + red
+
+# add to sampleInfo
+SGPD_meta <- SGPD_meta %>% mutate(Average_intensity = colMeans(greenred))
+
+SGPD_meta %>% 
+  mutate(Sample_Name = factor(as.character(Sample_Name), levels = Sample_Name)) %>%
+  ggplot(aes(x = Sample_Name, y = Average_intensity)) +
+  geom_point(alpha = 0.7, color = 'black') + theme_classic() +
+  theme(axis.text.x = element_blank()) +
+  geom_hline(yintercept = mean(SGPD_meta$Average_intensity) - 2*sd(SGPD_meta$Average_intensity),
+             linetype = 'dashed', col = 'blue')+
+  geom_hline(yintercept = mean(SGPD_meta$Average_intensity) + 2*sd(SGPD_meta$Average_intensity),
+             linetype = 'dashed', col = 'red') +
+  geom_label_repel(data = SGPD_meta[SGPD_meta$Average_intensity < mean(SGPD_meta$Average_intensity) -
+                             2*sd(SGPD_meta$Average_intensity),],
+                  aes(label = Sample_Name), force = 10, nudge_y = -2500, show.legend = F)+
+  scale_y_continuous(limits = c(0, 25000)) +
+  labs(x = 'Samples')
+
+threshold <- mean(SGPD_meta$Average_intensity) -2*sd(SGPD_meta$Average_intensity)
+length(lowintensity <- SGPD_meta[SGPD_meta$Average_intensity < threshold,"Sample_Name"]) #43
+```
+![Average intensity](/home1/NEURO/schaffner/4-replication/Vallerga_2020/avgintensity.png)
+43 samples have average intensity below mean - 2 standard deviations.
+
+## Outlier Detection - Lumi
+This function is contained in the lumi package. The current outlier detection is based on the distance from the sample to the center (average of all samples). The assumption of the outlier detection is that there is only one single cluster and the distance from the sample to the center is Gaussian distributed.
+
+The outlier is detected when its distance to the center is larger than a certain threshold. The threshold is calculated as Th * median distances to the center.
+
+Note this chunk was run in R rather than Rstudio to avoid crashing the session.
+
+```{r lumi outlier, eval=FALSE}
+betas_raw <- getBeta(SGPD_RG_Raw)
+
+Project_detout <- detectOutlier(betas_raw, Th = 1.5) # This calculates potential outliers
+length(which(Project_detout)) #82
+outlier_lumi <- names(which(Project_detout)) # This pulls the sample names of calculated outliers
+outlier_lumi <- sort(outlier_lumi)
+outlier_lumi
+#[1] "SGPD_1004" "SGPD_1012" "SGPD_1014" "SGPD_1079" "SGPD_1099" "SGPD_1106"
+#[7] "SGPD_1111" "SGPD_1132" "SGPD_1135" "SGPD_1137" "SGPD_1179" "SGPD_1206"
+#[13] "SGPD_1244" "SGPD_1245" "SGPD_1284" "SGPD_1293" "SGPD_1296" "SGPD_1345"
+#[19] "SGPD_1350" "SGPD_1386" "SGPD_1388" "SGPD_140"  "SGPD_1410" "SGPD_1450"
+#[25] "SGPD_1457" "SGPD_1458" "SGPD_1479" "SGPD_1516" "SGPD_1536" "SGPD_1539"
+#[31] "SGPD_1541" "SGPD_1555" "SGPD_1566" "SGPD_1596" "SGPD_1600" "SGPD_1605"
+#[37] "SGPD_1653" "SGPD_1676" "SGPD_1692" "SGPD_1705" "SGPD_1740" "SGPD_1775"
+#[43] "SGPD_178"  "SGPD_1788" "SGPD_179"  "SGPD_1802" "SGPD_1814" "SGPD_1852"
+#[49] "SGPD_1853" "SGPD_1871" "SGPD_188"  "SGPD_1887" "SGPD_213"  "SGPD_29"  
+#[55] "SGPD_309"  "SGPD_325"  "SGPD_329"  "SGPD_346"  "SGPD_421"  "SGPD_476" 
+#[61] "SGPD_552"  "SGPD_579"  "SGPD_610"  "SGPD_625"  "SGPD_660"  "SGPD_710" 
+#[67] "SGPD_719"  "SGPD_733"  "SGPD_784"  "SGPD_785"  "SGPD_787"  "SGPD_798" 
+#[73] "SGPD_804"  "SGPD_889"  "SGPD_927"  "SGPD_932"  "SGPD_936"  "SGPD_940" 
+#[79] "SGPD_957"  "SGPD_965"  "SGPD_967"  "SGPD_978" 
+save(outlier_lumi, file="~/4-replication/Vallerga_2020/outlier_lumi.RData")
+```
+
+## Outlier Detection - wateRmelon
+
+This is a wateRmelon package outlier detection method which uses the function pcout. Based on the robustly sphered data, semi-robust principal components are computed which are needed for determining distances for each observation. Separate weights for location and scatter outliers are computed based on these distances. The combined weights are used for outlier identification.
+
+There are two criteria which have to pass a given threshold to be considered an outlier: iqr and mv. It is sometimes useful to take a look at samples which pass one but fail the second as well, perhaps these samples should still be removed?
+
+Note this chunk was run in R rather than Rstudio to avoid crashing the session.
+
+```{r wateRmelon outlier, eval=F}
+Project_pcout <- outlyx(getBeta(SGPD_RG_Raw)) # This calculates potential outliers
+
+Project_pcout$Sample_ID <- rownames(Project_pcout)
+out <- Project_pcout[which(Project_pcout$outliers == T),"Sample_ID"] # Pulling sample names deemed to be outliers
+#These are the overlaps between iqr and mv methods
+
+iqrout <- Project_pcout[which(Project_pcout$iqr == T),"Sample_ID"] # Pulling samples which failed the iqr threshold
+# [1] "SGPD_346"  "SGPD_476"  "SGPD_733"  "SGPD_927"  "SGPD_957"  "SGPD_965" 
+# [7] "SGPD_1106" "SGPD_1137" "SGPD_1179" "SGPD_1245" "SGPD_1293" "SGPD_1350"
+#[13] "SGPD_1420" "SGPD_1431" "SGPD_1457" "SGPD_1516" "SGPD_1539" "SGPD_1541"
+#[19] "SGPD_1596" "SGPD_1632" "SGPD_1676"
+
+mvout <- Project_pcout[which(Project_pcout$mv == T),"Sample_ID"] # Pulling samples which failed the mv threshold
+#223 samples!
+
+#which are outliers in all 3?
+outlier_melon <- out[out %in% iqrout & out %in% mvout]
+outlier_melon
+# [1] "SGPD_346"  "SGPD_476"  "SGPD_733"  "SGPD_927"  "SGPD_957"  "SGPD_965" 
+# [7] "SGPD_1106" "SGPD_1179" "SGPD_1245" "SGPD_1293" "SGPD_1350" "SGPD_1420"
+#[13] "SGPD_1431" "SGPD_1541" "SGPD_1632" "SGPD_1676"
+
+save(outlier_melon, file="~/4-replication/Vallerga_2020/outlier_melon.RData")
+```
+
+
+## Inter-sample correlation
+Intersample correlation analysis is performed to looked at pairwise corrlations between all the samples. Samples from the same tissues are expected to have high correlation (>90%).
+```{r sample sample cor, eval=F}
+cor <-cor(betas_raw,use="pairwise.complete.obs") #have saved this as it takes a while
+save(cor, file="~/4-replication/Vallerga_2020/SGPD_sample_cor.RData")
+summary(as.vector(cor))
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 0.8567  0.9822  0.9854  0.9844  0.9888  1.0000 
+ 
+col.Sex <- gsub("M", "#AAAB9B", gsub("F", "#EFE7B8", SGPD_meta$reportedSex))
+col.Sex <- as.matrix(col.Sex)
+
+#Define custom dist and hclust functions for use with heatmaps
+mydist=function(c) {dist(c,method="euclidian")}
+myclust=function(c) {hclust(c,method="average")}
+
+#par(mar=c(7,4,1,2)+0.1) 
+grey<-colorRampPalette(brewer.pal(n=9,"Greys"))
+
+jpeg("~/4-replication/Vallerga_2020/SGPD_intersamplecorrelation.jpeg", width = 1250, height = 1100)
+intersamplecorrelation <- heatmap.3(cor,hclustfun=myclust, distfun=mydist,na.rm = TRUE, scale="none", dendrogram="col", margins=c(6,12), Rowv=TRUE, Colv=TRUE, symbreaks=FALSE, key=TRUE, symkey=FALSE, density.info="none", trace="none", ColSideColors=col.Sex, labCol=SGPD_meta$Sample_Name, labRow=SGPD_meta$Sample_Name, cexRow=1, col=grey,ColSideColorsSize=5,KeyValueName="Pearson's r",keysize=1,cexCol=1.2) 
+print(intersamplecorrelation)
+dev.off()
+
+#getting per-sample summary
+cor_summary <- colMeans(cor)
+length(cor_summary[cor_summary<0.95]) #6 samples with poor correlation
+samplecor <- names(cor_summary[cor_summary<0.95])
+#"SGPD_346"  "SGPD_476"  "SGPD_552"  "SGPD_733"  "SGPD_965"  "SGPD_1245"
+```
+![SGPD inter-sample correlation](/home1/NEURO/schaffner/4-replication/Vallerga_2020/SGPD_intersamplecorrelation.jpeg)
+
+There are six samples with mean inter-sample correlation < 0.95.
+
+## PCA
+```{r PCA, eval=F}
+PCA_full <-princomp(na.omit(betas_raw))
+Loadings <-as.data.frame(unclass(PCA_full$loadings))
+all(rownames(Loadings)==SGPD_meta$Sample_Name) #FALSE
+all(rownames(Loadings)%in%SGPD_meta$Sample_Name) #TRUE
+SGPD_meta <- SGPD_meta[match(rownames(Loadings),SGPD_meta$Sample_Name),]
+all(rownames(Loadings)==SGPD_meta$Sample_Name) #TRUE
+pca_meta <- cbind(SGPD_meta, Loadings)
+saveRDS(pca_meta,"/home1/NEURO/schaffner/4-replication/Vallerga_2020/pca_meta.rds") #this has the PCA loadings 
+
+png("/home1/NEURO/schaffner/4-replication/Vallerga_2020/initial_PCA_scatterplot.png")
+ggplot(pca_meta, aes(Comp.1, Comp.2, color=reportedSex)) + geom_point(size = 3, alpha=0.8) +  
+theme_classic() + theme(axis.text = element_text(size =15),
+axis.title = element_text(size =15))+ geom_label_repel(data = pca_meta %>% 
+                     dplyr::filter(Comp.1<0.021), aes(label = Sample_Name))
+dev.off()
+```
+![PCA on raw betas, coloured by sex](/home1/NEURO/schaffner/4-replication/Vallerga_2020/initial_PCA_scatterplot.png)
+
+A few samples are near the tail of the centroid, particularly in males, but the deviation from centre is not extreme.
+
+## Epigenetic age prediction (Horvath)
+If there are any large deviations from chronological age this could be a flag.
+```{r epigenetic age, eval=F}
+epiage <- HorvathAge_NG(MSet, Tissue="WB")
+#[1] "You have 352 out of 353 probes needed for the age clock. Missing 1 altogether."
+#[1] "Resulting in 0 % missingness. Data will be imputed using training data."
+write.table(epiage, file="/home1/NEURO/schaffner/4-replication/Vallerga_2020/epiage_Horvath_raw.txt", sep="\t", row.names=F)
+all(epiage$SampleID %in% SGPD_meta$Sample_Name) #TRUE
+epiage$SampleID <- as.character(epiage$SampleID)
+epiage <- epiage[match(SGPD_meta$Sample_Name, epiage$SampleID),]
+all.equal(as.character(epiage$SampleID), as.character(SGPD_meta$Sample_Name)) #TRUE
+SGPD_meta$DNAmAge_Horvath <- epiage$DNAmAge
+
+#split by sex and PD case/control status
+png("/home1/NEURO/schaffner/4-replication/Vallerga_2020/horvath_age.png")
+ggplot(SGPD_meta, aes(x = disease.state.ch1, y = DNAmAge_Horvath, group=disease.state.ch1, color=disease.state.ch1, fill=disease.state.ch1)) + geom_jitter() + geom_boxplot() +  scale_colour_manual(values=c("black","red")) + scale_fill_manual(values=c("grey","salmon")) + labs(y = "Predicted DNAm age (Horvath)")  + stat_compare_means(method = "anova", size = 3.5) + theme_classic() + facet_wrap(~reportedSex, nrow=1)
+dev.off()
+
+#some samples look extremely young. Although age is unknown, should be safe to remove those predicted to be children!
+age_outliers <- SGPD_meta[SGPD_meta$DNAmAge_Horvath<20,c("Sample_Name","DNAmAge_Horvath")]
+#     Sample_Name DNAmAge_Horvath
+#1411   SGPD_1411       14.145358
+#1432   SGPD_1432       11.112470
+#1683   SGPD_1683        9.749264
+```
+![Horvath DNAm age](/home1/NEURO/schaffner/4-replication/Vallerga_2020/horvath_age.png)
+
+Chronological age information was not included in the meta data, so we can't compare with predicted to determine outlier status. Here we there is a difference in epigenetic age between female controls and cases. Whether this is due to chronological age imbalances or age acceleration is unknown.
+
+## Raw beta distibutions check
+
+```{r raw beta distr, eval=F}
+#plotting beta distributions before
+#split by sexchr/autosomes
+load("~/kobor_shared_coding_resource/HM450_fdat.RData")
+length(Xprobes <- fData_450[fData_450$CHR=="X","TargetID"]) #11,232
+length(Yprobes <- fData_450[fData_450$CHR=="Y","TargetID"]) #416
+
+## raw data
+dim(MSet) #485512    567
+all.equal(sampleNames(MSet), as.character(SGPD_meta$Sample_Name)) #TRUE
+dim(MSet_raw_auto <- MSet[-which(rownames(MSet) %in% Xprobes|rownames(MSet) %in% Yprobes),]) #473864    567
+dim(MSet_raw_X <- MSet[which(rownames(MSet) %in% Xprobes),]) #11232   567
+dim(MSet_raw_Y <- MSet[which(rownames(MSet) %in% Yprobes),]) #416 567
+
+### autosomes
+Betas_raw_auto <-betas(MSet_raw_auto)
+Beta_raw_auto_sample<-Betas_raw_auto[sample(1:nrow(Betas_raw_auto), 100000),]
+Beta_raw_auto_sample_melted<- melt(Beta_raw_auto_sample)
+Beta_raw_auto_Plot<-Beta_raw_auto_sample_melted[which(Beta_raw_auto_sample_melted$value >= 0),]
+Beta_raw_auto_Plot<-merge(Beta_raw_auto_Plot,SGPD_meta, by.x="Var2", by.y="Sample_Name")
+raw_auto <- ggplot(Beta_raw_auto_Plot, aes(value, group=Var2, color=Var2))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw autosomes") + theme(legend.position = "none")
+
+### X
+Betas_raw_X <-betas(MSet_raw_X)
+Beta_raw_X_sample_melted<- melt(Betas_raw_X)
+Beta_raw_X_Plot<-Beta_raw_X_sample_melted[which(Beta_raw_X_sample_melted$value >= 0),]
+Beta_raw_X_Plot<-merge(Beta_raw_X_Plot,SGPD_meta, by.x="Var2", by.y="Sample_Name")
+raw_X <- ggplot(Beta_raw_X_Plot, aes(value, group=Var2, color=Var2))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Xchr") + theme(legend.position = "none")
+
+### Y
+Betas_raw_Y <-betas(MSet_raw_Y)
+Beta_raw_Y_sample_melted<- melt(Betas_raw_Y)
+Beta_raw_Y_Plot<-Beta_raw_Y_sample_melted[which(Beta_raw_Y_sample_melted$value >= 0),]
+Beta_raw_Y_Plot<-merge(Beta_raw_Y_Plot,SGPD_meta, by.x="Var2", by.y="Sample_Name")
+raw_Y <- ggplot(Beta_raw_Y_Plot, aes(value, group=Var2, color=Var2))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Ychr") + theme(legend.position = "none")
+
+#plot all
+png("/home1/NEURO/schaffner/4-replication/Vallerga_2020/beta_distr_raw.png")
+grid.arrange(raw_auto, raw_X, raw_Y, ncol=1, nrow=3)
+dev.off()
+
+
+### with outliers removed - does this address off distributions?
+length(outliers <- unique(c(as.character(ewastools), as.character(minfiqc), as.character(sex_mismatch), as.character(SNPcluster), as.character(SNPoutliers), as.character(badSamps), as.character(lowbead), as.character(lowintensity), as.character(outlier_lumi), as.character(outlier_melon), as.character(samplecor)))) #134
+
+dim(MSet_noout <- MSet[,-which(sampleNames(MSet) %in% outliers)]) #485512   1755
+SGPD_meta_sub <- SGPD_meta[match(sampleNames(MSet_noout),SGPD_meta$Sample_Name),]
+
+all.equal(sampleNames(MSet_noout), as.character(SGPD_meta_sub$Sample_Name)) #TRUE
+dim(MSet_raw_auto <- MSet_noout[-which(rownames(MSet_noout) %in% Xprobes|rownames(MSet_noout) %in% Yprobes),]) #473864   1755
+dim(MSet_raw_X <- MSet_noout[which(rownames(MSet_noout) %in% Xprobes),]) #11232  1755
+dim(MSet_raw_Y <- MSet_noout[which(rownames(MSet_noout) %in% Yprobes),]) #416 1755
+
+### autosomes
+Betas_raw_auto <-betas(MSet_raw_auto)
+Beta_raw_auto_sample<-Betas_raw_auto[sample(1:nrow(Betas_raw_auto), 100000),]
+Beta_raw_auto_sample_melted<- melt(Beta_raw_auto_sample)
+Beta_raw_auto_Plot<-Beta_raw_auto_sample_melted[which(Beta_raw_auto_sample_melted$value >= 0),]
+Beta_raw_auto_Plot<-merge(Beta_raw_auto_Plot,SGPD_meta, by.x="Var2", by.y="Sample_Name")
+raw_auto <- ggplot(Beta_raw_auto_Plot, aes(value, group=Var2, color=Var2))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw autosomes") + theme(legend.position = "none")
+
+### X
+Betas_raw_X <-betas(MSet_raw_X)
+Beta_raw_X_sample_melted<- melt(Betas_raw_X)
+Beta_raw_X_Plot<-Beta_raw_X_sample_melted[which(Beta_raw_X_sample_melted$value >= 0),]
+Beta_raw_X_Plot<-merge(Beta_raw_X_Plot,SGPD_meta, by.x="Var2", by.y="Sample_Name")
+raw_X <- ggplot(Beta_raw_X_Plot, aes(value, group=Var2, color=Var2))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Xchr") + theme(legend.position = "none")
+
+### Y
+Betas_raw_Y <-betas(MSet_raw_Y)
+Beta_raw_Y_sample_melted<- melt(Betas_raw_Y)
+Beta_raw_Y_Plot<-Beta_raw_Y_sample_melted[which(Beta_raw_Y_sample_melted$value >= 0),]
+Beta_raw_Y_Plot<-merge(Beta_raw_Y_Plot,SGPD_meta, by.x="Var2", by.y="Sample_Name")
+raw_Y <- ggplot(Beta_raw_Y_Plot, aes(value, group=Var2, color=Var2))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Ychr") + theme(legend.position = "none")
+
+#plot all
+png("/home1/NEURO/schaffner/4-replication/Vallerga_2020/beta_distr_raw_noout.png")
+grid.arrange(raw_auto, raw_X, raw_Y, ncol=1, nrow=3)
+dev.off()
+```
+![Raw data beta distributions](/home1/NEURO/schaffner/4-replication/Vallerga_2020/beta_distr_raw.png)
+
+![Raw data beta distributions after outlier removal](/home1/NEURO/schaffner/4-replication/Vallerga_2020/beta_distr_raw_noout.png)
+
+
+Some samples have off distributions, particularly on the sex chromosomes. Will check these further.
+
+### X and Y chr beta distributions check
+
+Subsetting to samples flagged during earlier outlier/sex checks.
+
+```{r x check raw, eval=F}
+#sex chromosomes by yMed
+X_raw <- ggplot(Beta_raw_X_Plot, aes(value, group=Var2, color=yMed))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Xchr")
+Y_raw <- ggplot(Beta_raw_Y_Plot, aes(value, group=Var2, color=yMed))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Ychr")
+grid.arrange(X_raw, Y_raw, nrow=2, ncol=1)
+
+#Females only, by yMed
+ggplot(Beta_raw_X_Plot[Beta_raw_X_Plot$reportedSex=="F",], aes(value, group=Var2, color=yMed))+geom_density(size=1)+theme_bw() + ggtitle("Raw Xchr (Females only)")
+#Ymed of outlier looks lower than the other ones
+
+#Plotting female samples with the lowest yMeds
+ggplot(Beta_raw_X_Plot[Beta_raw_X_Plot$reportedSex=="F" & Beta_raw_X_Plot$yMed<7.8,], aes(value, group=Var2, color=Var2))+ geom_density(size=1)+theme_bw() + ggtitle("Raw Xchr (Females only, yMed < 7.8)")
+
+### with outliers removed - does this address off distributions?
+length(outliers <- unique(c(as.character(ewastools), as.character(minfiqc), as.character(sex_mismatch), as.character(SNPcluster), as.character(SNPoutliers), as.character(badSamps), as.character(lowbead), as.character(lowintensity), as.character(outlier_lumi), as.character(outlier_melon), as.character(samplecor), "SGPD_994"))) #135
+
+dim(MSet_noout <- MSet[,-which(sampleNames(MSet) %in% outliers)]) #485512   1754
+SGPD_meta_sub <- SGPD_meta[match(sampleNames(MSet_noout),SGPD_meta$Sample_Name),]
+
+all.equal(sampleNames(MSet_noout), as.character(SGPD_meta_sub$Sample_Name)) #TRUE
+dim(MSet_raw_auto <- MSet_noout[-which(rownames(MSet_noout) %in% Xprobes|rownames(MSet_noout) %in% Yprobes),]) #473864   1754
+dim(MSet_raw_X <- MSet_noout[which(rownames(MSet_noout) %in% Xprobes),]) #11232  1754
+dim(MSet_raw_Y <- MSet_noout[which(rownames(MSet_noout) %in% Yprobes),]) #416 1754
+
+### autosomes
+Betas_raw_auto <-betas(MSet_raw_auto)
+Beta_raw_auto_sample<-Betas_raw_auto[sample(1:nrow(Betas_raw_auto), 100000),]
+Beta_raw_auto_sample_melted<- melt(Beta_raw_auto_sample)
+Beta_raw_auto_Plot<-Beta_raw_auto_sample_melted[which(Beta_raw_auto_sample_melted$value >= 0),]
+Beta_raw_auto_Plot<-merge(Beta_raw_auto_Plot,SGPD_meta, by.x="Var2", by.y="Sample_Name")
+raw_auto <- ggplot(Beta_raw_auto_Plot, aes(value, group=Var2, color=Var2))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw autosomes") + theme(legend.position = "none")
+
+### X
+Betas_raw_X <-betas(MSet_raw_X)
+Beta_raw_X_sample_melted<- melt(Betas_raw_X)
+Beta_raw_X_Plot<-Beta_raw_X_sample_melted[which(Beta_raw_X_sample_melted$value >= 0),]
+Beta_raw_X_Plot<-merge(Beta_raw_X_Plot,SGPD_meta, by.x="Var2", by.y="Sample_Name")
+raw_X <- ggplot(Beta_raw_X_Plot, aes(value, group=Var2, color=Var2))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Xchr") + theme(legend.position = "none")
+
+### Y
+Betas_raw_Y <-betas(MSet_raw_Y)
+Beta_raw_Y_sample_melted<- melt(Betas_raw_Y)
+Beta_raw_Y_Plot<-Beta_raw_Y_sample_melted[which(Beta_raw_Y_sample_melted$value >= 0),]
+Beta_raw_Y_Plot<-merge(Beta_raw_Y_Plot,SGPD_meta, by.x="Var2", by.y="Sample_Name")
+raw_Y <- ggplot(Beta_raw_Y_Plot, aes(value, group=Var2, color=Var2))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Ychr") + theme(legend.position = "none")
+
+#plot all
+png("/home1/NEURO/schaffner/4-replication/Vallerga_2020/beta_distr_raw_noout_v2.png")
+grid.arrange(raw_auto, raw_X, raw_Y, ncol=1, nrow=3)
+dev.off()
+```
+![Beta distributions for female samples with low yMed](/home1/NEURO/schaffner/4-replication/Vallerga_2020/beta_dist_Xchr_F_yMed<7.8.png)
+
+Sample "SGPD_994" has an off beta distribution on the X chromosome. Although it's a female, the yMed was lower than average. Possibily a technical issue with yMed below the background noise level.
+
+![Raw data beta distributions after  removal of SGPD_994](/home1/NEURO/schaffner/4-replication/Vallerga_2020/beta_distr_raw_noout_v2.png)
+
+## Summary of flagged samples
+
+For each metric here I'll only list additional samples not identified by the metrics above it.
+
+ewastools control metrics: 10
+
+minfi M/U intensity: 8
+
+sex mismatches: 1
+
+SNP control probes clustering: 2
+
+SNP outliers: 4
+
+detection p-value: 3
+
+bead count: 1
+
+average intensity: 43
+
+lumi outlier detection: 59
+
+wateRmelon outlier detection: 3
+
+inter-sample correlation: 0
+
+PCA clustering: 0
+
+epigenetic age: 3
+
+beta distribution: 1
+
+In total there are **138** samples flagged for removal.
+
+## Samples to remove
+```{r sample removal, eval=F}
+to_remove <- unique(c(outliers, age_outliers$Sample_Name))
+to_remove #138 in total
+
+#remove and save object
+dim(SGPD_RG_Raw) #[1] 622399   1889
+dim(SGPD_RG_Raw_noout <- SGPD_RG_Raw[,-which(sampleNames(SGPD_RG_Raw) %in% to_remove)]) #[1] 622399   1751
+save(SGPD_RG_Raw_noout, file="/home1/NEURO/schaffner/4-replication/Vallerga_2020/SGPD_RG_Raw_noout.RData")
+write.csv(SGPD_meta_sub, file="/home1/NEURO/schaffner/4-replication/Vallerga_2020/Vallerga_2020_meta_noout.csv", row.names=F)
+```
+
+# Normalization
+
+Since analysis will be sex stratified, sex chromosomes can be retained; however, special considerations should be taken into account for normalization due to differing DNAm distirbutions of sex chromosomes and autosomes (e.g. from X inactivation). 
+
+I will use the "adjustedFunnorm" function from the wateRmelon package (Wang et al., Bioinformatics 2022). This approach first normalizes autosomes, then uses the methylation values from the autosomes to "correct" methylation measurements on the sex chromosomes. Adjusted Funnorm may reduce artificial bias between sexes as compared to traditional Funnorm.
+
+The adjustedFunnorm function includes noob background and dye bias correction by default.
+
+## adjustedFunnorm
+```{r adjfunnorm, eval=F}
+SGPD_RG_norm <- adjustedFunnorm(SGPD_RG_Raw_noout)
+save(SGPD_RG_norm, file="/home1/NEURO/schaffner/4-replication/Vallerga_2020/SGPD_RG_norm.RData")
+
+#plotting beta distributions before/after normalization
+#split by sexchr/autosomes
+load("~/kobor_shared_coding_resource/HM450_fdat.RData")
+length(Xprobes <- fData_450[fData_450$CHR=="X","TargetID"]) #11,232
+length(Yprobes <- fData_450[fData_450$CHR=="Y","TargetID"]) #416
+
+## raw data
+MSet_raw <- preprocessRaw(SGPD_RG_Raw_noout) 
+dim(MSet_raw) #485512    539
+all(sampleNames(MSet_raw) %in% as.character(SGPD_meta_sub$Sample_Name)) #TRUE
+SGPD_meta_sub <- SGPD_meta_sub[match(sampleNames(MSet_raw), SGPD_meta_sub$Sample_Name),]
+all(sampleNames(MSet_raw) == as.character(SGPD_meta_sub$Sample_Name)) #TRUE
+dim(MSet_raw_auto <- MSet_raw[-which(rownames(MSet_raw) %in% Xprobes|rownames(MSet_raw) %in% Yprobes),]) # 473864    539
+dim(MSet_raw_X <- MSet_raw[which(rownames(MSet_raw) %in% Xprobes),]) #11232   539
+dim(MSet_raw_Y <- MSet_raw[which(rownames(MSet_raw) %in% Yprobes),]) #416 539
+
+### autosomes
+Betas_raw_auto <-betas(MSet_raw_auto)
+Beta_raw_auto_sample<-Betas_raw_auto[sample(1:nrow(Betas_raw_auto), 100000),]
+Beta_raw_auto_sample_melted<- melt(Beta_raw_auto_sample)
+Beta_raw_auto_Plot<-Beta_raw_auto_sample_melted[which(Beta_raw_auto_sample_melted$value >= 0),]
+Beta_raw_auto_Plot<-merge(Beta_raw_auto_Plot,SGPD_meta_sub, by.x="Var2", by.y="Sample_Name")
+raw_auto <- ggplot(Beta_raw_auto_Plot, aes(value, group=Var2, color=reportedSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw autosomes")
+
+### X
+Betas_raw_X <-betas(MSet_raw_X)
+Beta_raw_X_sample_melted<- melt(Betas_raw_X)
+Beta_raw_X_Plot<-Beta_raw_X_sample_melted[which(Beta_raw_X_sample_melted$value >= 0),]
+Beta_raw_X_Plot<-merge(Beta_raw_X_Plot,SGPD_meta_sub, by.x="Var2", by.y="Sample_Name")
+raw_X <- ggplot(Beta_raw_X_Plot, aes(value, group=Var2, color=reportedSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Xchr")
+
+### Y
+Betas_raw_Y <-betas(MSet_raw_Y)
+Beta_raw_Y_sample_melted<- melt(Betas_raw_Y)
+Beta_raw_Y_Plot<-Beta_raw_Y_sample_melted[which(Beta_raw_Y_sample_melted$value >= 0),]
+Beta_raw_Y_Plot<-merge(Beta_raw_Y_Plot,SGPD_meta_sub, by.x="Var2", by.y="Sample_Name")
+raw_Y <- ggplot(Beta_raw_Y_Plot, aes(value, group=Var2, color=reportedSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Ychr")
+
+## normalized data
+dim(SGPD_RG_norm) #485512    539
+dim(GSet_norm_auto <- SGPD_RG_norm[-which(rownames(SGPD_RG_norm) %in% Xprobes|rownames(SGPD_RG_norm) %in% Yprobes),]) # 473864    539
+dim(GSet_norm_X <- SGPD_RG_norm[which(rownames(SGPD_RG_norm) %in% Xprobes),]) #11232   539
+dim(GSet_norm_Y <- SGPD_RG_norm[which(rownames(SGPD_RG_norm) %in% Yprobes),]) #416 539
+
+### autosomes
+Betas_norm_auto <-getBeta(GSet_norm_auto)
+Beta_norm_auto_sample<-Betas_norm_auto[sample(1:nrow(Betas_norm_auto), 100000),]
+Beta_norm_auto_sample_melted<- melt(Beta_norm_auto_sample)
+Beta_norm_auto_Plot<-Beta_norm_auto_sample_melted[which(Beta_norm_auto_sample_melted$value >= 0),]
+Beta_norm_auto_Plot<-merge(Beta_norm_auto_Plot,SGPD_meta_sub, by.x="Var2", by.y="Sample_Name")
+norm_auto <- ggplot(Beta_norm_auto_Plot, aes(value, group=Var2, color=reportedSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Normalized autosomes")
+
+### X
+Betas_norm_X <-getBeta(GSet_norm_X)
+Beta_norm_X_sample_melted<- melt(Betas_norm_X)
+Beta_norm_X_Plot<-Beta_norm_X_sample_melted[which(Beta_norm_X_sample_melted$value >= 0),]
+Beta_norm_X_Plot<-merge(Beta_norm_X_Plot,SGPD_meta_sub, by.x="Var2", by.y="Sample_Name")
+norm_X <- ggplot(Beta_norm_X_Plot, aes(value, group=Var2, color=reportedSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Normalized Xchr")
+
+### Y
+Betas_norm_Y <-getBeta(GSet_norm_Y)
+Beta_norm_Y_sample_melted<- melt(Betas_norm_Y)
+Beta_norm_Y_Plot<-Beta_norm_Y_sample_melted[which(Beta_norm_Y_sample_melted$value >= 0),]
+Beta_norm_Y_Plot<-merge(Beta_norm_Y_Plot,SGPD_meta_sub, by.x="Var2", by.y="Sample_Name")
+norm_Y <- ggplot(Beta_norm_Y_Plot, aes(value, group=Var2, color=reportedSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Normalized Ychr")
+
+#plot all
+png("~/4-replication/Vallerga_2020/beta_distr_norm_1754n.png")
+grid.arrange(raw_auto, norm_auto, raw_X, norm_X, raw_Y, norm_Y, ncol=2, nrow=3)
+dev.off()
+```
+![Beta distributions before and after normalization](/home1/NEURO/schaffner/4-replication/Vallerga_2020/beta_distr_norm_1754n.png)
+
+After outlier removal and normalization, beta distributions for autosomes and sex chromosomes look as expected. There is a higher unmethylated peak in Xchr data here than there was for TERRE and DIG-PD - maybe due to difference between EPIC and 450K?
+
+# List of probes to filter
+
+I will first calculate the QC metrics/list of probes to remove using the raw object (BEFORE normalization). This is because funnorm imputes missing values, which might make probes that failed technical checks appear to be usable after normalization. Then I'll remove those probes from the normalized object.
+
+Probes to filter out:
+
+1. Those with low bead count/too many NA's (excluding female Ychr background signal)
+
+2. Cross-hybridizing probes
+
+3. Polymorphic probes
+
+## Poor performing probes
+
+Detection p values indicate whether a particular methylation intensity is statistically different from the average intensity over the negative control probes/background. P values which are greater than 0.01 are considered poor quality measurements.
+
+Every probe has multiple beads which serves as replicate readings/multiple measurements per sample. If a given probe for a given sample has fewer than 3 beads/reads that value is given an NA. Typically if a probe has NAs in 1% of samples or more then it is removed.
+
+```{r badprobe, eval=F}
+#getting detection p-values and bead count again (not saved)
+SGPD_meta_sub <- SGPD_meta_sub[match(sampleNames(SGPD_RG_Raw_noout), SGPD_meta_sub$Sample_Name),]
+detP <- minfi::detectionP(SGPD_RG_Raw_noout)
+all.equal(colnames(detP), as.character(SGPD_meta_sub$Sample_Name)) #TRUE
+
+#replacing female Ychr values with NA so they don't count toward total 
+detP_noY <- detP
+detP_noY[rownames(detP_noY) %in% Yprobes,colnames(detP_noY) %in% as.character(SGPD_meta_sub[SGPD_meta_sub$reportedSex=="F","Sample_Name"])] <- NA
+all(colnames(detP_noY)==(as.character(SGPD_meta_sub$Sample_Name))) #TRUE
+
+bead <- beadcount(SGPD_RG_Raw_noout)
+all(colnames(bead)==(as.character(SGPD_meta_sub$Sample_Name))) #TRUE
+
+# create a dummy matrix
+bad_probes <- matrix(data = F, nrow = nrow(detP), ncol = ncol(detP),
+                        dimnames = list(rownames(detP), colnames(detP))) %>% as.data.frame
+
+# now let us put 'TRUE' where detp > 0.01, or beadcount is < 3
+bad_probes[is.na(bead)] <- T
+bad_probes[detP_noY > 0.01] <- T #excluding female Y probes
+
+#Number of probes that had a significant amount of bad performing probes:
+n <- ncol(SGPD_RG_Raw_noout)
+bad_probes_count <- rowSums(bad_probes)
+sum(bad_probes_count > 0.010*n) #11554
+sum(bad_probes_count > 0.025*n) #2696
+sum(bad_probes_count > 0.05*n) #812
+
+# bad probes, remove if > 5% missing
+probe_anno <- tibble(probe_ID = rownames(detP)) %>%
+  mutate(number_bad_probes = bad_probes_count)
+nrow(probe_bad <- probe_anno %>% filter(number_bad_probes > 0.05*n)  %>% pull(probe_ID)  %>%  as.data.frame()) 
+#812 bad probes
+```
+
+## Cross-hybrizing probes
+
+Probes which are predicted to unintentionally bind to other regions throughout the genome other than their target region should be removed (cross hybridizing probes). Pidsley et. al (2016) did analysis to measure 450K cross reactive probes. I will remove any probes which have been predicted to cross hybridize on the 450K array.
+
+```{r cross hyb probes, eval=F}
+load("~/kobor_shared_coding_resource/Complete_450K_Annotation.RData")
+CH_probes <- Complete_450K_Annotation[Complete_450K_Annotation$CH_450_Aut%in%"Yes"|Complete_450K_Annotation$CH_450_XY%in%"Yes","TargetID"] 
+length(unique(CH_probes))
+#[1] 39037
+
+#Price list
+load("~/kobor_shared_coding_resource/Cross_Hybr_Probes_450K.RData")
+length(unique(Cross_Hybr_Probes_450K)) #41937
+all(as.character(CH_probes) %in% Cross_Hybr_Probes_450K) #TRUE
+
+length(HM450_CH_Probes_additional <- Cross_Hybr_Probes_450K[Cross_Hybr_Probes_450K %in% featureNames(SGPD_RG_norm)]) #41,937
+length(HM450_CH_Probes_additional <- HM450_CH_Probes_additional[-which(HM450_CH_Probes_additional %in% probe_bad$.)]) #41,865
+```
+
+## Polymorphic probes
+
+We remove probes which either measure a CpG which is also a SNP (polymorphic CpG) or contain a SNP within the probe. Only SNPs present in >5% of the population were removed.
+
+```{r polymorphic probes, eval=F}
+# Keep probes that were NOT poorly designed 
+load("~/kobor_shared_coding_resource/Complete_450K_Annotation.RData")
+fdat_sub <- Complete_450K_Annotation[Complete_450K_Annotation$TargetID %in% featureNames(SGPD_RG_norm),] #everything except 65 SNP probes
+length(Conf_Probes <- as.character(fdat_sub[complete.cases(fdat_sub$n_SNPCpG),"TargetID"])) #20,869
+```
+
+# Probe filtering
+```{r probe filter, eval=F}
+length(probes_to_filter <- unique(c(as.character(probe_bad$.), HM450_CH_Probes_additional, Conf_Probes))) #60,813
+length(probes_to_filter[probes_to_filter %in% featureNames(SGPD_RG_norm)]) #60,813
+dim(SGPD_RG_filtered <- SGPD_RG_norm[-which(featureNames(SGPD_RG_norm) %in% probes_to_filter),]) #424699    1751
+save(SGPD_RG_filtered, file="~/4-replication/Vallerga_2020/SGPD_RG_filtered.RData")
+
+rm(SGPD_RG_norm, detP, detP_noY, bad_probes, bead)
+write.csv(SGPD_meta_sub, file="~/4-replication/Vallerga_2020/SGPD_meta_prbfilter.csv", row.names=F)
+```
+
+
+# Meta data correlation matrix
+```{r meta data cor, eval=F}
+#Create correlation matrix
+SGPD_meta_sub$Chip <- sapply(1:nrow(SGPD_meta_sub), function(x) unlist(strsplit(as.character(SGPD_meta_sub$title[x]), split="_"))[1])
+SGPD_meta_sub$Chip_Position <- sapply(1:nrow(SGPD_meta_sub), function(x) unlist(strsplit(as.character(SGPD_meta_sub$title[x]), split="_"))[2])
+write.csv(SGPD_meta_sub, file="~/4-replication/Vallerga_2020/SGPD_meta_prbfilter.csv", row.names=F)
+
+SGPD_meta_sub_cor <- SGPD_meta_sub[,c(32,33,38:42,44,45)]
+rownames(SGPD_meta_sub_cor) <- SGPD_meta_sub$Sample_Name
+str(SGPD_meta_sub_cor)
+SGPD_meta_sub_cor$Chip <- as.factor(SGPD_meta_sub_cor$Chip)
+SGPD_meta_sub_cor$Chip_Position <- as.factor(SGPD_meta_sub_cor$Chip_Position)
+
+cormat <- correlation_pval(SGPD_meta_sub_cor)
+
+# Get lower triangle of the correlation matrix
+get_lower_tri<-function(cormat){
+    cormat[upper.tri(cormat)] <- NA
+    return(cormat)
+  }
+# Get upper triangle of the correlation matrix
+get_upper_tri <- function(cormat){
+    cormat[lower.tri(cormat)]<- NA
+    return(cormat)
+  }
+
+upper_tri <- get_upper_tri(cormat)
+
+#colour if sig
+for(x in 1:nrow(upper_tri)){
+  for(y in 1:ncol(upper_tri)){
+    if(is.na(upper_tri[x,y])==FALSE){
+    if(as.numeric(upper_tri[x,y])<=0.001){upper_tri[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri[x,y])<=0.01){upper_tri[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri[x,y])<=0.05){upper_tri[x,y]<-"<=0.05"}else{upper_tri[x,y]<-">0.05"}}}}
+  }}
+melted_cormat <- reshape2::melt(upper_tri, na.rm = TRUE)
+png("~/4-replication/Vallerga_2020/meta_cor.png", width=900, height=900)
+ggplot(data = melted_cormat, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+
+## females only
+meta_F <- SGPD_meta_sub_cor[SGPD_meta_sub_cor$reportedSex=="F",-(2)]
+cormat_F <- correlation_pval(meta_F)
+upper_tri_F <- get_upper_tri(cormat_F)
+for(x in 1:nrow(upper_tri_F)){
+  for(y in 1:ncol(upper_tri_F)){
+    if(is.na(upper_tri_F[x,y])==FALSE){
+    if(as.numeric(upper_tri_F[x,y])<=0.001){upper_tri_F[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri_F[x,y])<=0.01){upper_tri_F[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri_F[x,y])<=0.05){upper_tri_F[x,y]<-"<=0.05"}else{upper_tri_F[x,y]<-">0.05"}}}}
+  }}
+melted_cormat_F <- reshape2::melt(upper_tri_F, na.rm = TRUE)
+png("~/4-replication/Vallerga_2020/meta_cor_F.png", width=900, height=900)
+ggplot(data = melted_cormat_F, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+
+## males only
+meta_M <- SGPD_meta_sub_cor[SGPD_meta_sub_cor$reportedSex=="M",-(c(2))]
+cormat_M <- correlation_pval(meta_M)
+upper_tri_M <- get_upper_tri(cormat_M)
+for(x in 1:nrow(upper_tri_M)){
+  for(y in 1:ncol(upper_tri_M)){
+    if(is.na(upper_tri_M[x,y])==FALSE){
+    if(as.numeric(upper_tri_M[x,y])<=0.001){upper_tri_M[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri_M[x,y])<=0.01){upper_tri_M[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri_M[x,y])<=0.05){upper_tri_M[x,y]<-"<=0.05"}else{upper_tri_M[x,y]<-">0.05"}}}}
+  }}
+melted_cormat_M <- reshape2::melt(upper_tri_M, na.rm = TRUE)
+png("~/4-replication/Vallerga_2020/meta_cor_M.png", width=900, height=900)
+ggplot(data = melted_cormat_M, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+```
+![Meta data correlation in both sexes](/home1/NEURO/schaffner/4-replication/Vallerga_2020/meta_cor.png)
+
+Chip and chip position are not correlated to sex or disease status, so should be okay to correct with ComBat.
+
+![Meta data correlation in females](/home1/NEURO/schaffner/4-replication/Vallerga_2020/meta_cor_F.png)
+
+
+![Meta data correlation in males](/home1/NEURO/schaffner/4-replication/Vallerga_2020/meta_cor_M.png)
+
+
+# Principal component analysis
+
+Next I'll use PCA to look at sources of variation in the data. Code from Nicole Gladish.
+
+## PCA on raw data
+```{r pca raw, eval=F}
+# Here are the arguments you can add (and their defaults): 
+# PCA_Plot(PCA_Object, type = c("All", "Sparse"), nPCs = 10, MTC = F, Discrete = T, label.y_size = 12, label.x_size = 12, angle.x = 30, vjust.x = 0.5)
+# Here is what some arguments do: 
+# type = c("All", "Sparse") - this is to tell it whether your PCA_Object results from a sparse or regular PCA (it does not do it for you it just tells the function what you have).
+# nPCs - how many PCs do you want to plot
+# MTC = F - do you want the associations multiple test corrected? BH is the method I include here
+# Discrete = T, do you want a continuous display of significane values or discrete?
+
+#restructing meta data and subsetting to categorical/continuous
+SGPD_meta_sub_cor <- SGPD_meta_sub_cor[match(sampleNames(SGPD_RG_Raw_noout), rownames(SGPD_meta_sub_cor)),]
+str(SGPD_meta_sub_cor)
+
+meta_categorical <- SGPD_meta_sub_cor[,c("disease.state.ch1","reportedSex","Chip","Chip_Position","failed")]
+
+meta_continuous <- SGPD_meta_sub_cor[,c("xMed","yMed","Average_intensity","DNAmAge_Horvath")]
+
+#PCA on beta values: input
+betas_raw <- getBeta(SGPD_RG_Raw_noout)
+all(colnames(betas_raw) == rownames(meta_categorical)) #TRUE
+PCA_full<-princomp(betas_raw[complete.cases(betas_raw),])
+
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+
+png("~/4-replication/Vallerga_2020/pca_raw_heat_legend.png", width=900, height=800)
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)[[1]]
+dev.off()
+
+png("~/4-replication/Vallerga_2020/pca_raw_heat_nolegend.png", width=900, height=800)
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)[[2]]
+dev.off()
+
+png("~/4-replication/Vallerga_2020/pca_raw_scree.png", width=900, height=800)
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)[[3]]
+dev.off()
+```
+![PCA on raw data - scree](/home1/NEURO/schaffner/4-replication/Vallerga_2020/pca_raw_scree.png)
+
+![PCA on raw data - heat map](/home1/NEURO/schaffner/4-replication/Vallerga_2020/pca_raw_heat_legend.png)
+
+PD, sex, and age contribute strongly to variation in DNAm.
+
+## PCA on normalized and probe-filtered data
+```{r pca norm, eval=F}
+betas_norm <- getBeta(SGPD_RG_filtered)
+all.equal(colnames(betas_norm), rownames(meta_categorical)) #TRUE
+
+#PCA on beta values: input
+PCA_full<-princomp(betas_norm[complete.cases(betas_norm),])
+
+png("~/4-replication/Vallerga_2020/pca_norm_heat_legend.png", width=900, height=800)
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)[[1]]
+dev.off()
+
+png("~/4-replication/Vallerga_2020/pca_norm_heat_nolegend.png", width=900, height=800)
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)[[2]]
+dev.off()
+
+png("~/4-replication/Vallerga_2020/pca_norm_scree.png", width=900, height=800)
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)[[3]]
+dev.off()
+```
+![PCA on normalized and filtered data - scree](/home1/NEURO/schaffner/4-replication/Vallerga_2020/pca_norm_scree.png)
+
+![PCA on normalized and filtered data - heat map](/home1/NEURO/schaffner/4-replication/Vallerga_2020/pca_norm_heat_legend.png)
+
+
+# ComBat
+
+I'll apply ComBat correction for chip and chip position.
+
+## ComBat batch correction - chip
+```{r ComBat chip, eval=F}
+#get Mvals for input and convert any infinite values to an extreme negative
+Mvals <- getM(SGPD_RG_filtered)
+Mvals[Mvals==-Inf] <- min(Mvals[Mvals>-Inf])
+
+all(SGPD_meta_sub$Sample_Name==sampleNames(SGPD_RG_filtered)) #TRUE
+
+Mvals_combat <- ComBat(Mvals, SGPD_meta_sub$Chip) #168 batches
+
+m2beta <- function (m) 
+{
+    beta <- 2^m/(2^m + 1)
+    return(beta)
+}
+betas_combat <- m2beta(Mvals_combat)
+```
+
+## PCA on ComBat-corrected data 
+```{r pca combat chip, eval=F}
+all.equal(colnames(betas_combat), rownames(meta_categorical)) #TRUE
+all.equal(colnames(betas_combat), rownames(meta_continuous)) #TRUE
+
+#PCA on beta values: input
+PCA_full<-princomp(betas_combat[complete.cases(betas_combat),])
+
+png("~/4-replication/Vallerga_2020/pca_combat_chip_heat_legend.png", width=900, height=800)
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)[[1]]
+dev.off()
+
+png("~/4-replication/Vallerga_2020/pca_combat_chip_heat_nolegend.png", width=900, height=800)
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)[[2]]
+dev.off()
+
+png("~/4-replication/Vallerga_2020/pca_combat_chip_scree.png", width=900, height=800)
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)[[3]]
+dev.off()
+```
+![PCA scree plot: Chip-corrected data](/home1/NEURO/schaffner/4-replication/Vallerga_2020/pca_combat_chip_scree.png)
+
+![PCA heat map: Chip-corrected data](/home1/NEURO/schaffner/4-replication/Vallerga_2020/pca_combat_chip_heat_legend.png)
+
+All chip effects are gone.
+
+## ComBat batch correction - chip position
+```{r ComBat chip pos, eval=F}
+Mvals_combat <- ComBat(Mvals_combat, SGPD_meta_sub$Chip_Position) #12 batches
+betas_combat <- m2beta(Mvals_combat)
+save(betas_combat, file="~/4-replication/Vallerga_2020/SGPD_betas_combat.RData")
+```
+
+##PCA on ComBat-corrected data 
+```{r pca combat chip pos, eval=F}
+all.equal(colnames(betas_combat), rownames(meta_categorical)) #TRUE
+all.equal(colnames(betas_combat), rownames(meta_continuous)) #TRUE
+
+#PCA on beta values: input
+PCA_full<-princomp(betas_combat[complete.cases(betas_combat),])
+
+png("~/4-replication/Vallerga_2020/pca_combat_pos_heat_legend.png", width=900, height=800)
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)[[1]]
+dev.off()
+
+png("~/4-replication/Vallerga_2020/pca_combat_pos_heat_nolegend.png", width=900, height=800)
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)[[2]]
+dev.off()
+
+png("~/4-replication/Vallerga_2020/pca_combat_pos_scree.png", width=900, height=800)
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)[[3]]
+dev.off()
+```
+![PCA scree plot: Chip position-corrected data](/home1/NEURO/schaffner/4-replication/Vallerga_2020/pca_combat_pos_scree.png)
+
+![PCA heat map: Chip position-corrected data](/home1/NEURO/schaffner/4-replication/Vallerga_2020/pca_combat_pos_heat_legend.png)
+
+All chip position effects are gone.
+
+# Predicting cell type proportions
+
+I will predict cell type using the Houseman algorithm and IDOL-picked reference probes on RAW data. Note ECC11 in-house function produced odd estimates, so I am using the estimateCellCounts2 function.
+
+### IDOL reference (estimateCellCounts2)
+```{r celltype estimatecell2, eval=F}
+source('~/kobor_shared_coding_resource/ECC2_SS.R') #manually calls experimenthub object created 9/2/22
+data("IDOLOptimizedCpGs450klegacy")
+cellprop_ecc2_idol <- ECC2_SS(SGPD_RG_Raw_noout, compositeCellType = "Blood", probeSelect="IDOL", IDOLOptimizedCpGs = IDOLOptimizedCpGs450klegacy, referencePlatform = "IlluminaHumanMethylation450k")
+
+counts <- cellprop_ecc2_idol$counts
+counts <- counts[match(SGPD_meta_sub$Sample_Name, rownames(counts)),]
+all.equal(rownames(counts), as.character(SGPD_meta_sub$Sample_Name)) #TRUE
+SGPD_meta <- cbind(SGPD_meta_sub, counts)
+write.csv(SGPD_meta, file="~/4-replication/Vallerga_2020/SGPD_meta_cellprop.csv", row.names=F)
+
+cellprop_melt <- melt(SGPD_meta[,46:51])
+ggplot(cellprop_melt, aes(x=variable, y=value, col=variable)) + geom_jitter(alpha=0.2) + theme_bw() + ggtitle("estimateCellCounts2: raw data with IDOL probes")
+
+#plot by PD
+cellprop_melt <- melt(SGPD_meta[,c(32,33,46:51)], id.vars=c("reportedSex","disease.state.ch1"))
+cellprop_melt$disease.state.ch1 <- as.factor(cellprop_melt$disease.state.ch1)
+ggplot(cellprop_melt, aes(x=variable, y=value, fill=disease.state.ch1)) + geom_boxplot() + theme_bw() + ggtitle("Standard cell types") + theme(axis.text.x=element_text(angle=90, hjust=1), axis.title.x=element_blank()) + ylim(c(0,1))
+
+#plot by sex and PD
+ggplot(cellprop_melt, aes(x=variable, y=value, fill=disease.state.ch1)) + geom_boxplot() + theme_bw() + ggtitle("Standard cell types") + theme(axis.text.x=element_text(angle=90, hjust=1), axis.title.x=element_blank()) + ylim(c(0,1)) + facet_wrap(~reportedSex)
+
+
+########## standard cell types significance test
+#testing significance: standard cell types, sexes combined
+pvals_std <- c("CD8T"=t.test(SGPD_meta[SGPD_meta$disease.state.ch1=="Control","CD8T"],SGPD_meta[SGPD_meta$disease.state.ch1=="Parkinson's disease","CD8T"])$p.value,
+               "CD4T"=t.test(SGPD_meta[SGPD_meta$disease.state.ch1=="Control","CD4T"],SGPD_meta[SGPD_meta$disease.state.ch1=="Parkinson's disease","CD4T"])$p.value,
+               "NK"=t.test(SGPD_meta[SGPD_meta$disease.state.ch1=="Control","NK"],SGPD_meta[SGPD_meta$disease.state.ch1=="Parkinson's disease","NK"])$p.value,
+               "Bcell"=t.test(SGPD_meta[SGPD_meta$disease.state.ch1=="Control","Bcell"],SGPD_meta[SGPD_meta$disease.state.ch1=="Parkinson's disease","Bcell"])$p.value,
+               "Mono"=t.test(SGPD_meta[SGPD_meta$disease.state.ch1=="Control","Mono"],SGPD_meta[SGPD_meta$disease.state.ch1=="Parkinson's disease","Mono"])$p.value,
+               "Neu"=t.test(SGPD_meta[SGPD_meta$disease.state.ch1=="Control","Neu"],SGPD_meta[SGPD_meta$disease.state.ch1=="Parkinson's disease","Neu"])$p.value)
+sort(pvals_std)
+#       Bcell          Neu         CD4T         CD8T         Mono           NK 
+#1.679861e-30 3.335968e-23 1.244779e-19 4.021113e-06 1.058819e-01 5.678139e-01 
+
+sort(p.adjust(pvals_std))
+#       Bcell          Neu         CD4T         CD8T         Mono           NK 
+#1.007917e-29 1.667984e-22 4.979116e-19 1.206334e-05 2.117637e-01 5.678139e-01 
+
+#testing significance: standard cell types, females
+pvals_std_F <- c("CD8T"=t.test(SGPD_meta[SGPD_meta$disease.state.ch1=="Control"&SGPD_meta$reportedSex=="F","CD8T"],SGPD_meta[SGPD_meta$disease.state.ch1=="Parkinson's disease"&SGPD_meta$reportedSex=="F","CD8T"])$p.value,
+               "CD4T"=t.test(SGPD_meta[SGPD_meta$disease.state.ch1=="Control"&SGPD_meta$reportedSex=="F","CD4T"],SGPD_meta[SGPD_meta$disease.state.ch1=="Parkinson's disease"&SGPD_meta$reportedSex=="F","CD4T"])$p.value,
+               "NK"=t.test(SGPD_meta[SGPD_meta$disease.state.ch1=="Control"&SGPD_meta$reportedSex=="F","NK"],SGPD_meta[SGPD_meta$disease.state.ch1=="Parkinson's disease"&SGPD_meta$reportedSex=="F","NK"])$p.value,
+               "Bcell"=t.test(SGPD_meta[SGPD_meta$disease.state.ch1=="Control"&SGPD_meta$reportedSex=="F","Bcell"],SGPD_meta[SGPD_meta$disease.state.ch1=="Parkinson's disease"&SGPD_meta$reportedSex=="F","Bcell"])$p.value,
+               "Mono"=t.test(SGPD_meta[SGPD_meta$disease.state.ch1=="Control"&SGPD_meta$reportedSex=="F","Mono"],SGPD_meta[SGPD_meta$disease.state.ch1=="Parkinson's disease"&SGPD_meta$reportedSex=="F","Mono"])$p.value,
+               "Neu"=t.test(SGPD_meta[SGPD_meta$disease.state.ch1=="Control"&SGPD_meta$reportedSex=="F","Neu"],SGPD_meta[SGPD_meta$disease.state.ch1=="Parkinson's disease"&SGPD_meta$reportedSex=="F","Neu"])$p.value)
+sort(pvals_std_F)
+#       Bcell          Neu         CD4T         CD8T         Mono           NK 
+#8.951324e-18 2.555195e-08 4.602955e-06 7.738984e-04 2.048573e-01 3.127006e-01 
+
+sort(p.adjust(pvals_std_F))
+#       Bcell          Neu         CD4T         CD8T           NK         Mono 
+#5.370794e-17 1.277598e-07 1.841182e-05 2.321695e-03 4.097147e-01 4.097147e-01 
+
+#testing significance: standard cell types, males
+pvals_std_M <- c("CD8T"=t.test(SGPD_meta[SGPD_meta$disease.state.ch1=="Control"&SGPD_meta$reportedSex=="M","CD8T"],SGPD_meta[SGPD_meta$disease.state.ch1=="Parkinson's disease"&SGPD_meta$reportedSex=="M","CD8T"])$p.value,
+               "CD4T"=t.test(SGPD_meta[SGPD_meta$disease.state.ch1=="Control"&SGPD_meta$reportedSex=="M","CD4T"],SGPD_meta[SGPD_meta$disease.state.ch1=="Parkinson's disease"&SGPD_meta$reportedSex=="M","CD4T"])$p.value,
+               "NK"=t.test(SGPD_meta[SGPD_meta$disease.state.ch1=="Control"&SGPD_meta$reportedSex=="M","NK"],SGPD_meta[SGPD_meta$disease.state.ch1=="Parkinson's disease"&SGPD_meta$reportedSex=="M","NK"])$p.value,
+               "Bcell"=t.test(SGPD_meta[SGPD_meta$disease.state.ch1=="Control"&SGPD_meta$reportedSex=="M","Bcell"],SGPD_meta[SGPD_meta$disease.state.ch1=="Parkinson's disease"&SGPD_meta$reportedSex=="M","Bcell"])$p.value,
+               "Mono"=t.test(SGPD_meta[SGPD_meta$disease.state.ch1=="Control"&SGPD_meta$reportedSex=="M","Mono"],SGPD_meta[SGPD_meta$disease.state.ch1=="Parkinson's disease"&SGPD_meta$reportedSex=="M","Mono"])$p.value,
+               "Neu"=t.test(SGPD_meta[SGPD_meta$disease.state.ch1=="Control"&SGPD_meta$reportedSex=="M","Neu"],SGPD_meta[SGPD_meta$disease.state.ch1=="Parkinson's disease"&SGPD_meta$reportedSex=="M","Neu"])$p.value)
+sort(pvals_std_M)
+#         Neu         CD4T        Bcell           NK         Mono         CD8T 
+#4.070523e-13 7.914837e-11 2.885672e-10 3.978392e-03 1.297391e-02 1.514619e-01 
+
+sort(p.adjust(pvals_std_M))
+#         Neu         CD4T        Bcell           NK         Mono         CD8T 
+#2.442314e-12 3.957419e-10 1.154269e-09 1.193518e-02 2.594781e-02 1.514619e-01 
+```
+![ECC2 predicted cell type proportions with IDOL reference](/home1/NEURO/schaffner/4-replication/Vallerga_2020/celltype_ecc2_idol.png)
+
+A lot of individuals have predicted zero CD8T cells, NK cells, and B cells...
+
+![Predicted cell type proportions split by PD status, with sexes combined](/home1/NEURO/schaffner/4-replication/Vallerga_2020/celltype_by_PD.png)
+
+PD cases have elevated neutrophils.
+
+![Predicted cell type proportions split by PD status, with sex stratification](/home1/NEURO/schaffner/4-replication/Vallerga_2020/celltype_by_sex_PD.png)

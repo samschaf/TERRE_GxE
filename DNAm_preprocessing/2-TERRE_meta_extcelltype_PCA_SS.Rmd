@@ -1,0 +1,645 @@
+---
+itle: "TERRE_plots"
+author: "SS"
+date: "09/06/2022"
+output:
+  html_document:
+    df_print: paged
+  rmdformats::readthedown:
+    fig_caption: yes
+    gallery: no
+    highlight: kate
+    lightbox: yes
+    self_contained: yes
+    thumbnails: no
+---
+TERRE 1-preprocessing and Normalization
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: Feb 27, 2023
+
+The *TERRE* cohort (subset containing n=88 cases and n=177 controls) consists of French agricultural workers enrolled in the Mutualite Sociale Agricole health insurance system (Elbaz et al., 2009). All PD cases in this subset of data have a disease duration of 1.5 years or less. We are performing this study in collaboration with r. Alexis Elbaz, Dr. Alexis Brice, and Dr. Jean-Christophe Corvol. EPIC arrays were run in Paris, France on bisulfite-converted DNA samples extracted from whole blood. We were provided with idat files for 1-preprocessing and analysis.
+
+The data was re-processed in Aug-Sept 2022 (see TERRE_funnorm_082022_nocombat.Rmd). Here I will assess meta data correlations and PCA within the portion we'll be analyzing for differential DNAm (with matched gentoype data).
+
+Update Feb 27, 2023: Changed cell types estimation parameters from "IDOL" probe select and "Blood" reference to "auto" probe select (IDOL not working) and "BloodExtended" reference (should have been "BloodExtended" originally).
+
+Update June 6, 2023: Using Spearman's correlation and including correlation coefficient in heat maps.
+
+### Libraries and outside functions
+```{r results='hide', warning=FALSE, message=FALSE, eval=F}
+setwd("~/")
+library(sva)
+library(Metrics)
+library(methylumi)
+library(dendextend)
+library(locfdr)
+library(gplots)
+library(lattice)
+#library(wateRmelon) #problem with lumi, can't load wateRmelon
+library("RColorBrewer")
+library(plyr)
+library(VennDiagram)
+library(ggplot2)
+library(qvalue)
+library("sva")
+library(parallel)
+library(gridExtra)
+library(grid)
+library("reshape2")
+library("corrplot")
+library(rgr)
+library(viridis)
+#library(lumi) #can't load
+library(missMethyl)
+library(hydroGOF)
+library(quadprog)
+library(genefilter)
+library(matrixStats)
+library(limma)
+library(FlowSorted.Blood.450k)
+library(FlowSorted.Blood.EPIC)
+library(ewastools)
+library(ggrepel)
+library(conumee)
+library(doParallel)
+library(ggplotify)
+library(cowplot)
+library(ggpubr)
+#library(tidyverse)
+#library(robCompositions)
+
+#custom functions
+source("~/kobor_shared_coding_resource/PCA_Plot_Function.R")
+source("~/kobor_shared_coding_resource/correlation_pval.R") #modified slightly so that corr between perfectly confounded variables (PD with dis_duration and age_onset) is 0; also made function verbose
+source("/home1/NEURO/schaffner/kobor_shared_coding_resource/pcaCoDa_NG.R")
+source("~/kobor_shared_coding_resource/correlation_coef_Spearman.R")
+source("~/kobor_shared_coding_resource/correlation_pval_Spearman.R")
+```
+
+## Load data 
+```{r load data, eval=F}
+load("~/1-preprocessing/TERRE/normalized_filtered/TERRE_RG_filtered.RData")
+terre_meta <- read.csv("~/1-preprocessing/TERRE/terre_meta_cellprop_ext2_02272023.csv")
+table(terre_meta$reportedSex, terre_meta$PD)
+#     0  1
+#  F 72 35
+#  M 85 39
+```
+
+## Add genotyping and cell type PCs
+
+### Robust PCA of cell type data
+
+This code was written by Dr. Sarah Merrill.
+  
+Compositional data is unique, and as such, cannot be easily used in ANCOVAs, linear regressions, or Principle Components Analysis (PCA) due to breaking necessary assumptions - specifically the assumptions of independence and little multicolinearity. Compositional data are strictly positive and multivariate that are constrained to have a unit sum (Aitchison, 1982). Therefore, predicted cell type proportions using reference methods like Houseman et al. (2012) are compositional data. 
+
+With compositional data, you can perform a PCA of the orthonormal relative structure (isometric logratio transformation) of the proportions instead of the values of their original components to create linearly uncorrelated variables to include in your standard model (Filzmoser, Hron & Reimann, 2009). This approach uses the principles of compositional data (scale invariance, subcompositional coherence, and permutation invariance) to maintain relative distances among the components. PCA is then performed to reduce data into the variability in the relative distances among the cell type proportions. 
+
+The Robust PCA method for compositional data also uses Minimum Covariance Determinant (MCD) estimators of location and covariance inquire ILR coordinates to obtain full rank data in order to get the MCD estimate of the covariance matrix and the respective matrix of eigenvectors. This is to reduce the potential affect of outliers (Filzmoser, Hron & Reimann, 2009). 
+
+```{r celltype, eval=F}
+CompMatrix <- abs(terre_meta[,61:72]) #Take the absolute value because sometimes extremely small values can be estimated as negative, which is not actually possible for a proportion. 
+rownames(CompMatrix) <- terre_meta$patient
+
+#Because some of the proportions can be estimated to be exactly 0, this is a problem for the log transformation. Therefore, for the values that are 0, we need to add a small offset
+sum(CompMatrix==0) #Are there any proportions predicted to be 0? 
+CompMatrix <- (CompMatrix + 0.001) #If necessary, add the offset of 0.001
+min(CompMatrix) # Cannot be = or < 0
+#0.001
+
+pca_object <- pcaCoDa_NG(CompMatrix)
+summary(pca_object$princompOutputClr)
+#Importance of components:
+#                          Comp.1    Comp.2    Comp.3     Comp.4    Comp.5     Comp.6     Comp.7     Comp.8     Comp.9    Comp.10     Comp.11
+#Standard deviation     0.8038694 0.7795259 0.5723305 0.46423541 0.3926501 0.36836755 0.29143418 0.25731081 0.23049815 0.19366872 0.148334544
+#Proportion of Variance 0.2749117 0.2585135 0.1393529 0.09168509 0.0655894 0.05772779 0.03613293 0.02816685 0.02260253 0.01595663 0.009360667
+#Cumulative Proportion  0.2749117 0.5334252 0.6727781 0.76446321 0.8300526 0.88778040 0.92391332 0.95208017 0.97468270 0.99063933 1.000000000
+
+plot(pca_object$princompOutputClr)
+
+#removing other un-needed cell type estimations (6-cell reference)
+terre_meta <- terre_meta[,-(43:60)]
+
+#add PCs to meta data
+CTP_ilrPCAScores <- as.data.frame(pca_object$scores) #Pull the PC scores out of the pca_object
+CTP_ilrPCAScores$Sample_ID <- rownames(CompMatrix)
+colnames(CTP_ilrPCAScores) <- c("CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4", "CTP_PC5", "CTP_PC6", "CTP_PC7", "CTP_PC8", "CTP_PC9", "CTP_PC10","CTP_PC11","Sample_ID") #Rename your PCs before adding into your methylumi object and to join Sample_ID
+all.equal(as.character(terre_meta$patient), CTP_ilrPCAScores$Sample_ID) #TRUE
+terre_meta <- cbind(terre_meta, CTP_ilrPCAScores[,1:11])
+```
+![Robust PCA for cell type composition](/home1/NEURO/schaffner/1-preprocessing/TERRE/normalized_filtered/celltype_ext2_pca_scree.png)
+6 PCs account for 89% of the variation in cell type composition.
+
+### Genotyping data
+
+Genotyping processing and PCA analysis was conducted by Will Casazza.
+```{r geno, eval=F}
+#adding in genetic ancestry PCs
+ancestry_PCs <- read.table("/home1/NEURO/SHARE_DECIPHER/Genetic_data/terre_ancestry_PCs.txt")
+#match sample IDs
+terre_IDs <- read.table("/home1/NEURO/SHARE_DECIPHER/processed_DNAm_data/sampleInfo_revised/CORRESPONDANCES_terre.txt", header=TRUE)
+ancestry_PCs$ID <- paste(ancestry_PCs$V1, ancestry_PCs$V2, sep="_")
+all(ancestry_PCs$ID %in% terre_IDs$FID_plink) #TRUE
+terre_IDs <- terre_IDs[match(ancestry_PCs$ID, terre_IDs$FID_plink),]
+all.equal(as.character(terre_IDs$FID_plink), ancestry_PCs$ID) #TRUE
+ancestry_PCs$patient <- terre_IDs$patient_TERRE
+
+all(as.character(ancestry_PCs$patient) %in% as.character(terre_meta$patient)) #FALSE
+all(terre_meta$patient %in% ancestry_PCs$patient) #FALSE 
+nrow(terre_meta[-which(terre_meta$patient %in% ancestry_PCs$patient),]) # 12 people don't have genetic data
+meta_sub <- terre_meta[terre_meta$patient %in% ancestry_PCs$patient,]
+ancestry_PCs <- ancestry_PCs[match(meta_sub$patient, ancestry_PCs$patient),]
+all.equal(as.character(ancestry_PCs$patient), as.character(meta_sub$patient)) #TRUE
+
+colnames(ancestry_PCs)[3:22] <- sapply(1:20, function(x) paste("ancestryPC", x, sep=""))
+meta_sub <- cbind(meta_sub, ancestry_PCs[,3:22])
+meta_nogenetic <- terre_meta[-which(terre_meta$patient %in% ancestry_PCs$patient),]
+meta_nogenetic <- cbind(meta_nogenetic, data.frame(ancestryPC1=rep(NA,12), ancestryPC2=rep(NA,12), ancestryPC3=rep(NA,12),ancestryPC4=rep(NA,12),ancestryPC5=rep(NA,12),ancestryPC6=rep(NA,12),ancestryPC7=rep(NA,12),
+                                                   ancestryPC8=rep(NA,12),ancestryPC9=rep(NA,12),ancestryPC10=rep(NA,12),ancestryPC11=rep(NA,12),ancestryPC12=rep(NA,12),ancestryPC13=rep(NA,12),ancestryPC14=rep(NA,12),ancestryPC15=rep(NA,12),ancestryPC16=rep(NA,12),ancestryPC17=rep(NA,12),ancestryPC18=rep(NA,12),ancestryPC19=rep(NA,12),ancestryPC20=rep(NA,12)))
+
+terre_meta <- rbind(meta_sub, meta_nogenetic)
+write.csv(terre_meta, file="~/1-preprocessing/TERRE/normalized_filtered/terre_meta_extcelltypePCs2_ancestryPCs.csv", row.names=F)
+
+#removing individuals without genetic data
+nrow(terre_sub <- terre_meta[complete.cases(terre_meta$ancestryPC1),]) #219 individuals
+write.csv(terre_sub, file="~/1-preprocessing/TERRE/normalized_filtered/terre_meta_extcelltypePCs2_ancestryPCs_complete.csv", row.names=F)
+table(terre_sub$PD, terre_sub$reportedSex)
+#     F  M
+#  0 67 81
+#  1 33 38
+
+#testing correlation of 6 cell type PCs with PD status
+str(terre_sub$PD)
+terre_sub$PD <- as.factor(terre_sub$PD)
+aov_pvals = c(summary(aov(terre_sub$CTP_PC1 ~ terre_sub$PD))[[1]]$'Pr(>F)'[1], summary(aov(terre_sub$CTP_PC2 ~ terre_sub$PD))[[1]]$'Pr(>F)'[1], summary(aov(terre_sub$CTP_PC3 ~ terre_sub$PD))[[1]]$'Pr(>F)'[1], summary(aov(terre_sub$CTP_PC4 ~ terre_sub$PD))[[1]]$'Pr(>F)'[1], summary(aov(terre_sub$CTP_PC5 ~ terre_sub$PD))[[1]]$'Pr(>F)'[1], summary(aov(terre_sub$CTP_PC6 ~ terre_sub$PD))[[1]]$'Pr(>F)'[1])
+names(aov_pvals) <- c("CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4", "CTP_PC5", "CTP_PC6")
+
+sort(aov_pvals)
+#   CTP_PC2    CTP_PC1    CTP_PC3    CTP_PC6    CTP_PC5    CTP_PC4 
+#0.03710728 0.11018689 0.12362537 0.48223594 0.93304755 0.93325547 
+
+aov_padj <- p.adjust(aov_pvals, method="BH")
+sort(aov_padj)
+#  CTP_PC2   CTP_PC1   CTP_PC3   CTP_PC6   CTP_PC4   CTP_PC5 
+#0.2226437 0.2472507 0.2472507 0.7233539 0.9332555 0.9332555 
+
+library(ggpubr)
+terre_sub$PD <- gsub(0, "Control", gsub(1, "Case", terre_sub$PD))
+terre_melt <- melt(terre_sub[,c("reportedSex","PD","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5","CTP_PC6")])
+#Using reportedSex, PD as id variables
+
+#dummy "PD" column to position the label in centre
+padj_df <- data.frame(variable=names(aov_padj), label=paste("ANOVA padj =", round(aov_padj,2),sep=" "), PD=1.5)
+
+png("~/1-preprocessing/TERRE/normalized_filtered/CTP_by_PD.png")
+ggboxplot(terre_melt, y="value", x="PD", add="jitter", facet.by="variable", col="PD") + theme_bw() + theme(axis.text.x=element_text(angle=90)) + geom_text(data=padj_df, aes(label=label), y=Inf, vjust=2) + scale_color_manual(values=c("grey","black")) + theme(axis.title.x=element_blank(), axis.text.x=element_blank())
+dev.off()
+
+ncol(betas <- getBeta(PD_RG_filtered[,sampleNames(PD_RG_filtered) %in% terre_sub$patient])) #219
+```
+
+## Stratifying meta data by sex
+```{r meta sex strat, eval=F}
+nrow(terre_meta_F <- terre_sub[terre_sub$reportedSex=="F",]) #100
+table(terre_meta_F$PD, terre_meta_F$reportedSex)
+#     F  M
+#  0 67  0
+#  1 33  0
+ncol(betas_F <- getBeta(PD_RG_filtered[,sampleNames(PD_RG_filtered) %in% terre_meta_F$patient]))
+#100
+
+nrow(terre_meta_M <- terre_sub[terre_sub$reportedSex=="M",]) #119
+table(terre_meta_M$PD, terre_meta_M$reportedSex)
+#     F  M
+#  0  0 81
+#  1  0 38
+ncol(betas_M <- getBeta(PD_RG_filtered[,sampleNames(PD_RG_filtered) %in% terre_meta_M$Sample_Name]))
+#119
+```
+
+# Testing demographic differences between cases and controls, within each sex
+```{r case-control diff test, eval=F}
+### Females
+meta_F_test <- terre_meta_F[,c(13,3,6,8,9,10,11,20,21,22,23,24,25,26,29,43:54)]
+
+#code ethnicity as numeric for signifiance testing
+meta_F_test$ethnicity <- as.integer(meta_F_test$ethnicity)
+
+case_ctrl_pval <- unlist(sapply(2:ncol(meta_F_test), function(x) {
+  t.test(meta_F_test[meta_F_test$PD==0 & complete.cases(meta_F_test[,x]),x], meta_F_test[meta_F_test$PD==1 & complete.cases(meta_F_test[,x]),x])$p.value 
+  }))
+case_ctrl_padj <- p.adjust(case_ctrl_pval)
+
+meta_F_pvals <- data.frame(variable=colnames(meta_F_test)[2:ncol(meta_F_test)], pval=case_ctrl_pval, padj=case_ctrl_padj)
+meta_F_pvals <- meta_F_pvals %>% arrange(pval)
+meta_F_pvals[meta_F_pvals$pval<=0.2 & complete.cases(meta_F_pvals),]
+#    variable       pval     padj
+#1    NK.ext2 0.01887152 0.471788
+#2  ethnicity 0.08322858 1.000000
+#3 pesticides 0.13965078 1.000000
+#4  Mono.ext2 0.14942559 1.000000
+#5        MMS 0.19493631 1.000000
+
+table(terre_meta_F$PD, terre_meta_F$ethnicity)
+#    Caucasian North_African
+#  0        64             3
+#  1        33             0
+
+table(terre_meta_F$PD, terre_meta_F$pesticides)
+#     0  1  2
+#  0 38 16 10
+#  1 13 12  7
+
+meta_F_test$pesticides <- gsub(0, "None", gsub(1, "Gardening", gsub(2, "Professional", meta_F_test$pesticides)))
+meta_F_test$pesticides <- as.factor(meta_F_test$pesticides)
+meta_F_test$PD <- as.factor(meta_F_test$PD)
+ggplot(meta_F_test, aes(x=pesticides, group=PD, fill=PD)) + geom_bar(stat="count", position=position_dodge()) + scale_fill_manual(values=c("lightpink2","lightpink4")) + theme_bw()
+
+### Males (all Caucasian)
+meta_M_test <- terre_meta_M[,c(13,3,6,8,9,10,11,20,21,22,23,24,25,26,43:54)]
+
+case_ctrl_pval <- unlist(sapply(2:ncol(meta_M_test), function(x) {
+  t.test(meta_M_test[meta_M_test$PD==0 & complete.cases(meta_M_test[,x]),x], meta_M_test[meta_M_test$PD==1 & complete.cases(meta_M_test[,x]),x])$p.value 
+  }))
+case_ctrl_padj <- p.adjust(case_ctrl_pval)
+
+meta_M_pvals <- data.frame(variable=colnames(meta_M_test)[2:ncol(meta_M_test)], pval=case_ctrl_pval, padj=case_ctrl_padj)
+meta_M_pvals <- meta_M_pvals %>% arrange(pval)
+meta_M_pvals[meta_M_pvals$pval<=0.2 & complete.cases(meta_M_pvals),]
+#      variable       pval      padj
+#1          MMS 0.01577869 0.3944673
+#2     Bnv.ext2 0.02123033 0.5095279
+#3     Bas.ext2 0.02655866 0.6108492
+#4      smoking 0.02951826 0.6494018
+#5   CD4nv.ext2 0.03849221 0.8083363
+#6   CD8nv.ext2 0.04667822 0.9335644
+#7     Eos.ext2 0.05897827 1.0000000
+#8          edu 0.06261191 1.0000000
+#9     Neu.ext2 0.09285967 1.0000000
+#10    alcohol1 0.14530985 1.0000000
+#11         bmi 0.17514213 1.0000000
+#12 CD4mem.ext2 0.18628689 1.0000000
+
+table(terre_meta_M$PD, terre_meta_M$pesticides)
+#     0  1  2
+#  0  3  9 60
+#  1  4  3 24
+
+meta_M_test$pesticides <- gsub(0, "None", gsub(1, "Gardening", gsub(2, "Professional", meta_M_test$pesticides)))
+meta_M_test$pesticides <- as.factor(meta_M_test$pesticides)
+meta_M_test$PD <- as.factor(meta_M_test$PD)
+ggplot(meta_M_test, aes(x=pesticides, group=PD, fill=PD)) + geom_bar(stat="count", position=position_dodge()) + scale_fill_manual(values=c("lightsteelblue2","lightsteelblue4")) + theme_bw()
+```
+![TERRE females by PD status and overall pesticide exposure](/home1/NEURO/schaffner/1-preprocessing/TERRE/normalized_filtered/females_by_PD_pesticides.png)
+
+Female controls mainly have no pesticide exposure, while female cases are more split between no exposure and some exposure.
+
+![TERRE males by PD status and overall pesticide exposure](/home1/NEURO/schaffner/1-preprocessing/TERRE/normalized_filtered/males_by_PD_pesticides.png)
+
+Male controls are also more likely than cases to have no pesticide exposure.
+
+# Meta data correlation matrix
+```{r meta data cor, eval=F}
+#Create correlation matrix
+terre_meta_cor <- terre_sub[,-(c(2,18,27,28,30:42,61:65,69:86))]
+str(terre_meta_cor)
+terre_meta_cor$levodopa <- as.integer(terre_meta_cor$levodopa)
+terre_meta_cor$edu <- as.integer(terre_meta_cor$edu)
+terre_meta_cor$reportedSex <- as.integer(terre_meta_cor$reportedSex)
+terre_meta_cor$smoking <- as.integer(terre_meta_cor$smoking)
+terre_meta_cor$pesticides <- as.integer(terre_meta_cor$pesticides)
+terre_meta_cor$head_trauma <- as.integer(terre_meta_cor$head_trauma)
+terre_meta_cor$PD<- as.integer(terre_meta_cor$PD)
+terre_meta_cor$agonist <- as.integer(terre_meta_cor$agonist)
+terre_meta_cor$Sample_Well <- as.integer(as.factor(terre_meta_cor$Sample_Well))
+terre_meta_cor$SentrixBarcode_A <- as.integer(terre_meta_cor$SentrixBarcode_A)
+terre_meta_cor$SentrixPosition_A <- as.integer(as.factor(terre_meta_cor$SentrixPosition_A))
+terre_meta_cor$plate<- as.integer(terre_meta_cor$plate)
+terre_meta_cor$marital <- as.integer(terre_meta_cor$marital)
+terre_meta_cor$alcohol1 <- as.integer(terre_meta_cor$alcohol1)
+terre_meta_cor$ethnicity <- as.integer(terre_meta_cor$ethnicity)
+colnames(terre_meta_cor)[15:16] <- c("chip", "chip_position")
+
+cormat <- correlation_coef_spearman(terre_meta_cor, verbose=FALSE)
+cormat_p <- correlation_pval_spearman(terre_meta_cor, verbose=FALSE)
+
+# Get lower triangle of the correlation matrix
+get_lower_tri<-function(cormat){
+    cormat[upper.tri(cormat)] <- NA
+    return(cormat)
+  }
+# Get upper triangle of the correlation matrix
+get_upper_tri <- function(cormat){
+    cormat[lower.tri(cormat)]<- NA
+    return(cormat)
+  }
+
+upper_tri <- get_upper_tri(cormat)
+upper_tri_p <- get_upper_tri(cormat_p)
+
+#colour if sig
+#for(x in 1:nrow(upper_tri)){
+#  for(y in 1:ncol(upper_tri)){
+#    if(is.na(upper_tri[x,y])==FALSE){
+#    if(as.numeric(upper_tri[x,y])<=0.001){upper_tri[x,y]<-"<=0.001"}else{
+#    if(as.numeric(upper_tri[x,y])<=0.01){upper_tri[x,y]<-"<=0.01"}else{
+#      if(as.numeric(upper_tri[x,y])<=0.05){upper_tri[x,y]<-"<=0.05"}else{upper_tri[x,y]<-">0.05"}}}}
+#  }}
+
+melted_cormat <- reshape2::melt(upper_tri, na.rm = TRUE)
+colnames(melted_cormat)[3] <- "Spearman_rho"
+limit <- max(abs(melted_cormat$Spearman_rho))*c(-1,1)
+
+melted_cormat_p <- reshape2::melt(upper_tri_p, na.rm = TRUE)
+melted_cormat$p.value <- round(melted_cormat_p$value,2)
+
+library(RColorBrewer)
+
+png("~/1-preprocessing/TERRE/meta_cor_terre_06062023.png", width=1200, height=1200)
+ggplot(data = melted_cormat, aes(Var2, Var1, fill = Spearman_rho))+
+ geom_tile(color = "white")+ scale_fill_distiller(palette="RdBu", direction=1, limit=limit) + geom_text(aes(label=p.value)) +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+
+## females only
+terre_meta_F_cor <- terre_meta_F[,-(c(7,27:30,35,41))]
+cormat_F <- correlation_pval(terre_meta_F_cor)
+upper_tri_F <- get_upper_tri(cormat_F)
+upper_tri_F[upper_tri_F=="NaN"] <- NA
+for(x in 1:nrow(upper_tri_F)){
+    for(y in 1:ncol(upper_tri_F)){
+      #print(paste("[",x,",",y,"]",sep=""))
+    if(is.na(upper_tri_F[x,y])==FALSE){
+    if(as.numeric(upper_tri_F[x,y])<=0.001){upper_tri_F[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri_F[x,y])<=0.01){upper_tri_F[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri_F[x,y])<=0.05){upper_tri_F[x,y]<-"<=0.05"}else{upper_tri_F[x,y]<-">0.05"}}}}
+  }}
+melted_cormat_F <- reshape2::melt(upper_tri_F, na.rm = TRUE)
+png("~/1-preprocessing/TERRE/normalized_filtered/meta_cor_terre_F_ext_022023.png", width=1200, height=1200)
+ggplot(data = melted_cormat_F, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+
+## males only
+terre_meta_M_cor <- terre_meta_M[,-(c(7,27:30,35,41))]
+cormat_M <- correlation_pval(terre_meta_M_cor)
+upper_tri_M <- get_upper_tri(cormat_M)
+upper_tri_M[upper_tri_M=="NaN"] <- NA
+for(x in 1:nrow(upper_tri_M)){
+  for(y in 1:ncol(upper_tri_M)){
+    if(is.na(upper_tri_M[x,y])==FALSE){
+    if(as.numeric(upper_tri_M[x,y])<=0.001){upper_tri_M[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri_M[x,y])<=0.01){upper_tri_M[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri_M[x,y])<=0.05){upper_tri_M[x,y]<-"<=0.05"}else{upper_tri_M[x,y]<-">0.05"}}}}
+  }}
+melted_cormat_M <- reshape2::melt(upper_tri_M, na.rm = TRUE)
+png("~/1-preprocessing/TERRE/normalized_filtered/meta_cor_terre_M_ext_022023.png", width=1200, height=1200)
+ggplot(data = melted_cormat_M, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+
+## subset to only batch and sex (for figure)
+colnames(terre_sub)
+terre_meta_cor <- terre_sub[,c(7,19,16,17)]
+str(terre_meta_cor)
+colnames(terre_meta_cor) <- c("Sex", "Plate", "Chip", "Chip_position")
+terre_meta_cor$Sex <- as.factor(terre_meta_cor$Sex)
+terre_meta_cor$Plate <- as.factor(terre_meta_cor$Plate)
+terre_meta_cor$Chip <- as.factor(terre_meta_cor$Chip)
+terre_meta_cor$Chip_position <- as.factor(terre_meta_cor$Chip_position)
+cormat <- correlation_pval(terre_meta_cor)
+upper_tri <- get_upper_tri(cormat)
+
+#colour if sig
+for(x in 1:nrow(upper_tri)){
+  for(y in 1:ncol(upper_tri)){
+    if(is.na(upper_tri[x,y])==FALSE){
+    if(as.numeric(upper_tri[x,y])<=0.001){upper_tri[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri[x,y])<=0.01){upper_tri[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri[x,y])<=0.05){upper_tri[x,y]<-"<=0.05"}else{upper_tri[x,y]<-">0.05"}}}}
+  }}
+melted_cormat <- reshape2::melt(upper_tri, na.rm = TRUE)
+png("~/1-preprocessing/TERRE/meta_cor_terre_sex_batch.png", width=600, height=600)
+ggplot(data = melted_cormat, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1), axis.title.x=element_blank(), axis.title.y=element_blank())+
+ coord_fixed()
+dev.off()
+```
+![Meta data correlation in both sexes](/home1/NEURO/schaffner/1-preprocessing/TERRE/normalized_filtered/meta_cor_terre_ext_022023.png)
+
+![Meta data correlation in females](/home1/NEURO/schaffner/1-preprocessing/TERRE/normalized_filtered/meta_cor_terre_F_ext_022023.png)
+
+
+![Meta data correlation in males](/home1/NEURO/schaffner/1-preprocessing/TERRE/normalized_filtered/meta_cor_terre_M_ext_022023.png)
+## Comparing new and old cell type PCs
+```{r compare PCs, eval=F}
+terre_meta_v1 <- read.csv("~/1-preprocessing/TERRE/normalized_filtered/terre_meta_extcelltypePCs_ancestryPCs_complete2.csv")
+terre_v1_sub <- terre_meta_v1[,grep("CTP_PC", colnames(terre_meta_v1))]
+terre_v2_sub <- terre_sub[,grep("CTP_PC", colnames(terre_sub))]
+terre_v2_sub <- terre_v2_sub[match(rownames(terre_v1_sub),rownames(terre_v2_sub)),]
+all(rownames(terre_v1_sub)==rownames(terre_v2_sub)) #TRUE
+all(colnames(terre_v1_sub)==colnames(terre_v2_sub)) #TRUE
+
+PC_cor <- sapply(1:ncol(terre_v1_sub), function(x) cor(terre_v1_sub[,x], terre_v2_sub[,x]))
+PC_cor_pval <- sapply(1:ncol(terre_v1_sub), function(x) cor.test(terre_v1_sub[,x], terre_v2_sub[,x])$p.value)
+PC_cor <- data.frame(PC=colnames(terre_v1_sub), cor_Pearson=PC_cor, cor_pval=PC_cor_pval)
+PC_cor
+#         PC  cor_Pearson  cor_pval
+#1   CTP_PC1 -0.016739489 0.8058743
+#2   CTP_PC2 -0.012732349 0.8517252
+#3   CTP_PC3 -0.048328434 0.4777827
+#4   CTP_PC4  0.010719607 0.8749551
+#5   CTP_PC5  0.074698533 0.2721588
+#6   CTP_PC6 -0.023512982 0.7299313
+#7   CTP_PC7 -0.049570810 0.4665253
+#8   CTP_PC8  0.005150713 0.9397273
+#9   CTP_PC9  0.100907265 0.1375159
+#10 CTP_PC10 -0.039507381 0.5617848
+#11 CTP_PC11 -0.055306831 0.4164916
+```
+
+# Principal component analysis
+
+Next I'll use PCA to look at sources of variation in the data. This will also guide batch correction with ComBat. Code from Nicole Gladish.
+
+## Pre-PCA set up
+```{r pca setup, eval=F}
+# Here are the arguments you can add (and their defaults): 
+# PCA_Plot(PCA_Object, type = c("All", "Sparse"), nPCs = 10, MTC = F, Discrete = T, label.y_size = 12, label.x_size = 12, angle.x = 30, vjust.x = 0.5)
+# Here is what some arguments do: 
+# type = c("All", "Sparse") - this is to tell it whether your PCA_Object results from a sparse or regular PCA (it does not do it for you it just tells the function what you have).
+# nPCs - how many PCs do you want to plot
+# MTC = F - do you want the associations multiple test corrected? BH is the method I include here
+# Discrete = T, do you want a continuous display of significane values or discrete?
+
+#restructing meta data and subsetting to categorical/continuous
+nrow(terre_sub <- terre_sub[terre_sub$Sample_Name %in% colnames(betas),]) #219
+terre_sub <- terre_sub[match(colnames(betas), terre_sub$Sample_Name),]
+str(terre_sub)
+terre_sub$levodopa <- as.factor(terre_sub$levodopa)
+terre_sub$edu <- as.factor(terre_sub$edu)
+terre_sub$reportedSex <- as.factor(terre_sub$reportedSex)
+terre_sub$smoking <- as.factor(terre_sub$smoking)
+terre_sub$pesticides <- as.factor(terre_sub$pesticides)
+terre_sub$head_trauma <- as.factor(terre_sub$head_trauma)
+terre_sub$PD <- as.factor(terre_sub$PD)
+terre_sub$agonist <- as.factor(terre_sub$agonist)
+terre_sub$SentrixBarcode_A <- as.factor(terre_sub$SentrixBarcode_A)
+terre_sub$plate <- as.factor(terre_sub$plate)
+terre_sub$alcohol1 <- as.factor(terre_sub$alcohol1)
+terre_sub$alochol5 <- as.factor(terre_sub$alcohol5)
+terre_sub$ethnicity <- as.factor(terre_sub$ethnicity)
+terre_sub$marital <- as.factor(terre_sub$marital)
+rownames(terre_sub) <- terre_sub$Sample_Name
+colnames(terre_sub) <- gsub(".ext2", "", colnames(terre_sub))
+
+meta_categorical <- terre_sub[,c("plate", "SentrixBarcode_A", "SentrixPosition_A", "Sample_Well", "reportedSex", "PD", "ethnicity", "levodopa", "agonist", "edu", "smoking", "pesticides", "head_trauma", "marital", "alcohol1", "alcohol5")]
+
+meta_continuous <- terre_sub[,c("age", "age_onset", "dis_duration","MMS", "time_sto", "bmi","alcohol2", "alcohol3", "alcohol4", "Neu", "Eos", "Bas", "Mono", "Bnv", "Bmem", "CD4nv", "CD4mem", "Treg", "CD8nv", "CD8mem", "NK", "CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4", "CTP_PC5", "CTP_PC6","ancestryPC1", "ancestryPC2", "ancestryPC3")]
+
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+```
+
+## PCA on normalized and probe-filtered data
+```{r pca norm, eval=F}
+all.equal(colnames(betas), rownames(meta_categorical)) #TRUE
+
+#PCA on beta values: input
+PCA_full<-princomp(betas[complete.cases(betas),])
+
+PCA_Plot(PCA_full, type="sparse", MTC=T, Discrete=T)
+```
+![PCA on normalized and filtered data - scree](/home1/NEURO/schaffner/1-preprocessing/TERRE/normalized_filtered/PCA_terre_scree_ext2.png)
+
+![PCA on normalized and filtered data - heat map](/home1/NEURO/schaffner/1-preprocessing/TERRE/normalized_filtered/PCA_terre_heat_legend_ext2.png)
+
+## Females PCA
+```{r pca norm F, eval=F}
+#restructing meta data and subsetting to categorical/continuous
+nrow(terre_meta_F <- terre_meta_F[terre_meta_F$Sample_Name %in% colnames(betas_F),]) #100
+terre_meta_F <- terre_meta_F[match(colnames(betas_F), terre_meta_F$Sample_Name),]
+str(terre_meta_F)
+terre_meta_F$levodopa <- as.factor(terre_meta_F$levodopa)
+terre_meta_F$edu <- as.factor(terre_meta_F$edu)
+terre_meta_F$smoking <- as.factor(terre_meta_F$smoking)
+terre_meta_F$pesticides <- as.factor(terre_meta_F$pesticides)
+terre_meta_F$head_trauma <- as.factor(terre_meta_F$head_trauma)
+terre_meta_F$PD <- as.factor(terre_meta_F$PD)
+terre_meta_F$agonist <- as.factor(terre_meta_F$agonist)
+terre_meta_F$SentrixBarcode_A <- as.factor(terre_meta_F$SentrixBarcode_A)
+terre_meta_F$plate <- as.factor(terre_meta_F$plate)
+terre_meta_F$alcohol1 <- as.factor(terre_meta_F$alcohol1)
+terre_meta_F$alcohol5 <- as.factor(terre_meta_F$alcohol5)
+terre_meta_F$ethnicity <- as.factor(terre_meta_F$ethnicity)
+terre_meta_F$marital <- as.factor(terre_meta_F$marital)
+rownames(terre_meta_F) <- terre_meta_F$Sample_Name
+
+meta_categorical <- terre_meta_F[,c("plate", "SentrixBarcode_A", "SentrixPosition_A", "Sample_Well", "PD", "ethnicity", "levodopa", "agonist", "edu", "smoking", "pesticides", "head_trauma", "marital", "alcohol1","alcohol5")]
+
+meta_continuous <- terre_meta_F[,c("age", "age_onset", "dis_duration","MMS", "time_sto", "bmi","Neu.ext2", "Eos.ext2", "Bas.ext2", "Mono.ext2", "Bnv.ext2", "Bmem.ext2", "CD4nv.ext2", "CD4mem.ext2", "Treg.ext2", "CD8nv.ext2", "CD8mem.ext2", "NK.ext2", "CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4", "CTP_PC5", "CTP_PC6","CTP_PC7","ancestryPC1", "ancestryPC2", "ancestryPC3", "ancestryPC4", "ancestryPC5")]
+
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+
+all.equal(colnames(betas_F), rownames(terre_meta_F)) #TRUE
+
+#PCA on beta values: input
+PCA_full<-princomp(betas_F[complete.cases(betas_F),])
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)
+```
+![PCA scree plot for females: normalized, uncorrected data](/home1/NEURO/schaffner/1-preprocessing/TERRE/normalized_filtered/PCA_terre_F_scree_ext2.png)
+
+![PCA heat map for females: normalized, uncorrected data](/home1/NEURO/schaffner/1-preprocessing/TERRE/normalized_filtered/PCA_terre_F_heat_legend_ext2.png)
+
+## Males PCA
+```{r pca norm M, eval=F}
+#restructing meta data and subsetting to categorical/continuous
+nrow(terre_meta_M <- terre_meta_M[terre_meta_M$Sample_Name %in% colnames(betas_M),]) #119
+terre_meta_M <- terre_meta_M[match(colnames(betas_M), terre_meta_M$Sample_Name),]
+str(terre_meta_M)
+terre_meta_M$levodopa <- as.factor(terre_meta_M$levodopa)
+terre_meta_M$edu <- as.factor(terre_meta_M$edu)
+terre_meta_M$smoking <- as.factor(terre_meta_M$smoking)
+terre_meta_M$pesticides <- as.factor(terre_meta_M$pesticides)
+terre_meta_M$head_trauma <- as.factor(terre_meta_M$head_trauma)
+terre_meta_M$PD <- as.factor(terre_meta_M$PD)
+terre_meta_M$agonist <- as.factor(terre_meta_M$agonist)
+terre_meta_M$SentrixBarcode_A <- as.factor(terre_meta_M$SentrixBarcode_A)
+terre_meta_M$plate <- as.factor(terre_meta_M$plate)
+terre_meta_M$alcohol1 <- as.factor(terre_meta_M$alcohol1)
+terre_meta_M$alcohol5 <- as.factor(terre_meta_M$alcohol5)
+terre_meta_M$ethnicity <- as.factor(terre_meta_M$ethnicity)
+terre_meta_M$marital <- as.factor(terre_meta_M$marital)
+rownames(terre_meta_M) <- terre_meta_M$Sample_Name
+
+#excluding ethnicity (all men are caucasian)
+meta_categorical <- terre_meta_M[,c("plate", "SentrixBarcode_A", "SentrixPosition_A", "Sample_Well", "PD", "levodopa", "agonist", "edu", "smoking", "pesticides", "head_trauma", "marital", "alcohol1", "alcohol5")]
+
+meta_continuous <- terre_meta_M[,c("age", "age_onset", "dis_duration","MMS", "time_sto", "bmi","alcohol2","alcohol3","alcohol4","Neu.ext2", "Eos.ext2", "Bas.ext2", "Mono.ext2", "Bnv.ext2", "Bmem.ext2", "CD4nv.ext2", "CD4mem.ext2", "Treg.ext2", "CD8nv.ext2", "CD8mem.ext2", "NK.ext2", "CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4", "CTP_PC5","CTP_PC6","CTP_PC7", "ancestryPC1", "ancestryPC2", "ancestryPC3", "ancestryPC4", "ancestryPC5")]
+
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+
+all.equal(colnames(betas_M), rownames(terre_meta_M)) #TRUE
+
+#PCA on beta values: input
+PCA_Full<-princomp(betas_M[complete.cases(betas_M),])
+PCA_Plot(PCA_Full, type="Sparse", MTC=T, Discrete=T)
+```
+![PCA scree plot for males: normalized, uncorrected data](/home1/NEURO/schaffner/1-preprocessing/TERRE/normalized_filtered/PCA_terre_M_scree_ext2.png)
+
+![PCA heat map for males: normalized, uncorrected data](/home1/NEURO/schaffner/1-preprocessing/TERRE/normalized_filtered/PCA_terre_M_heat_legend_ext2.png)
+
+## Checking sex balancing by batch
+
+Amy Inkster advised that if sex is balanced across batches, this step can be applied on all the data. 
+
+```{r sex by batch, eval=F}
+table(terre_sub$reportedSex, terre_sub$plate)
+#     5  6  7  8  9
+#  F  9 36 31 19  5
+#  M  0  0 25 55 39
+
+table(terre_sub$reportedSex, terre_sub$SentrixBarcode_A)
+#about half of chips have one sex
+
+table(terre_sub$reportedSex, terre_sub$SentrixPosition_A)
+#    R01C01 R02C01 R03C01 R04C01 R05C01 R06C01 R07C01 R08C01
+#  F     15     15     14      9      9     17     12      9
+#  M     18     16     16     13     13     17     15     11
+
+table(terre_sub$reportedSex, terre_sub$Sample_Well)
+#    A01 A02 A03 A04 A05 A06 A07 A08 A09 A10 A11 A12 B01 B02 B03 B04 B05 B06 B07 B08 B09 B10 B11 B12 C01 C02 C03 C04 C05 C06
+#  F   1   0   0   2   0   0   1   2   2   3   2   2   1   0   1   2   0   0   1   2   2   3   1   2   1   0   0   1   0   0
+#  M   1   2   1   1   2   3   2   1   1   1   2   1   1   2   0   1   2   2   2   2   1   1   2   0   1   2   1   1   2   2
+#   
+#    C07 C08 C09 C10 C11 C12 D01 D02 D03 D04 D06 D07 D08 D09 D10 D11 D12 E01 E02 E03 E04 E05 E06 E07 E08 E09 E10 E11 E12 F01
+#  F   1   2   2   3   2   2   0   2   0   0   1   1   2   0   2   1   0   2   1   0   0   0   2   1   0   1   1   1   0   3
+#  M   2   1   0   1   2   1   2   1   1   1   0   2   2   1   1   1   1   1   1   1   1   1   1   2   3   0   0   0   2   1
+#   
+#    F02 F03 F04 F05 F06 F07 F08 F09 F10 F11 F12 G01 G02 G03 G04 G05 G06 G07 G08 G09 G10 G11 G12 H02 H03 H04 H05 H06 H07 H08
+#  F   3   0   2   2   1   0   0   2   1   2   1   3   0   0   2   2   1   0   0   2   1   0   1   0   0   2   3   1   0   0
+#  M   1   3   2   1   3   2   2   0   0   0   2   0   1   3   2   0   3   2   1   0   1   2   0   1   2   1   0   2   1   1
+#   
+#    H09 H10 H11 H12
+#  F   1   0   0   2
+#  M   0   1   2   0
+```

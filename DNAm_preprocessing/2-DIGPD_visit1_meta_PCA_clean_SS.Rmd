@@ -1,0 +1,510 @@
+---
+itle: "DIGPD_visit1_plots"
+author: "SS"
+date: "09/02/2022"
+output:
+  html_document:
+    df_print: paged
+  rmdformats::readthedown:
+    fig_caption: yes
+    gallery: no
+    highlight: kate
+    lightbox: yes
+    self_contained: yes
+    thumbnails: no
+---
+DIGPD PreProcessing and Normalization
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: Sept 4, 2022
+
+The *DIGPD* cohort (n=332 cases and n=190 controls) is a longitudinal study of individuals who developed sporadic PD, with follow-up up to 6 years after diagnosis. All PD cases in the first timepoint have a disease duration of 2 years or less. We are performing this study in collaboration with r. Alexis Elbaz, Dr. Alexis Brice, and Dr. Jean-Christophe Corvol. EPIC arrays were run in Paris, France on bisulfite-converted DNA samples extracted from whole blood. We were provided with idat files for preprocessing and analysis.
+
+The data was re-processed in Aug-Sept 2022 (see DIGPD_funnorm_082022.Rmd). Here I am subsetting the data to the first visit to assess meta data correlations and PCA within the portion we'll be comparing to TERRE.
+
+Update June 6, 2023: Using Spearman's correlation and including correlation coefficient in heat maps.
+
+### Libraries and outside functions
+```{r results='hide', warning=FALSE, message=FALSE, eval=F}
+setwd("~/")
+library(sva)
+library(Metrics)
+library(methylumi)
+library(dendextend)
+library(locfdr)
+library(gplots)
+library(lattice)
+#library(wateRmelon) #problem with lumi, can't load wateRmelon
+library("RColorBrewer")
+library(plyr)
+library(VennDiagram)
+library(ggplot2)
+library(qvalue)
+library("sva")
+library(parallel)
+library(gridExtra)
+library(grid)
+library("reshape2")
+library("corrplot")
+library(rgr)
+library(viridis)
+#library(lumi) #can't load
+library(missMethyl)
+library(hydroGOF)
+library(quadprog)
+library(genefilter)
+library(matrixStats)
+library(limma)
+library(FlowSorted.Blood.450k)
+library(FlowSorted.Blood.EPIC)
+library(ewastools)
+library(ggrepel)
+library(conumee)
+library(doParallel)
+library(ggplotify)
+library(cowplot)
+library(ggpubr)
+#library(tidyverse)
+#library(robCompositions)
+
+#custom functions
+source("~/kobor_shared_coding_resource/PCA_Plot_Function.R")
+source("~/kobor_shared_coding_resource/correlation_pval.R") #modified slightly so that corr between perfectly confounded variables (PD with dis_duration and age_onset) is 0; also made function verbose
+source("/home1/NEURO/schaffner/kobor_shared_coding_resource/pcaCoDa_NG.R")
+source("~/kobor_shared_coding_resource/correlation_coef_Spearman.R")
+source("~/kobor_shared_coding_resource/correlation_pval_Spearman.R")
+```
+
+## Load data 
+```{r load data, eval=F}
+load("~/preprocessing/DIGPD/082022/DIGPD_RG_filtered.RData")
+digpd_meta <- read.csv("~/preprocessing/DIGPD/082022/digpd_meta_cellprop.csv")
+unique(digpd_meta$visite) #[1]  1  4  2  6 NA
+
+nrow(visit1 <- digpd_meta[-which(digpd_meta$visite>1),]) #278
+unique(visit1$visite) #[1]  1 NA
+table(visit1$reportedSex, visit1$PD)
+#     0  1
+#  F 59 53
+#  M 79 87
+```
+
+## Add genotyping and cell type PCs
+
+### Robust PCA of cell type data
+
+This code was written by Dr. Sarah Merrill.
+  
+Compositional data is unique, and as such, cannot be easily used in ANCOVAs, linear regressions, or Principle Components Analysis (PCA) due to breaking necessary assumptions - specifically the assumptions of independence and little multicolinearity. Compositional data are strictly positive and multivariate that are constrained to have a unit sum (Aitchison, 1982). Therefore, predicted cell type proportions using reference methods like Houseman et al. (2012) are compositional data. 
+
+With compositional data, you can perform a PCA of the orthonormal relative structure (isometric logratio transformation) of the proportions instead of the values of their original components to create linearly uncorrelated variables to include in your standard model (Filzmoser, Hron & Reimann, 2009). This approach uses the principles of compositional data (scale invariance, subcompositional coherence, and permutation invariance) to maintain relative distances among the components. PCA is then performed to reduce data into the variability in the relative distances among the cell type proportions. 
+
+The Robust PCA method for compositional data also uses Minimum Covariance Determinant (MCD) estimators of location and covariance inquire ILR coordinates to obtain full rank data in order to get the MCD estimate of the covariance matrix and the respective matrix of eigenvectors. This is to reduce the potential affect of outliers (Filzmoser, Hron & Reimann, 2009). 
+
+```{r celltype, eval=F}
+CompMatrix <- abs(visit1[,c("CD8T","CD4T","NK","Bcell","Mono","Neu")]) #Take the absolute value because sometimes extremely small values can be estimated as negative, which is not actually possible for a proportion. 
+rownames(CompMatrix) <- visit1$Sample_Name
+
+#Because some of the proportions can be estimated to be exactly 0, this is a problem for the log transformation. Therefore, for the values that are 0, we need to add a small offset
+sum(CompMatrix==0) #Are there any proportions predicted to be 0? 0
+#CompMatrix <- (CompMatrix + 0.001) #If necessary, add the offset of 0.001
+min(CompMatrix) # Cannot be = or < 0
+#0.008769571
+
+pca_object <- pcaCoDa_NG(CompMatrix)
+summary(pca_object$princompOutputClr)
+#Importance of components:
+#                          Comp.1    Comp.2    Comp.3    Comp.4    Comp.5
+#Standard deviation     0.4648532 0.3943863 0.3231909 0.2853494 0.2562922
+#Proportion of Variance 0.3467450 0.2495871 0.1676088 0.1306569 0.1054021
+#Cumulative Proportion  0.3467450 0.5963321 0.7639409 0.8945979 1.0000000
+
+plot(pca_object$princompOutputClr)
+
+CTP_ilrPCAScores <- as.data.frame(pca_object$scores) #Pull the PC scores out of the pca_object
+CTP_ilrPCAScores$Sample_ID <- rownames(CompMatrix)
+colnames(CTP_ilrPCAScores) <- c("CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4", "CTP_PC5", "Sample_ID") #Rename your PCs before adding into your methylumi object and to join Sample_ID
+all.equal(as.character(visit1$Sample_Name), CTP_ilrPCAScores$Sample_ID) #TRUE
+visit1 <- cbind(visit1, CTP_ilrPCAScores[,1:5])
+```
+![Robust PCA for cell type composition](/home1/NEURO/schaffner/preprocessing/DIGPD/082022/celltype_pca_scree.png)
+### Genotyping data
+
+Genotyping processing and PCA analysis was conducted by Will Casazza.
+```{r geno, eval=F}
+#adding in genetic ancestry PCs
+ancestry_PCs <- read.table("/home1/NEURO/SHARE_DECIPHER/Genetic_data/digpd_ancestry_PCs.txt", header=TRUE)
+length(ancestry_PCs$FID[complete.cases(ancestry_PCs$FID)]) #255 subjects with ancestry PCs
+
+#match sample IDs for cases
+DIGPD_IDs_cases <- read.table("/home1/NEURO/SHARE_DECIPHER/processed_DNAm_data/sampleInfo_revised/CORRESPONDANCES_digpd_cases.txt", header=TRUE)
+length(DIGPD_IDs_cases$FID_plink_file[complete.cases(DIGPD_IDs_cases$FID_plink_file)]) #152 cases with genetic data
+DIGPD_IDs_ctrls <- read.table("/home1/NEURO/SHARE_DECIPHER/processed_DNAm_data/sampleInfo_revised/CORRESPONDANCES_digpd_controls.txt", header=TRUE)
+length(DIGPD_IDs_ctrls$FID_plink[complete.cases(DIGPD_IDs_ctrls$FID_plink)]) #135 controls with genetic data
+colnames(DIGPD_IDs_ctrls) <- colnames(DIGPD_IDs_cases) #the columns contain the same information in same order but are named differently
+DIGPD_IDs <- rbind(DIGPD_IDs_cases, DIGPD_IDs_ctrls)
+length(DIGPD_IDs$FID_plink_file[complete.cases(DIGPD_IDs$FID_plink_file)]) #287 subjects
+length(DIGPD_IDs$patient_DIGPD_cases[complete.cases(DIGPD_IDs$patient_DIGPD_cases)]) #287 subjects
+
+#There are more individuals in the raw genetic data than ancestry PCs file, indicating some individuals were likely removed by Will during genetic data QC
+#check if all individuals with ancestry info are in the DIGPD_IDs dataframe
+all(ancestry_PCs$FID %in% DIGPD_IDs$FID_plink_file) #FALSE
+all(as.character(ancestry_PCs$FID) %in% as.character(DIGPD_IDs$FID_plink_file)) #FALSE
+length(ancestry_PCs$FID[-which(ancestry_PCs$FID %in% DIGPD_IDs$FID_plink_file)]) #128 are missing
+head(ancestry_PCs$FID[-which(ancestry_PCs$FID %in% DIGPD_IDs$FID_plink_file)]) #[1] PAL_88  PAL_89  PAL_220 PAL_332 PAL_463 PAL_555
+
+#checking the data frames, DIGPD_IDs has the "PAL_88" naming convention repeated (i.e. "PAL_88_PAL_88")
+#make this the same for ancestry PCs data frame
+ancestry_PCs$FID <- as.character(ancestry_PCs$FID)
+ancestry_PCs$FID <- sapply(1:nrow(ancestry_PCs), function(x){
+  if(length(grep("PAL", ancestry_PCs$FID[x]))>0){ return(paste(ancestry_PCs$FID[x], ancestry_PCs$FID[x], sep="_")) }
+  else { return(ancestry_PCs$FID[x]) }
+})
+all(ancestry_PCs$FID %in% DIGPD_IDs$FID_plink_file) #TRUE
+
+dim(DIGPD_IDs <- DIGPD_IDs[match(ancestry_PCs$FID, DIGPD_IDs$FID_plink_file),]) #255 subjects
+dim(ancestry_PCs <- ancestry_PCs[match(DIGPD_IDs$FID_plink_file, ancestry_PCs$FID),]) #255 subjects
+all(ancestry_PCs$FID %in% DIGPD_IDs$FID_plink_file) #TRUE
+all(DIGPD_IDs$FID_plink_file %in% ancestry_PCs$FID) #TRUE
+ancestry_PCs$patient <- DIGPD_IDs$patient_DIGPD_cases
+
+length(ancestry_PCs$patient[ancestry_PCs$patient %in% visit1$patient]) #229 (missing 26)
+ancestry_PCs$patient[-which(ancestry_PCs$patient %in% visit1$patient)] #these were removed during DNAm QC
+# [1] 01010GM  01075RM  01082PP  01177CA  01194LY  01243LE  01246CL  01351LF  01352LP  01389CJ  T-718-13 T-358-13 T-358-25
+#[14] T-84-3   T-814-6  T-814-40 T-872-7  T-209-12 T-23-7   T-59-11  T-796-7  T-171-8  T-113-1  T-121-1  T-2754-2 T-20-1  
+
+#subset DNAm metadata to those with genetic data, and subset ancestry PCs to those with DNAm data
+visit1_sub <- visit1[visit1$patient %in% ancestry_PCs$patient,]
+ancestry_PCs <- ancestry_PCs[match(visit1_sub$patient, ancestry_PCs$patient),]
+all.equal(as.character(ancestry_PCs$patient), as.character(visit1_sub$patient)) #TRUE
+
+colnames(ancestry_PCs)[3:12] <- sapply(1:10, function(x) paste("ancestryPC", x, sep=""))
+visit1_sub <- cbind(visit1_sub, ancestry_PCs[,3:12])
+
+#adding back in individuals with DNAm data but no genetic data; putting ancestry PCs as null entries
+meta_nogenetic <- visit1[-which(visit1$patient %in% ancestry_PCs$patient),]
+nrow(meta_nogenetic) #49
+meta_nogenetic <- cbind(meta_nogenetic, data.frame(ancestryPC1=rep(NA,49), ancestryPC2=rep(NA,49), ancestryPC3=rep(NA,49),ancestryPC4=rep(NA,49),ancestryPC5=rep(NA,49),ancestryPC6=rep(NA,49),ancestryPC7=rep(NA,49),
+                                                   ancestryPC8=rep(NA,49),ancestryPC9=rep(NA,49),ancestryPC10=rep(NA,49)))
+
+visit1 <- rbind(visit1_sub, meta_nogenetic)
+
+### familial mutation information
+DIGPD_mut <- read.delim("~/TERRE_DIGPD_LRRK2_GBA_mut/DIGPD_cases_mutation.txt")
+DIGPD_corresp <- read.delim("/home1/NEURO/SHARE_DECIPHER/sampleInfo_revised/CORRESPONDANCES_digpd_cases.txt")
+all(DIGPD_mut$id %in% DIGPD_corresp$FID_plink_file) #TRUE
+GBA_patients <- DIGPD_corresp[DIGPD_corresp$FID_plink_file %in% DIGPD_mut[DIGPD_mut$GBA==1,"id"],] #5
+LRRK2_patients <- DIGPD_corresp[DIGPD_corresp$FID_plink_file %in% DIGPD_mut[DIGPD_mut$LRRK2==1,"id"],] #2
+
+all(GBA_patients$patient_DIGPD_cases %in% visit1$patient) #TRUE
+all(LRRK2_patients$patient_DIGPD_cases %in% visit1$patient) #TRUE
+
+visit1$GBA_E326K <- 0
+visit1[visit1$patient %in% GBA_patients$patient_DIGPD_cases,"GBA_E326K"] <- 1
+visit1$LRRK2_G2019S <- 0
+visit1[visit1$patient %in% LRRK2_patients$patient_DIGPD_cases,"LRRK2_G2019S"] <- 1
+
+write.csv(visit1, file="~/preprocessing/DIGPD/082022/digpd_meta_visit1_celltypePCs_ancestryPCs.csv")
+
+#removing individuals with familial mutations, individuals without genetic data
+nrow(visit1_sub <- visit1[complete.cases(visit1$ancestryPC1) & visit1$GBA_E326K==0 & visit1$LRRK2_G2019S==0,]) #222 individuals
+write.csv(visit1_sub, file="~/preprocessing/DIGPD/082022/digpd_meta_visit1_celltypePCs_ancestryPCs_nomut.csv")
+table(visit1_sub$PD, visit1_sub$reportedSex)
+#     F  M
+#  0 46 66
+#  1 47 63
+
+ncol(betas <- getBeta(DIGPD_RG_filtered[,sampleNames(DIGPD_RG_filtered) %in% visit1_sub$Sample_Name])) #222
+```
+
+## Stratifying meta data by sex
+```{r meta sex strat, eval=F}
+nrow(visit1_F <- visit1_sub[visit1_sub$reportedSex=="F",]) #93
+table(visit1_F$visite, visit1_F$reportedSex)
+#     F  M
+#  1 47  0
+summary(as.factor(visit1_F$PD))
+# 0  1 
+#46 47 
+ncol(betas_F <- getBeta(DIGPD_RG_filtered[,sampleNames(DIGPD_RG_filtered) %in% visit1_F$Sample_Name]))
+#93
+
+nrow(visit1_M <- visit1_sub[visit1_sub$reportedSex=="M",]) #129
+table(visit1_M$visite, visit1_M$reportedSex)
+#     F  M
+#  1  0 63
+summary(as.factor(visit1_M$PD))
+# 0  1 
+#66 63
+ncol(betas_M <- getBeta(DIGPD_RG_filtered[,sampleNames(DIGPD_RG_filtered) %in% visit1_M$Sample_Name]))
+#129
+```
+
+# Meta data correlation matrix
+```{r meta data cor, eval=F}
+#Create correlation matrix
+visit1_cor <- visit1_sub[,-(c(1,3,23,24,26:36,47,51:59))]
+colnames(visit1_cor)[19:20] <- c("chip","chip_position")
+str(visit1_cor)
+visit1_cor$reportedSex <- as.integer(as.factor(visit1_cor$reportedSex))
+visit1_cor$ethnicity <- as.integer(as.factor(visit1_cor$ethnicity))
+visit1_cor$Sample_Well <- as.integer(as.factor(visit1_cor$Sample_Well))
+visit1_cor$chip_position <- as.integer(as.factor(visit1_cor$chip_position))
+
+cormat <- correlation_coef_spearman(visit1_cor, verbose=FALSE)
+cormat_p <- correlation_pval_spearman(visit1_cor, verbose=FALSE)
+
+# Get lower triangle of the correlation matrix
+get_lower_tri<-function(cormat){
+    cormat[upper.tri(cormat)] <- NA
+    return(cormat)
+  }
+# Get upper triangle of the correlation matrix
+get_upper_tri <- function(cormat){
+    cormat[lower.tri(cormat)]<- NA
+    return(cormat)
+  }
+
+upper_tri <- get_upper_tri(cormat)
+upper_tri_p <- get_upper_tri(cormat_p)
+
+#colour if sig
+#for(x in 1:nrow(upper_tri)){
+#  for(y in 1:ncol(upper_tri)){
+#    if(is.na(upper_tri[x,y])==FALSE){
+#    if(as.numeric(upper_tri[x,y])<=0.001){upper_tri[x,y]<-"<=0.001"}else{
+#    if(as.numeric(upper_tri[x,y])<=0.01){upper_tri[x,y]<-"<=0.01"}else{
+#      if(as.numeric(upper_tri[x,y])<=0.05){upper_tri[x,y]<-"<=0.05"}else{upper_tri[x,y]<-">0.05"}}}}
+#  }}
+
+melted_cormat <- reshape2::melt(upper_tri, na.rm = TRUE)
+colnames(melted_cormat)[3] <- "Spearman_rho"
+limit <- max(abs(melted_cormat$Spearman_rho))*c(-1,1)
+
+melted_cormat_p <- reshape2::melt(upper_tri_p, na.rm = TRUE)
+melted_cormat$p.value <- round(melted_cormat_p$value,2)
+
+library(RColorBrewer)
+
+png("~/1-preprocessing/DIGPD/meta_cor_visit1_06062023.png", width=900, height=900)
+ggplot(data = melted_cormat, aes(Var2, Var1, fill = Spearman_rho))+
+ geom_tile(color = "white")+ scale_fill_distiller(palette="RdBu", direction=1, limit=limit) + geom_text(aes(label=p.value)) +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+
+## females only
+visit1_F_cor <- visit1_F[,-(c(3,22,25,27,32,33,34,57,58))]
+cormat_F <- correlation_pval(visit1_F_cor)
+upper_tri_F <- get_upper_tri(cormat_F)
+for(x in 1:nrow(upper_tri_F)){
+  for(y in 1:ncol(upper_tri_F)){
+    if(is.na(upper_tri_F[x,y])==FALSE){
+    if(as.numeric(upper_tri_F[x,y])<=0.001){upper_tri_F[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri_F[x,y])<=0.01){upper_tri_F[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri_F[x,y])<=0.05){upper_tri_F[x,y]<-"<=0.05"}else{upper_tri_F[x,y]<-">0.05"}}}}
+  }}
+melted_cormat_F <- reshape2::melt(upper_tri_F, na.rm = TRUE)
+png("~/preprocessing/DIGPD/082022/meta_cor_visit1_F_092022.png", width=900, height=900)
+ggplot(data = melted_cormat_F, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+
+## males only
+visit1_M_cor <- visit1_M[,-(c(3,22,25,27,32,33,34,57,58))]
+cormat_M <- correlation_pval(visit1_M_cor)
+upper_tri_M <- get_upper_tri(cormat_M)
+for(x in 1:nrow(upper_tri_M)){
+  for(y in 1:ncol(upper_tri_M)){
+    if(is.na(upper_tri_M[x,y])==FALSE){
+    if(as.numeric(upper_tri_M[x,y])<=0.001){upper_tri_M[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri_M[x,y])<=0.01){upper_tri_M[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri_M[x,y])<=0.05){upper_tri_M[x,y]<-"<=0.05"}else{upper_tri_M[x,y]<-">0.05"}}}}
+  }}
+melted_cormat_M <- reshape2::melt(upper_tri_M, na.rm = TRUE)
+png("~/preprocessing/DIGPD/082022/meta_cor_visit1_M_092022.png", width=900, height=900)
+ggplot(data = melted_cormat_M, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+```
+![Meta data correlation in both sexes](/home1/NEURO/schaffner/preprocessing/DIGPD/082022/meta_cor_visit1_092022.png)
+
+![Meta data correlation in females](/home1/NEURO/schaffner/preprocessing/DIGPD/082022/meta_cor_visit1_F_092022.png)
+
+
+![Meta data correlation in males](/home1/NEURO/schaffner/preprocessing/DIGPD/082022/meta_cor_visit1_M_092022.png)
+
+
+# Principal component analysis
+
+Next I'll use PCA to look at sources of variation in the data. This will also guide batch correction with ComBat. Code from Nicole Gladish.
+
+## Pre-PCA set up
+```{r pca setup, eval=F}
+# Here are the arguments you can add (and their defaults): 
+# PCA_Plot(PCA_Object, type = c("All", "Sparse"), nPCs = 10, MTC = F, Discrete = T, label.y_size = 12, label.x_size = 12, angle.x = 30, vjust.x = 0.5)
+# Here is what some arguments do: 
+# type = c("All", "Sparse") - this is to tell it whether your PCA_Object results from a sparse or regular PCA (it does not do it for you it just tells the function what you have).
+# nPCs - how many PCs do you want to plot
+# MTC = F - do you want the associations multiple test corrected? BH is the method I include here
+# Discrete = T, do you want a continuous display of significane values or discrete?
+
+#restructing meta data and subsetting to categorical/continuous
+nrow(visit1_sub <- visit1_sub[visit1_sub$Sample_Name %in% colnames(betas),]) #222
+visit1_sub <- visit1_sub[match(colnames(betas), visit1_sub$Sample_Name),]
+str(visit1_sub)
+visit1_sub$levodopa <- as.factor(visit1_sub$levodopa)
+visit1_sub$edu <- as.factor(visit1_sub$edu)
+visit1_sub$reportedSex <- as.factor(visit1_sub$reportedSex)
+visit1_sub$smoking <- as.factor(visit1_sub$smoking)
+visit1_sub$pesticides <- as.factor(visit1_sub$pesticides)
+visit1_sub$head_trauma <- as.factor(visit1_sub$head_trauma)
+visit1_sub$PD <- as.factor(visit1_sub$PD)
+visit1_sub$agonist <- as.factor(visit1_sub$agonist)
+visit1_sub$SentrixBarcode_A <- as.factor(visit1_sub$SentrixBarcode_A)
+visit1_sub$plate <- as.factor(visit1_sub$plate)
+visit1_sub$alcohol <- as.factor(visit1_sub$alcohol)
+visit1_sub$ethnicity <- as.factor(visit1_sub$ethnicity)
+visit1_sub$marital <- as.factor(visit1_sub$marital)
+rownames(visit1_sub) <- visit1_sub$Sample_Name
+
+meta_categorical <- visit1_sub[,c("plate", "SentrixBarcode_A", "SentrixPosition_A", "Sample_Well", "reportedSex", "PD", "ethnicity", "levodopa", "agonist", "edu", "smoking", "pesticides", "head_trauma", "marital", "alcohol")]
+
+meta_continuous <- visit1_sub[,c("Age", "age_onset", "dis_duration","MMS", "time_sto", "bmi","CD8T", "CD4T", "NK", "Bcell", "Mono", "Neu", "CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4", "CTP_PC5", "ancestryPC1", "ancestryPC2", "ancestryPC3", "ancestryPC4", "ancestryPC5")]
+
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+```
+
+## PCA on normalized and probe-filtered data
+```{r pca norm, eval=F}
+all.equal(colnames(betas), rownames(meta_categorical)) #TRUE
+
+#PCA on beta values: input
+PCA_full<-princomp(betas[complete.cases(betas),])
+
+PCA_Plot(PCA_full, type="sparse", MTC=T, Discrete=T)
+```
+![PCA on normalized and filtered data - scree](/home1/NEURO/schaffner/preprocessing/DIGPD/082022/PCA_visit1_scree.png)
+
+![PCA on normalized and filtered data - heat map](/home1/NEURO/schaffner/preprocessing/DIGPD/082022/PCA_visit1_heat_legend.png)
+
+## Females PCA
+```{r pca norm F, eval=F}
+#restructing meta data and subsetting to categorical/continuous
+nrow(visit1_F <- visit1_F[visit1_F$Sample_Name %in% colnames(betas_F),]) #93
+visit1_F <- visit1_F[match(colnames(betas_F), visit1_F$Sample_Name),]
+str(visit1_F)
+visit1_F$levodopa <- as.factor(visit1_F$levodopa)
+visit1_F$edu <- as.factor(visit1_F$edu)
+visit1_F$smoking <- as.factor(visit1_F$smoking)
+visit1_F$pesticides <- as.factor(visit1_F$pesticides)
+visit1_F$head_trauma <- as.factor(visit1_F$head_trauma)
+visit1_F$PD <- as.factor(visit1_F$PD)
+visit1_F$agonist <- as.factor(visit1_F$agonist)
+visit1_F$SentrixBarcode_A <- as.factor(visit1_F$SentrixBarcode_A)
+visit1_F$plate <- as.factor(visit1_F$plate)
+visit1_F$alcohol <- as.factor(visit1_F$alcohol)
+visit1_F$ethnicity <- as.factor(visit1_F$ethnicity)
+visit1_F$marital <- as.factor(visit1_F$marital)
+rownames(visit1_F) <- visit1_F$Sample_Name
+
+meta_categorical <- visit1_F[,c("plate", "SentrixBarcode_A", "SentrixPosition_A", "Sample_Well", "PD", "ethnicity", "levodopa", "agonist", "edu", "smoking", "pesticides", "head_trauma", "marital", "alcohol")]
+
+meta_continuous <- visit1_F[,c("Age", "age_onset", "dis_duration","MMS", "time_sto", "bmi","CD8T", "CD4T", "NK", "Bcell", "Mono", "Neu", "CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4", "CTP_PC5", "ancestryPC1", "ancestryPC2", "ancestryPC3", "ancestryPC4", "ancestryPC5")]
+
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+
+all.equal(colnames(betas_F), rownames(visit1_F)) #TRUE
+
+#PCA on beta values: input
+PCA_full<-princomp(betas_F[complete.cases(betas_F),])
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)
+```
+![PCA scree plot for females: normalized, uncorrected data](/home1/NEURO/schaffner/preprocessing/DIGPD/082022/PCA_visit1_F_scree.png)
+
+![PCA heat map for females: normalized, uncorrected data](/home1/NEURO/schaffner/preprocessing/DIGPD/082022/PCA_visit1_F_heat_legend.png)
+
+## Males PCA
+```{r pca norm M, eval=F}
+#restructing meta data and subsetting to categorical/continuous
+nrow(visit1_M <- visit1_M[visit1_M$Sample_Name %in% colnames(betas_M),]) #129
+visit1_M <- visit1_M[match(colnames(betas_M), visit1_M$Sample_Name),]
+str(visit1_M)
+visit1_M$levodopa <- as.factor(visit1_M$levodopa)
+visit1_M$edu <- as.factor(visit1_M$edu)
+visit1_M$smoking <- as.factor(visit1_M$smoking)
+visit1_M$pesticides <- as.factor(visit1_M$pesticides)
+visit1_M$head_trauma <- as.factor(visit1_M$head_trauma)
+visit1_M$PD <- as.factor(visit1_M$PD)
+visit1_M$agonist <- as.factor(visit1_M$agonist)
+visit1_M$SentrixBarcode_A <- as.factor(visit1_M$SentrixBarcode_A)
+visit1_M$plate <- as.factor(visit1_M$plate)
+visit1_M$alcohol <- as.factor(visit1_M$alcohol)
+visit1_M$ethnicity <- as.factor(visit1_M$ethnicity)
+visit1_M$marital <- as.factor(visit1_M$marital)
+rownames(visit1_M) <- visit1_M$Sample_Name
+
+meta_categorical <- visit1_M[,c("plate", "SentrixBarcode_A", "SentrixPosition_A", "Sample_Well", "PD", "ethnicity", "levodopa", "agonist", "edu", "smoking", "pesticides", "head_trauma", "marital", "alcohol")]
+
+meta_continuous <- visit1_M[,c("Age", "age_onset", "dis_duration","MMS", "time_sto", "bmi","CD8T", "CD4T", "NK", "Bcell", "Mono", "Neu", "CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4", "CTP_PC5", "ancestryPC1", "ancestryPC2", "ancestryPC3", "ancestryPC4", "ancestryPC5")]
+
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+
+all.equal(colnames(betas_M), rownames(visit1_M)) #TRUE
+
+#PCA on beta values: input
+PCA_Full<-princomp(betas_M[complete.cases(betas_M),])
+PCA_Plot(PCA_Full, type="Sparse", MTC=T, Discrete=T)
+```
+![PCA scree plot for males: normalized, uncorrected data](/home1/NEURO/schaffner/preprocessing/DIGPD/082022/PCA_visit1_M_scree.png)
+
+![PCA heat map for males: normalized, uncorrected data](/home1/NEURO/schaffner/preprocessing/DIGPD/082022/PCA_visit1_M_heat_legend.png)
+
+## Checking sex balancing by batch
+
+Amy Inkster advised that if sex is balanced across batches, this step can be applied on all the data. 
+
+```{r sex by batch, eval=F}
+table(visit1_sub$reportedSex, visit1_sub$plate)
+#     1  2  3  4  5  6  7
+#  F 24 21 14 20 14  0  0
+#  M 23 23 21 21 17 16  8
+
+table(visit1_sub$reportedSex, visit1_sub$SentrixBarcode_A)
+#majority of chips are balanced between sexes, but note most also have only 3 individuals from the first time point
+
+table(visit1_sub$reportedSex, visit1_sub$SentrixPosition_A)
+#    R01C01 R02C01 R03C01 R04C01 R05C01 R06C01 R07C01 R08C01
+#  F     14     17      4     17     10     13     11      7
+#  M     21     24      4     22     19     15     16      8
+
+table(visit1_sub$reportedSex, visit1_sub$Sample_Well)
+#    A01 A02 A03 A04 A05 A06 A07 A08 A09 A10 A11 A12 B01 B02 B03 B04 B05 B06 B07 B08 B09 B10 B11 B12 C01 C02 C03 C04 C05 C06
+#  F   2   1   3   0   3   1   0   0   2   2   0   0   4   0   2   1   1   2   3   0   0   3   0   1   0   1   0   0   2   0
+#  M   1   3   1   2   3   1   2   3   2   1   1   1   2   2   2   4   3   1   2   4   1   0   1   2   1   0   0   2   0   0
+#   
+#    C07 C08 C09 C10 C11 C12 D01 D02 D03 D04 D05 D06 D07 D08 D09 D10 D11 D12 E01 E02 E03 E04 E05 E06 E07 E08 E09 E10 E11 E12
+#  F   1   0   0   0   0   0   0   2   2   0   1   2   2   1   3   1   1   2   0   1   0   1   1   0   2   3   1   1   0   0
+#  M   0   0   0   0   0   1   4   2   1   3   4   3   2   1   1   0   1   0   2   1   0   0   3   0   1   0   2   5   2   3
+#   
+#    F01 F02 F03 F04 F05 F06 F07 F08 F09 F10 F11 F12 G01 G02 G03 G04 G06 G07 G08 G09 G10 G11 G12 H01 H02 H03 H04 H05 H06 H07
+#  F   1   1   0   4   0   1   0   1   1   1   2   1   1   1   0   1   0   2   1   1   2   2   0   1   0   1   1   0   0   2
+#  M   0   0   2   0   1   3   2   1   3   1   0   2   2   0   4   0   3   0   2   3   0   1   1   0   1   0   0   2   1   1
+#   
+#    H08 H09 H10 H11 H12
+#  F   0   0   1   1   0
+#  M   1   1   0   0   1
+```

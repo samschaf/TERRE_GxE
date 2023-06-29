@@ -1,0 +1,1691 @@
+---
+title: "TERRE_Preprocessing"
+author: "SS"
+date: "09/02/2022"
+output:
+  html_document:
+    df_print: paged
+  rmdformats::readthedown:
+    fig_caption: yes
+    gallery: no
+    highlight: kate
+    lightbox: yes
+    self_contained: yes
+    thumbnails: no
+---
+
+The *TERRE* cohort (subset containing n=88 cases and n=177 controls) consists of French agricultural workers enrolled in the Mutualite Sociale Agricole health insurance system (Elbaz et al., 2009). All PD cases in this subset of data have a disease duration of 1.5 years or less. We are performing this study in collaboration with r. Alexis Elbaz, Dr. Alexis Brice, and Dr. Jean-Christophe Corvol. EPIC arrays were run in Paris, France on bisulfite-converted DNA samples extracted from whole blood. We were provided with idat files for preprocessing and analysis.
+
+The general steps applied in this script are as follows:
+
+Removing outlier samples
+
+Cell type prediction (blood)
+
+Performing normalization using control probes (funnorm)
+
+Removing poor performing probes
+
+Removing variation due to batch effects (ComBat)
+
+#### GPCC version: update v1 Sept 7, 2022; v2 Mar 1, 2023 (adding extended cell types estimation)
+
+### Libraries and outside functions
+```{r results='hide', warning=FALSE, message=FALSE, eval=F}
+setwd("~/")
+#installed latest version of wateRmelon manually to personal folder to get around compatibility issues
+#adding custom library path
+.libPaths(c(.libPaths(), "/mnt/scratch/KoborLab/R_Libs/4.2", "/mnt/scratch/KoborLab/Personal_Folders/sschaffner/Rstudio/R/x86_64-pc-linux-gnu-library/4.0/"))
+library(lifecycle, lib.loc="/mnt/scratch/KoborLab/R_Libs/4.2")
+library(scales, lib.loc="/mnt/scratch/KoborLab/R_Libs/4.2")
+library(vctrs, lib.loc="/mnt/scratch/KoborLab/R_Libs/4.2")
+
+library(FlowSorted.BloodExtended.EPIC)
+
+library(sva)
+library(Metrics)
+library(methylumi)
+library(dendextend)
+library(locfdr)
+library(gplots)
+library(lattice)
+library(wateRmelon)
+library("RColorBrewer")
+library(plyr)
+library(VennDiagram)
+library(ggplot2)
+library(qvalue)
+library("sva")
+library(parallel)
+library(gridExtra)
+library(grid)
+library("reshape2")
+library("corrplot")
+library(rgr)
+library(viridis)
+library(lumi)
+library(missMethyl)
+library(hydroGOF)
+library(quadprog)
+library(genefilter)
+library(matrixStats)
+library(limma)
+library(FlowSorted.Blood.450k)
+library(FlowSorted.Blood.EPIC) #estimateCellCounts2: minfi estimation with IDOL reference
+library(ewastools)
+library(ggrepel)
+library(conumee)
+library(doParallel)
+library(ggplotify)
+library(cowplot)
+library(ggpubr)
+library(tidyverse)
+source("~/KoborLab/kobor_space/shared_coding_resource/PCA_Plot_Function.R")
+#source("~/KoborLab/kobor_space/shared_coding_resource/BadProbe_Function.R")
+#source("~/KoborLab/kobor_space/shared_coding_resource/ECC11.R")
+```
+
+
+## Load data and create objects for preprocessing
+```{r create RG obj, eval=F}
+path = "~/KoborLab/Projects/TERRE/sschaffner/idats"
+idatlist <- list.files(path) #201125090023_R08C01 red and green idat files are in here
+head(idatlist) # Checks that all the idats you need are there.
+length(idatlist) #752 idats!
+
+terre_meta <- read.csv("~/KoborLab/Projects/TERRE/sschaffner/TERRE_cake/terre_canada.csv")
+terre_meta2 <- read.csv("~/KoborLab/Projects/TERRE/sschaffner/TERRE_cake/terre_canada2.csv")
+all.equal(terre_meta$patient, terre_meta2$patient) #TRUE
+terre_meta <- cbind(terre_meta, terre_meta2[,-2])
+
+terre_meta$Sample_Group <- "TERRE"
+terre_meta$Sample_Name <- terre_meta$patient
+terre_meta$ethnicity <- rep("Caucasian", nrow(terre_meta))
+terre_meta[terre_meta$patient %in% c("037-2", "327-2", "368-3", "439-2"),"ethnicity"] <- "North_African"
+nrow(terre_meta) #265
+length(unique(terre_meta$patient)) #262 (includes duplicates)
+terre_meta$patient[which(duplicated(terre_meta$patient))] #065-2 065-3 065-4
+terre_meta$patient <- as.character(terre_meta$patient)
+terre_meta[terre_meta$patient=="065-2","patient"][2] <- "065-2_rep"
+terre_meta[terre_meta$patient=="065-3","patient"][2] <- "065-3_rep"
+terre_meta[terre_meta$patient=="065-4","patient"][2] <- "065-4_rep"
+length(unique(terre_meta$patient)) #265
+
+terre_meta$Basename <- paste(terre_meta$SentrixBarcode_A, terre_meta$SentrixPosition_A, sep = "_")
+terre_meta$Chip_Position <- terre_meta$Basename
+terre_meta$Basename <- file.path(path, terre_meta$Basename) # Need to have the full pathnames without the ending _Grn.idat or _Red.idat
+PD_RG_Raw <- read.metharray(basenames = terre_meta$Basename, extended = T, force = T)
+
+# Replace samplenames of chip_position to actual sample names:
+identical(sampleNames(PD_RG_Raw), terre_meta$Chip_Position) #TRUE
+sampleNames(PD_RG_Raw) <- terre_meta$patient
+#all.equal(rownames(terre_meta), sampleNames(PD_RG_Raw))
+save(PD_RG_Raw, file="~/KoborLab/Projects/TERRE/sschaffner/funnorm/TERRE_RG_Raw.RData")
+
+# Creating object to use with ewastools
+meth <- read_idats(terre_meta$Basename)
+save(meth, file="~/KoborLab/Projects/TERRE/sschaffner/TERRE_ewastools_obj_raw.RData")
+
+# Creating MethylSet from RGSet to use with minfi
+MSet <- preprocessRaw(PD_RG_Raw) 
+```
+
+# Sample quality control checks
+
+## ewastools 
+This check uses the Illumina’s 636 control probes to assess technical parameters including array staining, extension, hybridization, target removal, specificity, and bisulfite conversion.
+```{r ewastools, eval=F}
+ctrls = control_metrics(meth)
+stripchart(ctrls$`Bisulfite Conversion II`,method="jitter",pch=4,xlab='Bisulfite Conversion II',xlim=c(0,10))
+abline(v=1,col=2,lty=3) # can see a group of samples failing here
+
+terre_meta$failed = sample_failure(ctrls)
+table(terre_meta$failed)
+#FALSE  TRUE 
+#  213    52
+
+#checking individual metrics with the default pass/fail thresholds (reccommended by Illumina)
+length(ctrls$Restoration[ctrls$Restoration>0]) # (all pass)
+length(ctrls$`Staining Green`[ctrls$`Staining Green`>5])  #1 failed
+length(ctrls$`Staining Red`[ctrls$`Staining Red`>5])  #1 failed
+length(ctrls$`Extension Green`[ctrls$`Extension Green`>5])  #1 failed
+length(ctrls$`Extension Red`[ctrls$`Extension Red`>5])  #1 failed
+length(ctrls$`Hybridization High/Medium`[ctrls$`Hybridization High/Medium`>1])  #(all pass)
+length(ctrls$`Hybridization Medium/Low`[ctrls$`Hybridization Medium/Low`>1]) #1 failed
+length(ctrls$`Target Removal 1`[ctrls$`Target Removal 1`>1]) #all pass
+length(ctrls$`Target Removal 2`[ctrls$`Target Removal 2`>1]) #all pass
+
+length(ctrls$`Bisulfite Conversion I Green`[ctrls$`Bisulfite Conversion I Green`>1]) #238 (27 failed)
+bisulfite1grn <- ctrls$`Bisulfite Conversion I Green`
+names(bisulfite1grn) <- meth$meta$sample_id
+hist(ctrls$`Bisulfite Conversion I Green`[ctrls$`Bisulfite Conversion I Green`<1], main="Bisulfite Conversion I Green", xlab=NA)
+#most are >0.8
+
+length(ctrls$`Bisulfite Conversion I Red`[ctrls$`Bisulfite Conversion I Red`>1]) #263 (2 failed)
+bisulfite1rd <- ctrls$`Bisulfite Conversion I Red`
+names(bisulfite1rd) <- meth$meta$sample_id
+
+length(ctrls$`Bisulfite Conversion II`[ctrls$`Bisulfite Conversion II`>1]) #214 (51 failed)
+bisulfiteII <- ctrls$`Bisulfite Conversion II`
+bisulfiteII <- bisulfiteII[match(terre_meta$Chip_Position, names(bisulfiteII))]
+all(names(bisulfiteII)==terre_meta$Chip_Position) #TRUE
+terre_meta$bisulfiteII <- bisulfiteII
+names(bisulfiteII) <- meth$meta$sample_id
+hist(ctrls$`Bisulfite Conversion II`[ctrls$`Bisulfite Conversion II`<1], main="Bisulfite Conversion II", xlab=NA)
+#this one is variable, spread between 0.6-0.8 mostly
+
+#how many fail both metrics?
+bisulfite1rd_fail <- bisulfite1rd[bisulfite1rd<1]
+bisulfite1_fail <- bisulfite1grn[bisulfite1grn<1]
+bisulfite2_fail <- bisulfiteII[bisulfiteII<1]
+
+length(bisulfite1rd_fail[bisulfite1rd_fail %in% bisulfite1_fail]) #0
+length(bisulfite1rd_fail[bisulfite1rd_fail %in% bisulfite2_fail]) #0
+length(dblfail <- names(bisulfite2_fail)[names(bisulfite2_fail) %in% names(bisulfite1_fail)]) #26 (26/27 from bisulfite I also fail bisulfite II)
+
+terre_meta$ewastools_flag <- NA
+terre_meta[terre_meta$Chip_Position %in% names(bisulfite1rd_fail),"ewastools_flag"] <- "Bisulfite I red"
+terre_meta[terre_meta$Chip_Position %in% names(bisulfite1_fail),"ewastools_flag"] <- "Bisulfite I green"
+terre_meta[terre_meta$Chip_Position %in% names(bisulfite2_fail),"ewastools_flag"] <- "Bisulfite II"
+summary(as.factor(terre_meta$ewastools_flag))
+#Bisulfite I green      Bisulfite II              NA's 
+#                1                51               213 
+
+#failing I and II
+table(terre_meta[terre_meta$Chip_Position %in% names(bisulfite1_fail),c("PD","men")])
+#   men
+#PD  0 1
+#  0 8 7
+#  1 6 6
+
+#failing II only
+table(terre_meta[terre_meta$Chip_Position %in% names(bisulfite2_fail)[-which(names(bisulfite2_fail) %in% names(bisulfite1_fail))],c("PD","men")])
+#   men
+#PD  0 1
+#  0 6 7
+#  1 6 6
+
+#plotting bisulfite 2 by bisulfite 1 pass/fail
+par(mfrow=c(1,2))
+hist(bisulfite2_fail[names(bisulfite2_fail) %in% names(bisulfite1_fail)], main="Type I & II fail", xlab=NA)
+hist(bisulfite2_fail[-which(names(bisulfite2_fail) %in% names(bisulfite1_fail))], main="Type II only fail", xlab=NA)
+
+length(ctrls$`Specificity I Green`[ctrls$`Specificity I Green`>1]) #1 failed
+length(ctrls$`Specificity I Red`[ctrls$`Specificity I Red`>1]) #all pass
+length(ctrls$`Specificity II`[ctrls$`Specificity II`>1]) #all pass
+length(ctrls$`Non-polymorphic Green`[ctrls$`Non-polymorphic Green`>5]) #1 failed
+
+length(ctrls$`Non-polymorphic Red`[ctrls$`Non-polymorphic Red`>5]) #264
+```
+![Bisulfite conversion check](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/TERRE_ewastools_bisulfite_conv.png)
+
+![Samples failing type I green bisulfite conversion](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/ewastools_bisulfiteIgreen_hist.png)
+
+![Samples failing type II bisulfite conversion](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/ewastools_bisulfiteII_hist.png)
+
+26 samples failed bisulfite conversion I green and bisulfite conversion II checks. They are distributed across sex and PD status so should not bias the sex-stratified PD EWAS too much. I'll remove them.
+
+## M/U channel intensity
+```{r minfi, eval=F}
+qc <- getQC(MSet)
+plotQC(qc)
+```
+![Minfi plotQC](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/TERRE_plotQC_minfi.png)
+
+No samples were flagged with methylated/unmethylated intensity check.
+
+# Sex checks
+
+Sex QC checks were conducted using three main methods: (1) Clustering using XY probes, (2) Sex inference using minfi() and (3) Using conumee() to confirm and resolve sex mismatched samples. Each of these methods will be expanded on in subsequent sections
+
+## X chromosome PCA
+```{r sex matching, eval=F}
+#get the names of X and Y chromosome probes using Kasper Hansen's EPIC annotation
+KH_Anno <- read.csv("~/KoborLab/kobor_space/shared_coding_resource/Illumina_EPIC/EPIC_KH_Annotation.csv", row.names = 1)
+length(Xprobes <- KH_Anno[KH_Anno$chr=="chrX","Name"]) #19,120
+length(Yprobes <- KH_Anno[KH_Anno$chr=="chrY","Name"]) #561
+
+#obtaining beta matrix
+betas_raw <- getBeta(PD_RG_Raw)
+betas_raw <- as.data.frame(betas_raw)
+
+#X chromosome PCA
+betas_X <- betas_raw[rownames(betas_raw) %in% Xprobes,]
+PCA_X <- princomp(betas_X[complete.cases(betas_X),])
+X_loadings <- as.data.frame(unclass(PCA_X$loadings))
+
+patients <- paste("X", terre_meta$patient, sep="")
+patients <- gsub("-", ".", patients)
+patients[patients=="X065.2_rep"] <- "X065.2.1"
+patients[patients=="X065.3_rep"] <- "X065.3.1"
+patients[patients=="X065.4_rep"] <- "X065.4.1"
+all.equal(rownames(X_loadings), patients) #TRUE
+
+X_loadings$sex <- terre_meta$men
+X_loadings$sex <- as.factor(X_loadings$sex)
+X_loadings$sex <- gsub(1, "M", gsub(0, "F", X_loadings$sex))
+ggplot(X_loadings[,c(1,2,ncol(X_loadings))], aes(x=Comp.1, y=Comp.2, col=sex)) + geom_point() + theme_bw()
+
+#labelled points
+ggplot(X_loadings[,c(1,2,ncol(X_loadings))], aes(x=Comp.1, y=Comp.2, col=sex)) + theme_bw() + geom_text(label=rownames(X_loadings))
+```
+![X chromosome PCA](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/Xchr_PCA.png)
+![X chromosome PCA wih labelled points](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/Xchr_PCA_text.png)
+
+358-2 is a clear outlier and will be removed. 344-4 also looks suspicious.
+
+## Y chromosome missing values
+```{r Y missing, eval=F}
+#Y chromosome percent missing values per sample (fewer probes than samples, can't do PCA)
+betas_Y <- betas_raw[rownames(betas_raw) %in% Yprobes,]
+betas_Y_t <- as.data.frame(t(as.matrix(betas_Y)))
+all.equal(rownames(betas_Y_t), patients) #TRUE
+betas_Y_t$missing <- rowSums(is.na(betas_Y_t))/ncol(betas_Y_t)
+betas_Y_t$sex <- terre_meta$men
+
+betas_Y_missing <- betas_Y_t[,c("sex","missing")]
+betas_Y_missing$sex <- gsub(0, "F", gsub(1, "M", betas_Y_missing$sex))
+ggplot(betas_Y_missing, aes(x=sex, y=missing, col=sex, group=sex)) + geom_jitter() + theme_bw()
+```
+![Y chromosome missing values](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/Ychr_missing.png)
+
+There are no males with missing Y chromosome values.
+
+## Sex prediction with minfi
+In this section, we infer the sex of all samples using minfi’s “getSex” function. getSex() works by comparing median total fluorescent intensity of the X chromosome probes and Y-chromosome probes. minfi separates the points by using a default cutoff of -2 for log2med(Y)−log2med(Y), although cutoff can be preferentially specified (use plotSex to get an idea of appropriate cutoffs). NOTE: Males and females should cluster seperately
+```{r pred sex, eval=F}
+Gset <- mapToGenome(ratioConvert(MSet))
+predictedSex <- getSex(Gset, cutoff = -2) #getSex() Estimates samples sex based on methylation data.
+predictedSex_dt <-as.data.frame(predictedSex)
+predictedSex_dt$id <- rownames(predictedSex_dt)
+colnames(predictedSex_dt)[3] <- "Predicted_Sex"
+
+sex_flagged_ids <- predictedSex_dt[predictedSex_dt$yMed > 10 &  predictedSex_dt$Predicted_Sex=="F" | predictedSex_dt$xMed < 12.5 | predictedSex_dt$yMed < 12 &  predictedSex_dt$Predicted_Sex=="M","id"] #none
+#seems wrong after plotting; should flag 358-1, 358-2, and 276-4
+
+#plotting predicted vs reported
+nrow(predictedSex_dt) #265
+terre_meta <- terre_meta[match(predictedSex_dt$id, terre_meta$patient),]
+terre_meta <- cbind(terre_meta, predictedSex_dt[,1:3])
+colnames(terre_meta)[7] <- "reportedSex"
+terre_meta$reportedSex <- gsub(0, "F", gsub(1, "M", terre_meta$reportedSex))
+table(terre_meta$predictedSex, terre_meta$reportedSex)
+#      F   M
+#  F 124   0
+#  M   1 140
+
+#one mismatch
+terre_meta[terre_meta$predictedSex!=terre_meta$reportedSex,"patient"] #"358-2"
+
+#flagging potential problem samples (other than 358-2 which will be removed regardless)
+terre_meta$flag <- NA
+terre_meta[terre_meta$patient %in% c("358-1","276-4"),"flag"] <- "Far from XY cluster centroid"
+terre_meta[terre_meta$patient %in% "344-4","flag"] <- "Far from Xchr cluster centroid"
+
+ggplot(terre_meta, aes(x=xMed, y=yMed, col=reportedSex)) + geom_text(label=terre_meta$patient) + theme_bw() + ggtitle("minfi Sex Prediction")
+```
+![Minfi predicted sex](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/minfi_sex_check.png)
+
+358-2, 358-1, and 276-4 cluster away from centre and should be flagged.
+
+## Using CNVs to examine sex-flagged samples
+
+To further investigate the samples failing sex QC, we used CNV profiles to identify sex based on X and Y chromosomal copy number variations in the respective samples. For this analysis, we used the conumee R package that performs CNV analysis using Illumina 450k or EPIC DNA methylation arrays. CNV analysis is performed by normalizing the combined intensity values of both ‘methylated’ and ‘unmethylated’ channel of each CpG using a set of normal controls (i.e. with a flat genome, not showing any copy-number alterations).
+
+Code from Rebecca Asiimwe.
+
+#### Preparing data sets
+We want to choose a subset of controls (Rebecca did 50 for 17 samples) to compare samples to, since conumee is time intensive and produces an individual comparison plot for every control.
+```{r data_prep conumee, eval=F}
+#Subsetting dataset to exclude sex mismatched samples and selecting only males as our controls
+controls <- terre_meta[-which(complete.cases(terre_meta$flag)),]
+controls_filtered <- controls[controls$reportedSex=="M",]
+controls_filtered <- controls_filtered[1:20,] #selecting 20 controls for 2 cases
+
+#Creating one metadata object with selected controls and sex mismatched samples
+meta_sex_mismatch_control <- rbind(controls_filtered, terre_meta[complete.cases(terre_meta$flag),])
+rownames(meta_sex_mismatch_control) <- meta_sex_mismatch_control$patient
+
+#Filtering RGset to select control samples
+RGset_subset <- PD_RG_Raw[, sampleNames(PD_RG_Raw) %in% meta_sex_mismatch_control$patient]
+dim(RGset_subset) #1051539      22
+
+#Matching sample names in control metadata with filtered RGset
+identical(colnames(RGset_subset), rownames(meta_sex_mismatch_control)) #TRUE
+
+#Creating an mset object required to run conumee
+mset_conumee <- preprocessIllumina(RGset_subset)
+```
+
+#### Identifying conumee controls and CNV calling
+```{r conumee_call, eval=F}
+#Conumee annotation 
+anno <- CNV.create_anno(array_type="EPIC", chrXY=TRUE, bin_minprobes=15, bin_minsize=50000)
+anno #863904 probes
+mranges_cnv <- mapToGenome(mset_conumee) 
+anno@probes <- subsetByOverlaps(anno@probes, granges(mranges_cnv)) # method to subset S4 object (anno)
+anno #862927 probes
+annoProbes <- as.data.frame(anno@probes)
+mset_conumee <- mset_conumee[which(rownames(mset_conumee) %in% rownames(annoProbes)), ] 
+dim(mset_conumee) #862927 probes
+
+#Identify Conumee Controls
+#Telling conumee which samples in our data and metadata objects are our “karyotypically normal” control samples for comparison to.
+all.equal(colnames(mset_conumee), meta_sex_mismatch_control$patient) # must be TRUE
+
+#Specifying which samples will be used as CNV controls
+meta_sex_mismatch_control$Status <- NA
+meta_sex_mismatch_control[complete.cases(meta_sex_mismatch_control$flag),"Status"] <- "MISMATCH"
+meta_sex_mismatch_control[-which(complete.cases(meta_sex_mismatch_control$flag)),"Status"] <- "CONTROL"
+summary(as.factor(meta_sex_mismatch_control$Status))
+# CONTROL MISMATCH 
+#      20        3 
+
+cnv_controls <-  meta_sex_mismatch_control$Status == "CONTROL"
+cnv_controls 
+
+#Parallel CNV Calling
+#Load into cnv calling format
+cnv_input <- CNV.load(mset_conumee)
+
+#Parallelizing the CNV calling so that multiple samples are called at once
+#Initialize cluster
+cl <- makeCluster(4)
+registerDoParallel(cl)
+
+#Parallel cnv fit
+cnv_calls <- foreach (i =  1:ncol(mset_conumee),
+                      .export = c("CNV.fit", "CNV.bin", "CNV.segment")) %dopar% 
+  CNV.segment(
+    CNV.bin(
+      CNV.fit(
+        cnv_input[i], ref = cnv_input[cnv_controls], anno = anno)))
+
+#Kill cluster
+stopCluster(cl)
+
+names(cnv_calls)
+names(cnv_calls) <- meta_sex_mismatch_control$patient
+```
+
+#### Samples flagged as mismatches or those far from cluster centroids 
+```{r flagged_samples, eval=F}
+#Recall of samples flagged as ar from cluster centroids
+meta_sex_mismatch_control[meta_sex_mismatch_control$Status=="MISMATCH","patient"] #"276-4" "344-4" "358-1"
+```
+
+#### CNV plots
+```{r cnv_plots, eval=F}
+#Function to loop through cnv_calls object and plot all samples (controls and mismatches)
+#adding 344-4
+for(i in names(cnv_calls)[22]){
+  
+  p1 <- as.grob(~CNV.genomeplot(cnv_calls[[i]], chr = "all", chrX = TRUE, chrY = TRUE, 
+                                centromere = TRUE, detail = TRUE, main = i,
+                                ylim = c(-1.25, 1.25), set_par = TRUE, cols = c("blue", "blue","gray", "red", "red")))
+  #chrX
+  p2 <- as.grob(~CNV.genomeplot(cnv_calls[[i]], chr = "chrX", 
+                                centromere = TRUE, detail = TRUE, main = "chrX",
+                                ylim = c(-1.25, 1.25), set_par = TRUE, cols = c("blue", "blue","gray", "red", "red")))
+  #chrY
+  p3 <- as.grob(~CNV.genomeplot(cnv_calls[[i]], chr = "chrY",  
+                                centromere = TRUE, detail = TRUE, main = "chrY",
+                                ylim = c(-1.25, 1.25), set_par = TRUE, cols = c("blue", "blue","gray", "red", "red"))) 
+  
+  grid1 <- plot_grid(p1, nrow = 1, ncol = 1, scale = c(.8))
+  merged_grids <- plot_grid(p2, p3, nrow = 1, ncol = 2, scale = c(.8))
+  plot <- plot_grid(grid1, merged_grids, nrow = 2, ncol = 1, align = "h", scale = c(.8))
+  print(plot)
+  
+  sample_id <- paste0("# ", i)
+  sample_id <- noquote(sample_id)
+  print(sample_id)
+}
+```
+![Sample 358-1 (predicted/reported female)](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/conumee/FLAG_358-1.png)
+
+The elevated X copy number suggests this sample is female.
+
+![Sample 276-4 (predicted/reported male)](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/conumee/FLAG_276-4.png)
+
+The sex for this sample is inconclusive. Could be one X chromosome (Turner syndrome).
+
+![Sample 344-4 (predicted/reported male)](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/conumee/FLAG_344-4.png)
+
+The sex of this sample is inconclusive
+
+### Samples flagged for removal
+
+Samples 358-2 (technical issue), 344-4 (inconclusive sex), and 276-4 (inconclusive sex) will be removed. The sex of sample 358-1 was confirmed by CNV analysis.
+
+## SNP Control Probes Sample Clustering
+There are 59 control probes which measure single nucleotide polymorphisms which we use for quality control. These are stored in their own slot in the RGChannelSet object, so they don't need to be filtered out since we will use getBeta() to later pull out the information for non-SNP probes only.
+The SNP probe beta values can be pulled separately using getSnpBeta() for QC checks.
+
+```{r SNP probes, eval=F}
+length(locusNames <- getManifestInfo(PD_RG_Raw, "locusNames")) # Gets all probe names
+#865,859 probes are in the RGChannelSet
+#this corresponds to the total number of probes when 977 probes were removed from EPIC manifest B3
+#this excludes the 59 SNP control probes
+
+#getSnpInfo() provides the columns with rs, maf info for each probe/CpG on the array
+#getSnpBeta() provides the DNAm values for the 59 SNP control probes
+rs.probes <- getSnpBeta(PD_RG_Raw)
+plotSampleRelation(rs.probes,cex=1,method="cluster")
+
+#reps and 346-1/346-2 cluster together
+```
+![SNP probe clustering: all samples](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/SNPcluster_all.png)
+
+
+The tech reps and samples 346-1 and 346-2 cluster together. These are not known to be related. They will be flagged for removal in case of accidental duplication.
+
+## Contamination check
+```{r contamination, eval=F}
+# While ewastools implements the LOESS normalization (Heiss and Brenner, 2015), the developers of the package says not use the normalization "as it does little to protect against batch effects but can result in the removal of genuine biological signal". They recommended to adjust for relevant technical covariates in regression models later.
+
+#use ewastools object
+beta <- dont_normalize(meth)
+
+#pulling out the SNP probes
+snps <- meth$manifest[probe_type=="rs",index]
+snps <- beta[snps,]
+
+# These SNPs are then used as input for call_genotypes(). This function estimates the parameters of a mixture model consisting of three Beta distributions representing the heterozygous and the two homozygous genotypes, and a fourth component, a uniform distribution, representing outliers. The functions returns posterior probabilities used for soft classification. 
+#In simple words, we are determining the probability for every SNP whether they belong to 1 of 4 distributions, 3 of which correspond to the 3 expected genotypes (AA, AB, BB), and the 4th distribution corresponds to outside / in-between these expected genotype distributions. SNPs with a higher probability of belonging to this 4th distribution indicate mixing between more than one genotype
+
+genotypes_called <- call_genotypes(snps,learn=T)
+
+# fit mixture model to call genotypes
+snps_called <- call_genotypes(snps, learn = T)
+
+# call genotype clusters
+terre_meta <- terre_meta %>% mutate(genotype_cluster = as.factor(enumerate_sample_donors(genotypes_called)))
+
+# examine probability outlier
+plot(snp_outliers(genotypes_called) %>% sort)
+terre_meta$outlier = snp_outliers(genotypes_called)
+terre_meta[terre_meta$outlier > -4,"patient"]
+#"038-2" "344-4" "358-2"
+```
+![ewastools genotype calling](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/TERRE_SNP_outliers.png)
+
+In addition to sample 358-2, this check flagged samples 038-2 and 344-4. These samples have a high probability of being outliers based on SNP genotype. They could be contaminated with foreign DNA during lab prep or sampling. Makes sense for 344-4 which has inconclusive sex according to conumee.
+
+## Detection p-value (minfi)
+
+Here we can define outlier samples simply if more than 5% of their probes have a pvalue below 1x10^-16.
+
+```{r samples bad probes, eval=F}
+detP <- detectionP(PD_RG_Raw)
+probe_num <- round(nrow(detP)*0.05)
+badDetP <- detP>=1e-16
+avgPval <- as.data.frame(colSums(badDetP))
+avgPval$Sample <- rownames(avgPval)
+colnames(avgPval) <- c("Number_Bad_Probes", "Sample_ID")
+(badSamps <- avgPval$Sample_ID[avgPval$Number_Bad_Probes>=probe_num]) #"358-2"
+length(badSamps) #1
+
+# Visualization of outlier samples
+ggplot(avgPval)+  
+  geom_point(aes(as.factor(Sample_ID), Number_Bad_Probes, fill=Sample_ID), shape=21, size=3)+
+  geom_hline(yintercept = probe_num, linetype = "dashed", color = "red", size = 1)+
+  theme(legend.position = "none")
+```
+![Outlier Samp >5% bad probes](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/outliers_badsamp.png)
+
+Only 358-2 was flagged for detection p-value.
+
+## Bead count
+Every probe has multiple beads which serves as replicate readings/multiple measurements per sample. If a given sample has fewer than 3 beads/reads that value is given an NA(missing).
+```{r bead count, eval=F}
+# calculates the number of samples with bead count <3 for each probe in matrix of bead count values
+bead <- beadcount(PD_RG_Raw)
+colnames(bead) <- gsub('X', '', colnames(bead))
+colnames(bead) <- gsub('\\.', '-', colnames(bead))
+all(colnames(bead)%in%(terre_meta$patient)) #TRUE
+all(colnames(bead)==(terre_meta$patient)) #TRUE
+
+terre_meta <- terre_meta %>% mutate(beadcount = colSums(is.na(bead)))
+
+#plot
+terre_meta %>% 
+  mutate(terre_meta = factor(as.character(patient), levels = patient)) %>%
+  ggplot(aes(x = patient, y = beadcount)) +
+  geom_point(shape = 21, size = 2, alpha=0.8, col="black")+
+  geom_hline(yintercept = 0.01*nrow(bead), linetype = 'dashed', color = 'gray') +
+  geom_text(aes(x = 0, y = 0.01*nrow(bead)), 
+            label = '1%', vjust = -0.5, hjust = -0.5, color = 'gray')+
+  labs(x = 'Samples', y = '', title = '# samples with probes with bead count < 3') +
+  theme(axis.text.x = element_blank()) +
+  scale_y_continuous(limits = c(0, 14000), breaks = seq(0,14000, 2000)) +
+  theme_classic()+
+  theme(axis.text.x = element_blank())+
+  geom_label_repel(data = terre_meta %>% filter(beadcount > (0.01*nrow(bead))), 
+aes(label = patient), size = 4, force = 15, nudge_x = 0.8, nudge_y = 0.5) 
+
+terre_meta_combine <- terre_meta
+terre_meta_combine <- write.csv(terre_meta_combine,"~/KoborLab/Projects/TERRE/sschaffner/terre_meta_combine.csv")
+
+nrow(terre_meta[terre_meta$beadcount > (0.01*nrow(bead)),]) #0
+```
+![Bead count](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/beadcount.png)
+
+All samples passed bead count check.
+
+## Average intensity
+```{r avg intensity, eval=F}
+green <- getGreen(PD_RG_Raw)
+red <- getRed(PD_RG_Raw)
+greenred <- green + red
+
+# add to sampleInfo
+terre_meta <- terre_meta %>% mutate(Average_intensity = colMeans(greenred))
+
+terre_meta %>% 
+  mutate(patient = factor(as.character(patient), levels = patient)) %>%
+  ggplot(aes(x = patient, y = Average_intensity)) +
+  geom_point(alpha = 0.7, color = 'black') + theme_classic() +
+  theme(axis.text.x = element_blank()) +
+  geom_hline(yintercept = mean(terre_meta$Average_intensity) - 2*sd(terre_meta$Average_intensity),
+             linetype = 'dashed', col = 'blue')+
+  geom_hline(yintercept = mean(terre_meta$Average_intensity) + 2*sd(terre_meta$Average_intensity),
+             linetype = 'dashed', col = 'red') +
+  geom_label_repel(data = terre_meta %>% 
+                    filter(Average_intensity < mean(terre_meta$Average_intensity) -
+                             2*sd(terre_meta$Average_intensity)),
+                  aes(label = patient), force = 10, nudge_y = -2500, show.legend = F)+
+  scale_y_continuous(limits = c(0, 25000)) +
+  labs(x = 'Samples')
+```
+![Average intensity](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/avgintensity.png)
+
+358-2 fails the intensity check. 199-1 and 359-1 are just below borderline but pretty close, seems okay.
+
+## Outlier Detection - Lumi
+This function is contained in the lumi package. The current outlier detection is based on the distance from the sample to the center (average of all samples). The assumption of the outlier detection is that there is only one single cluster and the distance from the sample to the center is Gaussian distributed.
+
+The outlier is detected when its distance to the center is larger than a certain threshold. The threshold is calculated as Th * median distances to the center.
+
+```{r lumi outlier, eval=F}
+betas_raw <- getBeta(PD_RG_Raw)
+Project_detout <- detectOutlier(betas_raw, Th = 1.5) # This calculates potential outliers
+length(which(Project_detout)) #3
+outlier_lumi <- names(which(Project_detout)) # This pulls the sample names of calculated outliers
+outlier_lumi <- sort(outlier_lumi)
+outlier_lumi
+#"344-2" "358-2" "482-4"
+```
+
+## Outlier Detection - wateRmelon
+
+This is a wateRmelon package outlier detection method which uses the function pcout. Based on the robustly sphered data, semi-robust principal components are computed which are needed for determining distances for each observation. Separate weights for location and scatter outliers are computed based on these distances. The combined weights are used for outlier identification.
+
+There are two criteria which have to pass a given threshold to be considered an outlier: iqr and mv. It is sometimes useful to take a look at samples which pass one but fail the second as well, perhaps these samples should still be removed?
+
+```{r wateRmelon outlier, eval=F}
+Project_pcout <- outlyx(PD_RG_Raw) # This calculates potential outliers
+#"pcout.png"
+
+Project_pcout$Sample_ID <- rownames(Project_pcout)
+out <- Project_pcout[which(Project_pcout$outliers == T),"Sample_ID"] # Pulling sample names deemed to be outliers
+#These are the overlaps between iqr and mv methods
+# "358-2"        
+
+iqrout <- Project_pcout[which(Project_pcout$iqr == T),"Sample_ID"] # Pulling samples which failed the iqr threshold
+#"358-2"           
+
+mvout <- Project_pcout[which(Project_pcout$mv == T),"Sample_ID"] # Pulling samples which failed the mv threshold
+# [1] "041-1" "211-4" "213-1" "213-2" "213-4" "240-3" "240-4" "253-2" "254-3" "254-4" "358-2" "382-2"
+#[13] "382-3" "387-3" "520-3" "554-4" "570-4" "589-1" "603-1" "623-3"
+```
+
+## Inter-sample correlation
+Intersample correlation analysis is performed to looked at pairwise corrlations between all the samples. Samples from the same tissues are expected to have high correlation (>90%).
+NOTE: Compare TERRE and DIG-PD in this plot (will do during DIG-PD preprocessing on CESP server). Expecting them to cluster similarly since they are both whole blood.
+```{r sample sample cor, eval=F}
+cor <-cor(betas_raw,use="pairwise.complete.obs") #have saved this as it takes a while
+save(cor, file="~/KoborLab/Projects/TERRE/sschaffner/TERRE_sample_cor.RData")
+
+source( "~/KoborLab/kobor_space/ckonwar/Function/heatmap.3.R")
+col.Sex <- gsub("M", "#AAAB9B", gsub("F", "#EFE7B8", terre_meta$predictedSex))
+col.position <-gsub("R01C01", "#F7F7F7", gsub("R02C01", "#D9D9D9",  
+                                         gsub("R03C01","#555555",
+                                         gsub("R04C01","#474747", 
+                                         gsub("R05C01","#737373",
+                                         gsub("R06C01","#E5E5E5",
+                                         gsub("R07C01","#252525",
+                                         gsub("R08C01","#BDBDBD", 
+                                        terre_meta$SentrixPosition_A))))))))
+
+clab <- cbind(col.position,col.Sex)
+colnames(clab) <- c("Chip.Position","Sex")
+
+#Define custom dist and hclust functions for use with heatmaps
+mydist=function(c) {dist(c,method="euclidian")}
+myclust=function(c) {hclust(c,method="average")}
+
+#par(mar=c(7,4,1,2)+0.1) 
+grey<-colorRampPalette(brewer.pal(n=9,"Greys"))
+
+jpeg("~/KoborLab/Projects/TERRE/sschaffner/intersamplecorrelation.jpeg", width = 1250, height = 1100)
+intersamplecorrelation <- heatmap.3(cor,hclustfun=myclust, distfun=mydist,na.rm = TRUE, scale="none", dendrogram="col", margins=c(6,12), Rowv=TRUE, Colv=TRUE, symbreaks=FALSE, key=TRUE, symkey=FALSE, density.info="none", trace="none", ColSideColors=clab, labCol=rownames(terre_meta), labRow=rownames(terre_meta), cexRow=1, col=grey,ColSideColorsSize=5,KeyValueName="Pearson's r",keysize=1,cexCol=1.2) 
+print(intersamplecorrelation)
+dev.off()
+```
+![Sample-sample correlations](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/intersamplecorrelation.jpeg)
+
+All samples are highly correlated as expected.
+
+## PCA
+```{r PCA, eval=F}
+PCA_full <-princomp(na.omit(betas_raw))
+Loadings <-as.data.frame(unclass(PCA_full$loadings))
+all(rownames(Loadings)==terre_meta$patient) #TRUE
+pca_meta <- cbind(terre_meta, Loadings)
+saveRDS(pca_meta,"~/KoborLab/Projects/TERRE/sschaffner/pca_meta.rds") #this has the PCA laadings 
+
+#remove 358-2 first since it throws off everything
+ggplot(pca_meta[-which(pca_meta$patient=="358-2"),], aes(Comp.1, Comp.2, color=predictedSex)) + geom_point(size = 3, alpha=0.8) +  
+theme_classic() + theme(axis.text = element_text(size =15),
+axis.title = element_text(size =15))
+```
+![PCA on raw betas, coloured by sex](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/initial_PCA_scatterplot.png)
+
+Samples cluster by sex on PC2.
+
+## Epigenetic age prediction (Horvath)
+If there are any large deviations from chornological age this could be a flag.
+```{r epigenetic age, eval=F}
+source('~/KoborLab/kobor_space/sschaffner/Age_Pred_Horvath_NG_SS.R')
+epiage <- HorvathAge_NG(MSet, Tissue="WB")
+#[1] "You have 334 out of 353 probes needed for the age clock. Missing 19 altogether."
+#[1] "Resulting in 5 % missingness. Data will be imputed using training data."
+epiage$SampleID <- gsub("X", "", gsub("\\.", "-", epiage$SampleID))
+write.table(epiage, file="~/KoborLab/Projects/TERRE/sschaffner/epiage_Horvath_raw.txt", sep="\t", row.names=F)
+epiage <- epiage[match(terre_meta$patient, epiage$SampleID),]
+all.equal(epiage$SampleID, terre_meta$patient) #TRUE
+terre_meta$DNAmAge_Horvath <- epiage$DNAmAge
+
+warnings <- epiage[grep("Warning",epiage$Comment),1:3]
+#       SampleID  DNAmAge                             Comment
+#X233.2    233-2 63.56989  Warning: meanMethBySample is <0.25
+#X254.3    254-3 69.61932  Warning: meanMethBySample is <0.25
+#X358.2    358-2 43.16569  Warning: meanMethBySample is >0.35
+#X387.3    387-3 62.52435  Warning: meanMethBySample is <0.25
+#X468.1    468-1 51.74037  Warning: meanMethBySample is <0.25
+#X516.1    516-1 70.18476  Warning: meanMethBySample is <0.25
+#X554.1    554-1 64.80465  Warning: meanMethBySample is <0.25
+#X604.2    604-2 70.15335  Warning: meanMethBySample is <0.25
+#X604.3    604-3 63.96038  Warning: meanMethBySample is <0.25
+
+min <- min(c(terre_meta$age, terre_meta$DNAmAge_Horvath))
+max <- max(c(terre_meta$age, terre_meta$DNAmAge_Horvath))
+terre_meta$PD <- as.factor(terre_meta$PD)
+ggplot(terre_meta, aes(x=age, y=DNAmAge_Horvath, color=PD)) + geom_point() + theme_bw() + xlim(c(min,max)) + ylim(c(min,max))
+
+#with warning samples labelled
+ggplot(terre_meta, aes(x = age, y = DNAmAge_Horvath)) + geom_point(colour="#E69F00") + labs(x = "Reported age", y = "Predicted DNAm age (Horvath)", caption = "Age: DNAm vs. chronological") +  xlim(min,max) + ylim(min,max) +
+  geom_smooth(method="lm", colour="grey", size=0.5) +
+  stat_cor(method = "spearman", size = 3.5,label.x.npc = 0.7,label.y.npc = "bottom") +
+  theme_bw() + theme(panel.border = element_blank(),
+                     panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(),
+                     axis.line = element_line(colour = "black"),
+                     axis.text = element_text(),
+                     axis.title = element_text(size = 10),
+                     plot.caption = element_text(hjust = 0.5, size = rel(1)),
+                     strip.background = element_blank(),
+                     strip.text.x = element_blank())+
+    geom_label_repel(data = terre_meta %>% filter(patient %in% warnings$SampleID),
+            aes(label = patient), size = 2.5, force = 10, nudge_x = -0.1, nudge_y = 0.1)
+
+#split by sex and PD case/control status
+ggplot(terre_meta, aes(x = age, y = DNAmAge_Horvath, group=PD, color=PD)) + geom_point() + scale_colour_manual(values=c("black","red")) + labs(x = "Reported age", y = "Predicted DNAm age (Horvath)", caption = "Age: DNAm vs. chronological") +  xlim(min,max) + ylim(min,max) +
+  geom_smooth(method="lm", colour="grey", size=0.5) +
+  stat_cor(method = "spearman", size = 3.5,label.x.npc = 0.7,label.y.npc = "bottom") +
+  theme_classic() + facet_wrap(~reportedSex, nrow=2)
+```
+![Horvath DNAm age](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/horvath_age_by_warning.png)
+
+There's not much pattern to samples with warnings on the age predictor, other than 358-2 clustering away as expected. The correlations between reported and predicted age vary so it's not clear if there are additional outliers based on epigenetic age prediction.
+
+![Horvath DNAm age by sex and PD status](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/horvath_age_by_sex_PD.png)
+
+There doesn't appear to be much difference between PD and non-PD.
+
+## Raw beta distibutions check
+
+```{r raw beta distr, eval=F}
+#plotting beta distributions before
+#split by sexchr/autosomes
+KH_Anno <- read.csv("~/KoborLab/kobor_space/shared_coding_resource/Illumina_EPIC/EPIC_KH_Annotation.csv", row.names = 1)
+length(Xprobes <- KH_Anno[KH_Anno$chr=="chrX","Name"]) #19,120
+length(Yprobes <- KH_Anno[KH_Anno$chr=="chrY","Name"]) #561
+
+## raw data
+dim(MSet) #865859    265
+terre_meta <- terre_meta[match(sampleNames(MSet), terre_meta$patient),]
+all.equal(sampleNames(MSet), as.character(terre_meta$patient)) #TRUE
+dim(MSet_raw_auto <- MSet[-which(rownames(MSet) %in% Xprobes|rownames(MSet) %in% Yprobes),]) #846232   265
+dim(MSet_raw_X <- MSet[which(rownames(MSet) %in% Xprobes),]) #19090   265
+dim(MSet_raw_Y <- MSet[which(rownames(MSet) %in% Yprobes),]) #537 265
+
+### autosomes
+Betas_raw_auto <-betas(MSet_raw_auto)
+Beta_raw_auto_sample<-Betas_raw_auto[sample(1:nrow(Betas_raw_auto), 100000),]
+Beta_raw_auto_sample_melted<- melt(Beta_raw_auto_sample)
+Beta_raw_auto_Plot<-Beta_raw_auto_sample_melted[which(Beta_raw_auto_sample_melted$value >= 0),]
+Beta_raw_auto_Plot<-merge(Beta_raw_auto_Plot,terre_meta, by.x="Var2", by.y="patient")
+raw_auto <- ggplot(Beta_raw_auto_Plot, aes(value, group=Var2, color=Var2))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw autosomes") + theme(legend.position = "none")
+
+### X
+Betas_raw_X <-betas(MSet_raw_X)
+Beta_raw_X_sample_melted<- melt(Betas_raw_X)
+Beta_raw_X_Plot<-Beta_raw_X_sample_melted[which(Beta_raw_X_sample_melted$value >= 0),]
+Beta_raw_X_Plot<-merge(Beta_raw_X_Plot,terre_meta, by.x="Var2", by.y="patient")
+raw_X <- ggplot(Beta_raw_X_Plot, aes(value, group=Var2, color=Var2))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Xchr") + theme(legend.position = "none")
+
+### Y
+Betas_raw_Y <-betas(MSet_raw_Y)
+Beta_raw_Y_sample_melted<- melt(Betas_raw_Y)
+Beta_raw_Y_Plot<-Beta_raw_Y_sample_melted[which(Beta_raw_Y_sample_melted$value >= 0),]
+Beta_raw_Y_Plot<-merge(Beta_raw_Y_Plot,terre_meta, by.x="Var2", by.y="patient")
+raw_Y <- ggplot(Beta_raw_Y_Plot, aes(value, group=Var2, color=Var2))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Ychr") + theme(legend.position = "none")
+
+#plot all
+grid.arrange(raw_auto, raw_X, raw_Y, ncol=1, nrow=3)
+```
+![Raw data beta distributions](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/beta_distr_raw.png)
+
+Aside from 358-2 (the completely failed sample), some of the sex probe distributions look a bit off.
+
+### X and Y chr beta distributions check
+
+Subsetting to samples flagged during earlier outlier/sex checks.
+
+```{r x check raw, eval=F}
+#samples initially flagged for conumee sex confirmation
+#add in 344-4 to metadata
+terre_meta[terre_meta$patient=="344-4","flag"] <- "Xchr check"
+terre_meta[complete.cases(terre_meta$flag),c("patient","reportedSex","predictedSex","flag")]
+#    patient reportedSex predictedSex                         flag
+#127   276-4           M            M Far from XY cluster centroid
+#148   344-4           M            M                   Xchr check
+#156   358-1           F            F Far from XY cluster centroid
+
+Beta_raw_X_Plot[Beta_raw_X_Plot$Var2=="344-4","flag"] <- "Xchr check"
+Beta_raw_Y_Plot[Beta_raw_Y_Plot$Var2=="344-4","flag"] <- "Xchr check"
+
+#all samples coloured by flag
+X_raw <- ggplot(Beta_raw_X_Plot, aes(value, group=Var2, color=flag))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Xchr")
+Y_raw <- ggplot(Beta_raw_Y_Plot, aes(value, group=Var2, color=flag))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Ychr")
+grid.arrange(X_raw, Y_raw, nrow=2, ncol=1)
+
+#flagged female samples only, coloured by xMed/yMed
+X_raw <- ggplot(Beta_raw_X_Plot[Beta_raw_X_Plot$reportedSex=="F",], aes(value, group=Var2, color=xMed))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Xchr")
+Y_raw <- ggplot(Beta_raw_Y_Plot[Beta_raw_Y_Plot$reportedSex=="F",], aes(value, group=Var2, color=yMed))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Ychr")
+grid.arrange(X_raw, Y_raw, nrow=2, ncol=1)
+
+#checking if already identified by other metrics
+outliers <- c("075-3", "075-4", "076-4", "084-2", "142-1", "175-2", "175-4", "196-3", "196-4", "225-1", "225-2", "276-1", "276-3", "276-4", "320-1", "321-1", "357-1", "357-3", "358-1",
+"359-2", "362-2", "449-1", "471-1", "471-2", "589-3", "652-2", "358-2", "344-4", "346-1", "346-2", "038-2", "344-2", "482-4")
+terre_meta[complete.cases(terre_meta$flag) & terre_meta$patient %in% outliers,"patient"] #"276-4" "344-4" "358-1"
+#all were already flagged by at least one more metric 
+
+#closer check on sex chromosomes
+Beta_raw_X_Plot<-Beta_raw_X_sample_melted[which(Beta_raw_X_sample_melted$value >= 0),]
+Beta_raw_X_Plot<-merge(Beta_raw_X_Plot,terre_meta, by.x="Var2", by.y="Sample_Name")
+raw_X <- ggplot(Beta_raw_X_Plot, aes(value, group=Var2, color=failed))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Xchr")
+
+Beta_raw_Y_Plot<-Beta_raw_Y_sample_melted[which(Beta_raw_Y_sample_melted$value >= 0),]
+Beta_raw_Y_Plot<-merge(Beta_raw_Y_Plot,terre_meta, by.x="Var2", by.y="Sample_Name")
+raw_Y <- ggplot(Beta_raw_Y_Plot, aes(value, group=Var2, color=failed))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Ychr")
+
+grid.arrange(raw_X, raw_Y, ncol=1, nrow=2) 
+#odd female Xchr sample flagged as failed by ewastools (bisulfite II). but not unique to this sample...
+
+#plotting failed F samples and annotating sample IDs
+Beta_raw_X_Plot_noout <- Beta_raw_X_Plot[-which(Beta_raw_X_Plot$Var2 %in% outliers),]
+ggplot(Beta_raw_X_Plot_noout[Beta_raw_X_Plot_noout$failed==TRUE & Beta_raw_X_Plot_noout$reportedSex=="F",], aes(value, group=Var2, color=Var2))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Xchr with outliers removed")
+#498-4 has a shifted Xchr distribution
+```
+![Raw beta distribution on sex chromosomes, coloured by sample flag](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/beta_distr_sexchr_by_flag.png)
+
+Each of the previously flagged samples has either an odd Xchr or Ychr beta distribution.
+
+![Raw beta distribution on X chromosome with outliers removed, coloured by sample ID](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/beta_distr_raw_Xchr_noout.png)
+
+498-4 has a shifted beta distribution and should additonally be excluded.
+
+## Summary of flagged samples
+For each metric here I'll only list additional samples not identified by the metrics above it.
+```{r flagged samples, eval=F}
+#ewastools control metrics
+length(dblfail) #26 samples
+#getting sample IDs
+dblfail_ctrls <- terre_meta[terre_meta$id %in% dblfail,"patient"]
+
+#minfi M/U intensity - none
+
+#sex checks - 358-2, 344-4, 276-4
+
+#SNP probes clustering - 346-1, 346-2
+
+#contamination check - 038-2
+
+#bead count - none
+
+#average intensity - none
+
+#lumi outliers - 344-2, 482-4
+
+#wateRmelon outliers - none
+
+#sample-sample cor - none
+
+#PCA - none
+
+#epigenetic age - none
+
+#beta distribution - 498-4
+```
+
+## Samples to remove
+```{r sample removal, eval=F}
+to_remove <- unique(c(dblfail_ctrls, "358-2", "344-4", "276-4", "346-1", "346-2", "038-2", "344-2", "482-4", "498-4"))
+to_remove #33 in total
+# [1] "075-3" "075-4" "076-4" "084-2" "142-1" "175-2" "175-4" "196-3" "196-4" "225-1" "225-2" "276-1" "276-3" "276-4" "320-1" "321-1" "357-1" "357-3" "358-1"
+#[20] "359-2" "362-2" "449-1" "471-1" "471-2" "589-3" "652-2" "358-2" "344-4" "346-1" "346-2" "038-2" "344-2" "482-4"
+
+#comparing with previous round of preprocessing
+prev_outliers <- c("344-2", "358-2", "482-4", "346-1", "346-2")
+length(prev_outliers[prev_outliers %in% to_remove]) #all 5 identified here
+
+#remove and save object
+dim(PD_RG_Raw) #[1] 1051539     265
+dim(PD_RG_Raw_noout <- PD_RG_Raw[,-which(sampleNames(PD_RG_Raw) %in% to_remove)]) #[1] 1051539     231
+save(PD_RG_Raw_noout, file="~/KoborLab/Projects/TERRE/sschaffner/TERRE_RG_Raw_noout.RData")
+load("~/KoborLab/Projects/TERRE/sschaffner/TERRE_RG_Raw_noout.RData")
+```
+
+# Normalization
+
+Since analysis will be sex stratified, sex chromosomes can be retained; however, special considerations should be taken into account for normalization due to differing DNAm distirbutions of sex chromosomes and autosomes (e.g. from X inactivation). 
+
+I will use the "adjustedFunnorm" function from the wateRmelon package (Wang et al., Bioinformatics 2022). This approach first normalizes autosomes, then uses the methylation values from the autosomes to "correct" methylation measurements on the sex chromosomes. Adjusted Funnorm may reduce artificial bias between sexes as compared to traditional Funnorm.
+
+The adjustedFunnorm function includes noob background and dye bias correction by default.
+
+## adjustedFunnorm
+```{r adjfunnorm, eval=F}
+PD_RG_norm <- adjustedFunnorm(PD_RG_Raw_noout)
+save(PD_RG_norm, file="~/KoborLab/Projects/TERRE/TERRE_RG_norm.RData")
+terre_meta_sub <- terre_meta[terre_meta$patient %in% sampleNames(PD_RG_norm),]
+
+#plotting beta distributions before/after normalization
+#split by sexchr/autosomes
+KH_Anno <- read.csv("~/KoborLab/kobor_space/shared_coding_resource/Illumina_EPIC/EPIC_KH_Annotation.csv", row.names = 1)
+length(Xprobes <- KH_Anno[KH_Anno$chr=="chrX","Name"]) #19,120
+length(Yprobes <- KH_Anno[KH_Anno$chr=="chrY","Name"]) #561
+
+## raw data
+MSet_raw <- preprocessRaw(PD_RG_Raw_noout) 
+dim(MSet_raw) #865859    232
+dim(MSet_raw_auto <- MSet_raw[-which(rownames(MSet_raw) %in% Xprobes|rownames(MSet_raw) %in% Yprobes),]) #846232    231
+dim(MSet_raw_X <- MSet_raw[which(rownames(MSet_raw) %in% Xprobes),]) #19090   231
+dim(MSet_raw_Y <- MSet_raw[which(rownames(MSet_raw) %in% Yprobes),]) #537 231
+
+### autosomes
+Betas_raw_auto <-betas(MSet_raw_auto)
+Beta_raw_auto_sample<-Betas_raw_auto[sample(1:nrow(Betas_raw_auto), 100000),]
+Beta_raw_auto_sample_melted<- melt(Beta_raw_auto_sample)
+Beta_raw_auto_Plot<-Beta_raw_auto_sample_melted[which(Beta_raw_auto_sample_melted$value >= 0),]
+Beta_raw_auto_Plot<-merge(Beta_raw_auto_Plot,terre_meta, by.x="Var2", by.y="Sample_Name")
+raw_auto <- ggplot(Beta_raw_auto_Plot, aes(value, group=Var2, color=reportedSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw autosomes")
+
+### X
+Betas_raw_X <-betas(MSet_raw_X)
+Beta_raw_X_sample_melted<- melt(Betas_raw_X)
+Beta_raw_X_Plot<-Beta_raw_X_sample_melted[which(Beta_raw_X_sample_melted$value >= 0),]
+Beta_raw_X_Plot<-merge(Beta_raw_X_Plot,terre_meta, by.x="Var2", by.y="Sample_Name")
+raw_X <- ggplot(Beta_raw_X_Plot, aes(value, group=Var2, color=reportedSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Xchr")
+
+### Y
+Betas_raw_Y <-betas(MSet_raw_Y)
+Beta_raw_Y_sample_melted<- melt(Betas_raw_Y)
+Beta_raw_Y_Plot<-Beta_raw_Y_sample_melted[which(Beta_raw_Y_sample_melted$value >= 0),]
+Beta_raw_Y_Plot<-merge(Beta_raw_Y_Plot,terre_meta, by.x="Var2", by.y="Sample_Name")
+raw_Y <- ggplot(Beta_raw_Y_Plot, aes(value, group=Var2, color=reportedSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Ychr")
+
+## normalized data
+dim(PD_RG_norm) #865859    232
+dim(GSet_norm_auto <- PD_RG_norm[-which(rownames(PD_RG_norm) %in% Xprobes|rownames(PD_RG_norm) %in% Yprobes),]) #846232    231
+dim(GSet_norm_X <- PD_RG_norm[which(rownames(PD_RG_norm) %in% Xprobes),]) #19090   231
+dim(GSet_norm_Y <- PD_RG_norm[which(rownames(PD_RG_norm) %in% Yprobes),]) #537 231
+
+### autosomes
+Betas_norm_auto <-getBeta(GSet_norm_auto)
+Beta_norm_auto_sample<-Betas_norm_auto[sample(1:nrow(Betas_norm_auto), 100000),]
+Beta_norm_auto_sample_melted<- melt(Beta_norm_auto_sample)
+Beta_norm_auto_Plot<-Beta_norm_auto_sample_melted[which(Beta_norm_auto_sample_melted$value >= 0),]
+Beta_norm_auto_Plot<-merge(Beta_norm_auto_Plot,terre_meta, by.x="Var2", by.y="Sample_Name")
+norm_auto <- ggplot(Beta_norm_auto_Plot, aes(value, group=Var2, color=reportedSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Normalized autosomes")
+
+### X
+Betas_norm_X <-getBeta(GSet_norm_X)
+Beta_norm_X_sample_melted<- melt(Betas_norm_X)
+Beta_norm_X_Plot<-Beta_norm_X_sample_melted[which(Beta_norm_X_sample_melted$value >= 0),]
+Beta_norm_X_Plot<-merge(Beta_norm_X_Plot,terre_meta, by.x="Var2", by.y="Sample_Name")
+norm_X <- ggplot(Beta_norm_X_Plot, aes(value, group=Var2, color=reportedSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Normalized Xchr")
+
+### Y
+Betas_norm_Y <-getBeta(GSet_norm_Y)
+Beta_norm_Y_sample_melted<- melt(Betas_norm_Y)
+Beta_norm_Y_Plot<-Beta_norm_Y_sample_melted[which(Beta_norm_Y_sample_melted$value >= 0),]
+Beta_norm_Y_Plot<-merge(Beta_norm_Y_Plot,terre_meta, by.x="Var2", by.y="Sample_Name")
+norm_Y <- ggplot(Beta_norm_Y_Plot, aes(value, group=Var2, color=reportedSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Normalized Ychr")
+
+#plot all
+png("~/KoborLab/Projects/TERRE/sschafner/beta_distr_norm_231n.png")
+grid.arrange(raw_auto, norm_auto, raw_X, norm_X, raw_Y, norm_Y, ncol=2, nrow=3)
+dev.off()
+
+rm(raw_auto, norm_auto, raw_X, norm_X, raw_Y, norm_Y)
+```
+![Beta distributions before and after normalization](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/beta_distr_adj_funnorm_by_sex_231n.png)
+
+Everything looks cleaner after normalization.
+
+# Probe filtering
+
+I will first calculate the QC metrics/list of probes to remove using the raw object (BEFORE normalization). This is because funnorm imputes missing values, which might make probes that failed technical checks appear to be usable after normalization. Then I'll remove those probes from the normalized object.
+
+Probes to filter out:
+
+1. Those with low bead count/too many NA's (excluding female Ychr background signal)
+
+2. Cross-hybridizing probes
+
+3. Polymorphic probes
+
+## Poor performing probes
+
+Detection p values indicate whether a particular methylation intensity is statistically different from the average intensity over the negative control probes/background. P values which are greater than 0.01 are considered poor quality measurements.
+
+Every probe has multiple beads which serves as replicate readings/multiple measurements per sample. If a given probe for a given sample has fewer than 3 beads/reads that value is given an NA. Typically if a probe has NAs in 1% of samples or more then it is removed.
+
+```{r badprobe, eval=F}
+#getting detection p-values and bead count again (not saved)
+detP <- minfi::detectionP(PD_RG_Raw_noout)
+
+#replacing female Ychr values with NA so they don't count toward total 
+detP_noY <- detP
+detP_noY[rownames(detP_noY) %in% Yprobes,colnames(detP_noY) %in% terre_meta[terre_meta$reportedSex=="F","patient"]] <- NA
+detP <- detP[,match(terre_meta_sub$patient, colnames(detP))]
+detP_noY <- detP_noY[,match(terre_meta_sub$patient, colnames(detP_noY))]
+all(colnames(detP)==(as.character(terre_meta_sub$patient))) #TRUE
+all(colnames(detP_noY)==(as.character(terre_meta_sub$patient))) #TRUE
+
+bead <- beadcount(PD_RG_Raw_noout)
+colnames(bead) <- gsub('X', '', colnames(bead))
+colnames(bead) <- gsub('\\.', '-', colnames(bead))
+all(colnames(bead)%in%(terre_meta$patient)) #TRUE
+all(colnames(bead)==(terre_meta_sub$patient))
+
+# create a dummy matrix
+bad_probes <- matrix(data = F, nrow = nrow(detP), ncol = ncol(detP),
+                        dimnames = list(rownames(detP), colnames(detP))) %>% as.data.frame
+
+# now let us put 'TRUE' where detp > 0.01, or beadcount is < 3
+bad_probes[is.na(bead)] <- T
+bad_probes[detP_noY > 0.01] <- T #excluding female Y probes
+
+#Number of probes that had a significant amount of bad performing probes:
+n <- ncol(PD_RG_Raw_noout)
+bad_probes_count <- rowSums(bad_probes)
+sum(bad_probes_count > 0.010*n) #60290
+sum(bad_probes_count > 0.025*n) #28374
+sum(bad_probes_count > 0.05*n) #9506
+
+# bad probes, remove if > 5% missing
+probe_anno <- tibble(probe_ID = rownames(detP)) %>%
+  mutate(number_bad_probes = bad_probes_count)
+probe_bad <- probe_anno %>% filter(number_bad_probes > 0.05*n)  %>% pull(probe_ID)  %>%  as.data.frame() 
+#9,506 bad probes
+```
+
+## Cross-hybrizing probes
+
+Probes which are predicted to unintentionally bind to other regions throughout the genome other than their target region should be removed (cross hybridizing probes). Pidsley et. al (2016) did analysis to measure EPIC cross reactive probes. I will remove any probes which have been predicted to cross hybridize on the EPIC array.
+
+```{r cross hyb probes, eval=F}
+# from Pidsley (includes Price probes)
+EPIC_Cross_Hybrid <- read.csv("~/KoborLab/kobor_space/shared_coding_resource/Illumina_EPIC/EPIC_Cross_reactive_probes.csv" , row.names = 1) 
+length(EPIC_CH_Probes <- rownames(EPIC_Cross_Hybrid)) # 43254 cross hybridizing probes
+length(EPIC_CH_Probes[EPIC_CH_Probes %in% featureNames(PD_RG_norm)]) #43177
+length(EPIC_CH_Probes_additional <- EPIC_CH_Probes[-which(EPIC_CH_Probes %in% probe_bad$.)]) #42843
+length(EPIC_CH_Probes_additional[EPIC_CH_Probes_additional %in% featureNames(PD_RG_norm)]) #42766
+```
+
+## Polymorphic probes
+
+We remove probes which either measure a CpG which is also a SNP (polymorphic CpG) or contain a SNP within the probe. Only SNPs present in >5% of the population were removed. The additional SNP annotation was produced by Dr. Kasper Hansen. This includes SNPs located at the CpG site measured, some additional sites located within the probes and SNPs located at the single base pair extension location.
+
+```{r polymorphic probes, eval=F}
+# Subsetting fdata for probes with CpG_maf values less than 0.05 or NA
+CpG <- rownames(KH_Anno)[(KH_Anno$CpG_maf < 0.05) | is.na(KH_Anno$CpG_maf)]
+
+# Subsetting KH_Annoa for probes with SBE_maf values less than 0.05 or NA
+SBE <- rownames(KH_Anno)[(KH_Anno$SBE_maf < 0.05) | is.na(KH_Anno$SBE_maf)]
+
+# Finding the overlapping row names
+No_SNP_Conf <- intersect(CpG, SBE) #these are the probes to KEEP
+length(Conf_Probes <- rownames(KH_Anno)[-which(rownames(KH_Anno) %in% No_SNP_Conf)]) #11,726 probes to remove
+length(Conf_Probes[Conf_Probes %in% featureNames(PD_RG_norm)]) #11681
+length(Conf_Probes_additional <- Conf_Probes[-which(Conf_Probes %in% probe_bad$.|Conf_Probes %in% EPIC_CH_Probes)]) #9848
+length(Conf_Probes_additional[Conf_Probes_additional %in% featureNames(PD_RG_norm)]) #9810
+```
+
+# Probe filtering
+```{r probe filter, eval=F}
+length(probes_to_filter <- unique(c(probe_bad$., EPIC_CH_Probes, Conf_Probes))) #62197
+length(probes_to_filter[probes_to_filter %in% featureNames(PD_RG_norm)]) #62082
+dim(PD_RG_filtered <- PD_RG_norm[-which(featureNames(PD_RG_norm) %in% probes_to_filter),]) #803777    231
+save(PD_RG_filtered, file="~/KoborLab/Projects/TERRE/sschaffner/TERRE_RG_filtered.RData")
+
+rm(PD_RG_norm)
+write.csv(terre_meta_sub, file="~/KoborLab/Projects/TERRE/sschaffner/terre_meta_prbfilter.csv", row.names=F)
+```
+
+# Predicting cell type proportions
+
+I will predict cell type using the Houseman algorithm and auto-picked reference probes on RAW data. Note ECC11 in-house function produced odd estimates, so I am using the estimateCellCounts2 function.
+
+### IDOL reference (estimateCellCounts2)
+```{r celltype estimatecell2, eval=F}
+cellprop_ecc2_idol <- estimateCellCounts2(PD_RG_Raw_noout, compositeCellType = "Blood", probeSelect="IDOL", IDOLOptimizedCpGs = IDOLOptimizedCpGs, referencePlatform = "IlluminaHumanMethylationEPIC")
+
+counts <- cellprop_ecc2_idol$counts
+all.equal(rownames(counts), as.character(terre_meta$patient)) #TRUE
+terre_meta <- cbind(terre_meta, counts)
+write.csv(terre_meta, file="~/KoborLab/Projects/TERRE/sschaffner/terre_meta_cellprop.csv")
+
+cellprop_melt <- melt(terre_meta[,43:48])
+ggplot(cellprop_melt, aes(x=variable, y=value, col=variable)) + geom_jitter() + theme_bw() + ggtitle("estimateCellCounts2: raw data with IDOL probes")
+```
+![ECC2 predicted cell type proportions with IDOL reference](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/celltype_ECC2_idol450.png)
+### Extended IDOL reference (estimateCellCounts2)
+Note: IDOL probe selection not working as of Feb 2023, so opted to use auto-picked probes with the extended IDOL reference dataset.
+```{r celltype estimatecell2 ext, eval=F}
+library(ExperimentHub)  
+hub <- ExperimentHub()  
+query(hub, "FlowSorted.BloodExtended.EPIC")  
+FlowSorted.BloodExtended.EPIC <- hub[["EH5425"]] 
+save(FlowSorted.BloodExtended.EPIC, file="/mnt/scratch/KoborLab/Personal_Folders/sschaffner/FlowSorted.BloodExtended.EPIC.RData")
+
+#Feb 27. 2023: "IDOL" probe select not working due to a bug in retrieving data("IDOLOptimizedCpGsBloodExtended"). Maggie and Meingold suggested to use "auto" probe select for the moment.
+cellprop_ecc2_auto_ext2 <- estimateCellCounts2(PD_RG_Raw_noout, compositeCellType = "BloodExtended", probeSelect="auto", IDOLOptimizedCpGs = IDOLOptimizedCpGsBloodExtended, referencePlatform = "IlluminaHumanMethylationEPIC", cellTypes=c("Neu","Eos","Bas","Mono","Bnv","Bmem","CD4nv","CD4mem","Treg","CD8nv","CD8mem","NK"), referenceset="FlowSorted.BloodExtended.EPIC")
+#[estimateCellCounts2] Combining user data with reference (flow sorted) data.
+#Warning in asMethod(object) : NAs introduced by coercion
+#[estimateCellCounts2] Processing user and reference data together.
+#[estimateCellCounts2] Picking probes for composition estimation.
+#[estimateCellCounts2] Estimating proportion composition (prop), if you provide cellcounts those will be provided as counts in the composition estimation.
+
+counts2 <- cellprop_ecc2_auto_ext2$prop
+all.equal(rownames(counts2), as.character(terre_meta$patient)) #TRUE
+colnames(counts2) <- paste(colnames(counts2), "ext2", sep=".")
+terre_meta <- cbind(terre_meta, counts2)
+write.csv(terre_meta, file="/mnt/scratch/KoborLab/TERRE/sschaffner/2022/terre_meta_cellprop_ext2_02272023.csv", row.names=F)
+
+cellprop_melt <- melt(terre_meta[,c(7,13,61:72)], id.vars=c("reportedSex","PD"))
+ggplot(cellprop_melt, aes(x=variable, y=value, col=variable)) + geom_jitter() + theme_bw() + ggtitle("estimateCellCounts2: raw data with auto probes (extended)")
+
+# Comparing standard and extended estimations, by sex and PD status
+cellprop_melt <- melt(terre_meta[,c(7,13,43:48)], id.vars=c("reportedSex","PD"))
+cellprop_melt$PD <- as.factor(cellprop_melt$PD)
+idol1 <- ggplot(cellprop_melt, aes(x=variable, y=value, fill=PD)) + geom_boxplot() + theme_bw() + ggtitle("Standard cell types") + theme(axis.text.x=element_text(angle=90, hjust=1), axis.title.x=element_blank()) + ylim(c(0,1)) + facet_wrap(~reportedSex)
+
+cellprop_ext_melt <- melt(terre_meta[,c(7,13,61:72)], id.vars=c("reportedSex","PD"))
+cellprop_ext_melt$PD <- as.factor(cellprop_ext_melt$PD)
+idol2 <- ggplot(cellprop_ext_melt, aes(x=variable, y=value, fill=PD)) + geom_boxplot() + theme_bw() + ggtitle("Extended cell types") + theme(axis.text.x=element_text(angle=90, hjust=1), axis.title.x=element_blank()) + ylim(c(0,1)) + facet_wrap(~reportedSex)
+
+grid.arrange(idol1, idol2, nrow=2)
+```
+![ECC2 predicted cell type proportions with IDOL extended reference](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/celltype_ECC2_autoextended.png)
+
+#### Significance testing for cell type differences between PD cases and controls
+```{r sig test, eval=F}
+########## standard cell types significance test
+#testing significance: standard cell types, sexes combined
+pvals_std <- c("CD8T"=t.test(terre_meta[terre_meta$PD==0,"CD8T"],terre_meta[terre_meta$PD==1,"CD8T"])$p.value,
+               "CD4T"=t.test(terre_meta[terre_meta$PD==0,"CD4T"],terre_meta[terre_meta$PD==1,"CD4T"])$p.value,
+               "NK"=t.test(terre_meta[terre_meta$PD==0,"NK"],terre_meta[terre_meta$PD==1,"NK"])$p.value,
+               "Bcell"=t.test(terre_meta[terre_meta$PD==0,"Bcell"],terre_meta[terre_meta$PD==1,"Bcell"])$p.value,
+               "Mono"=t.test(terre_meta[terre_meta$PD==0,"Mono"],terre_meta[terre_meta$PD==1,"Mono"])$p.value,
+               "Neu"=t.test(terre_meta[terre_meta$PD==0,"Neu"],terre_meta[terre_meta$PD==1,"Neu"])$p.value)
+sort(pvals_std)
+#     Bcell         NK       Mono        Neu       CD8T       CD4T 
+#0.01376623 0.02072089 0.15864034 0.33761111 0.55576668 0.57166628
+
+sort(p.adjust(pvals_std))
+#     Bcell         NK       Mono       CD8T       CD4T        Neu 
+#0.08259736 0.10360444 0.63456138 1.00000000 1.00000000 1.00000000
+
+#testing significance: standard cell types, females
+pvals_std_F <- c("CD8T"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","CD8T"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","CD8T"])$p.value,
+               "CD4T"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","CD4T"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","CD4T"])$p.value,
+               "NK"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","NK"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","NK"])$p.value,
+               "Bcell"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","Bcell"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","Bcell"])$p.value,
+               "Mono"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","Mono"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","Mono"])$p.value,
+               "Neu"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","Neu"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","Neu"])$p.value)
+sort(pvals_std_F)
+#        NK      Bcell       Mono       CD4T       CD8T        Neu 
+#0.02170621 0.03861371 0.24104988 0.40884266 0.76633775 0.78448164
+
+sort(p.adjust(pvals_std_F))
+#       NK     Bcell      Mono      CD8T      CD4T       Neu 
+#0.1302373 0.1930686 0.9641995 1.0000000 1.0000000 1.0000000
+
+#testing significance: standard cell types, males
+pvals_std_M <- c("CD8T"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","CD8T"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","CD8T"])$p.value,
+               "CD4T"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","CD4T"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","CD4T"])$p.value,
+               "NK"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","NK"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","NK"])$p.value,
+               "Bcell"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","Bcell"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","Bcell"])$p.value,
+               "Mono"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","Mono"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","Mono"])$p.value,
+               "Neu"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","Neu"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","Neu"])$p.value)
+sort(pvals_std_M)
+#      CD4T        Neu      Bcell         NK       CD8T       Mono 
+#0.08534781 0.10209358 0.12466564 0.24974240 0.30382029 0.39986785 
+
+sort(p.adjust(pvals_std_M))
+#     CD4T     Bcell       Neu      CD8T        NK      Mono 
+#0.5120869 0.5120869 0.5120869 0.7492272 0.7492272 0.7492272 
+
+########## extended cell types significance test
+#testing significance: extended cell types, sexes combined
+pvals_ext <- c("Neu.ext2"=t.test(terre_meta[terre_meta$PD==0,"Neu.ext2"],terre_meta[terre_meta$PD==1,"Neu.ext2"])$p.value,
+               "Eos.ext2"=t.test(terre_meta[terre_meta$PD==0,"Eos.ext2"],terre_meta[terre_meta$PD==1,"Eos.ext2"])$p.value,
+               "Bas.ext2"=t.test(terre_meta[terre_meta$PD==0,"Bas.ext2"],terre_meta[terre_meta$PD==1,"Bas.ext2"])$p.value,
+               "Mono.ext2"=t.test(terre_meta[terre_meta$PD==0,"Mono.ext2"],terre_meta[terre_meta$PD==1,"Mono.ext2"])$p.value,
+               "Bnv.ext2"=t.test(terre_meta[terre_meta$PD==0,"Bnv.ext2"],terre_meta[terre_meta$PD==1,"Bnv.ext2"])$p.value,
+               "Bmem.ext2"=t.test(terre_meta[terre_meta$PD==0,"Bmem.ext2"],terre_meta[terre_meta$PD==1,"Bmem.ext2"])$p.value,
+               "CD4nv.ext2"=t.test(terre_meta[terre_meta$PD==0,"CD4nv.ext2"],terre_meta[terre_meta$PD==1,"CD4nv.ext2"])$p.value,
+               "CD4mem.ext2"=t.test(terre_meta[terre_meta$PD==0,"CD4mem.ext2"],terre_meta[terre_meta$PD==1,"CD4mem.ext2"])$p.value,
+               "Treg.ext2"=t.test(terre_meta[terre_meta$PD==0,"Treg.ext2"],terre_meta[terre_meta$PD==1,"Treg.ext2"])$p.value,
+               "CD8nv.ext2"=t.test(terre_meta[terre_meta$PD==0,"CD8nv.ext2"],terre_meta[terre_meta$PD==1,"CD8nv.ext2"])$p.value,
+               "CD8mem.ext2"=t.test(terre_meta[terre_meta$PD==0,"CD8mem.ext2"],terre_meta[terre_meta$PD==1,"CD8mem.ext2"])$p.value,
+               "NK.ext2"=t.test(terre_meta[terre_meta$PD==0,"NK.ext2"],terre_meta[terre_meta$PD==1,"NK.ext2"])$p.value)
+sort(pvals_ext)
+#   Bnv.ext2    Eos.ext2     NK.ext2   Mono.ext2    Bas.ext2    Neu.ext2  CD8nv.ext2  CD4nv.ext2   Bmem.ext2 CD4mem.ext2   Treg.ext2 CD8mem.ext2 
+# 0.02690302  0.03823803  0.04465357  0.06627828  0.10791848  0.19622768  0.30836951  0.33747504  0.42146438  0.42686749  0.46333677  0.72559069 
+
+sort(p.adjust(pvals_ext))
+#   Bnv.ext2    Eos.ext2     NK.ext2   Mono.ext2    Bas.ext2    Neu.ext2   Bmem.ext2  CD4nv.ext2 CD4mem.ext2   Treg.ext2  CD8nv.ext2 CD8mem.ext2 
+#  0.3228363   0.4206183   0.4465357   0.5965045   0.8633479   1.0000000   1.0000000   1.0000000   1.0000000   1.0000000   1.0000000   1.0000000 
+
+#testing significance: extended cell types, females
+pvals_ext_F <- c("Neu.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","Neu.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","Neu.ext2"])$p.value,
+               "Eos.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","Eos.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","Eos.ext2"])$p.value,
+               "Bas.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","Bas.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","Bas.ext2"])$p.value,
+               "Mono.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","Mono.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","Mono.ext2"])$p.value,
+               "Bnv.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","Bnv.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","Bnv.ext2"])$p.value,
+               "Bmem.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","Bmem.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","Bmem.ext2"])$p.value,
+               "CD4nv.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","CD4nv.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","CD4nv.ext2"])$p.value,
+               "CD4mem.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","CD4mem.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","CD4mem.ext2"])$p.value,
+               "Treg.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","Treg.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","Treg.ext2"])$p.value,
+               "CD8nv.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","CD8nv.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","CD8nv.ext2"])$p.value,
+               "CD8mem.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","CD8mem.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","CD8mem.ext2"])$p.value,
+               "NK.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","NK.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","NK.ext2"])$p.value)
+sort(pvals_ext_F)
+#    NK.ext2   Mono.ext2   Bmem.ext2    Bnv.ext2   Treg.ext2    Eos.ext2  CD4nv.ext2 CD8mem.ext2 CD4mem.ext2  CD8nv.ext2    Bas.ext2    Neu.ext2 
+# 0.01595446  0.11955689  0.16118257  0.24722855  0.27082537  0.34454516  0.44104729  0.63968713  0.84204580  0.91194181  0.97753978  0.97939900 
+
+sort(p.adjust(pvals_ext_F))
+#    NK.ext2    Neu.ext2    Eos.ext2    Bas.ext2   Mono.ext2    Bnv.ext2   Bmem.ext2  CD4nv.ext2 CD4mem.ext2   Treg.ext2  CD8nv.ext2 CD8mem.ext2 
+#  0.1914535   1.0000000   1.0000000   1.0000000   1.0000000   1.0000000   1.0000000   1.0000000   1.0000000   1.0000000   1.0000000   1.0000000 
+
+#testing significance: extended cell types, males
+pvals_ext_M <-  c("Neu.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","Neu.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","Neu.ext2"])$p.value,
+               "Eos.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","Eos.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","Eos.ext2"])$p.value,
+               "Bas.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","Bas.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","Bas.ext2"])$p.value,
+               "Mono.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","Mono.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","Mono.ext2"])$p.value,
+               "Bnv.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","Bnv.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","Bnv.ext2"])$p.value,
+               "Bmem.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","Bmem.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","Bmem.ext2"])$p.value,
+               "CD4nv.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","CD4nv.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","CD4nv.ext2"])$p.value,
+               "CD4mem.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","CD4mem.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","CD4mem.ext2"])$p.value,
+               "Treg.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","Treg.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","Treg.ext2"])$p.value,
+               "CD8nv.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","CD8nv.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","CD8nv.ext2"])$p.value,
+               "CD8mem.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","CD8mem.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","CD8mem.ext2"])$p.value,
+               "NK.ext2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","NK.ext2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","NK.ext2"])$p.value)
+sort(pvals_ext_M)
+#   Bas.ext2    Bnv.ext2  CD4nv.ext2    Eos.ext2    Neu.ext2  CD8nv.ext2 CD4mem.ext2   Mono.ext2     NK.ext2   Bmem.ext2   Treg.ext2 CD8mem.ext2 
+# 0.02647961  0.03664657  0.03724451  0.04848533  0.06102969  0.06777564  0.23785890  0.27714885  0.48413268  0.81487931  0.85789520  0.93036951 
+
+sort(p.adjust(pvals_ext_M))
+#   Bas.ext2    Bnv.ext2  CD4nv.ext2    Eos.ext2    Neu.ext2  CD8nv.ext2   Mono.ext2   Bmem.ext2 CD4mem.ext2   Treg.ext2 CD8mem.ext2     NK.ext2 
+#  0.3177553   0.4031123   0.4031123   0.4363680   0.4882375   0.4882375   1.0000000   1.0000000   1.0000000   1.0000000   1.0000000   1.0000000 
+```
+![Predicted cell type proportions split by PD status, with sexes combined](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/celltype_std_ext_all_v2.png)
+
+![Predicted cell type proportions split by PD status, with sex stratification](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/celltype_std_ext_by_sex_v2.png)
+
+Almost nothing is significantly different after multiple test correction.
+
+## Robust PCA for extended cell types
+Next I'll try generating cell type PCs and check whether this reduces correlation with PD status.
+```{r cell pca, eval=F}
+source("/mnt/scratch/KoborLab/shared_coding_resource/pcaCoDa_NG.R")
+CompMatrix <- abs(terre_meta[,61:72]) #Take the absolute value because sometimes extremely small values can be estimated as negative, which is not actually possible for a proportion. 
+
+#Because some of the proportions can be estimated to be exactly 0, this is a problem for the log transformation. Therefore, for the values that are 0, we need to add a small offset
+sum(CompMatrix==0) #62
+CompMatrix <- (CompMatrix + 0.001)
+min(CompMatrix) #0.001
+
+pca_object <- pcaCoDa(CompMatrix)
+summary(pca_object$princompOutputClr)
+#Importance of components:
+#                          Comp.1    Comp.2    Comp.3     Comp.4     Comp.5     Comp.6     Comp.7
+#Standard deviation     0.8047259 0.7624896 0.5721397 0.46263079 0.39038591 0.36840604 0.28385804
+#Proportion of Variance 0.2787130 0.2502241 0.1408853 0.09211501 0.06559181 0.05841372 0.03467877
+#Cumulative Proportion  0.2787130 0.5289372 0.6698224 0.76193744 0.82752925 0.88594297 0.92062174
+#                           Comp.8     Comp.9    Comp.10     Comp.11
+#Standard deviation     0.25637019 0.23695455 0.20105730 0.148783422
+#Proportion of Variance 0.02828762 0.02416526 0.01739807 0.009527313
+#Cumulative Proportion  0.94890936 0.97307462 0.99047269 1.000000000
+
+plot(pca_object$princompOutputClr) 
+
+CTP_ilrPCAScores <- as.data.frame(pca_object$scores) #Pull the PC scores out of the pca_object
+CTP_ilrPCAScores$Sample_ID <- terre_meta$patient #should be same order as CompMatrix
+colnames(CTP_ilrPCAScores) <- c("CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4", "CTP_PC5", "CTP_PC6", "CTP_PC7", "CTP_PC8", "CTP_PC9", "CTP_PC10", "CTP_PC11", "patient")
+all.equal(CTP_ilrPCAScores$patient, terre_meta$patient) #TRUE
+terre_meta <- cbind(terre_meta, CTP_ilrPCAScores[,1:11])
+```
+![Scree plot for PCA on extended cell type proportions](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/pca_extcelltype_scree_v2.png)
+
+The first 6 PCs account for 89% of variance in cell type.
+
+### Testing difference in extended cell type PCs between PD patients and controls
+```{r celltype estimatecell2 ext diff, eval=F}
+########## extended cell types significance test
+#testing significance: extended cell types, sexes combined
+pvals_ext <- c("CTP_PC1"=t.test(terre_meta[terre_meta$PD==0,"CTP_PC1"],terre_meta[terre_meta$PD==1,"CTP_PC1"])$p.value,
+               "CTP_PC2"=t.test(terre_meta[terre_meta$PD==0,"CTP_PC2"],terre_meta[terre_meta$PD==1,"CTP_PC2"])$p.value,
+               "CTP_PC3"=t.test(terre_meta[terre_meta$PD==0,"CTP_PC3"],terre_meta[terre_meta$PD==1,"CTP_PC3"])$p.value,
+               "CTP_PC4"=t.test(terre_meta[terre_meta$PD==0,"CTP_PC4"],terre_meta[terre_meta$PD==1,"CTP_PC4"])$p.value,
+               "CTP_PC5"=t.test(terre_meta[terre_meta$PD==0,"CTP_PC5"],terre_meta[terre_meta$PD==1,"CTP_PC5"])$p.value,
+               "CTP_PC6"=t.test(terre_meta[terre_meta$PD==0,"CTP_PC6"],terre_meta[terre_meta$PD==1,"CTP_PC6"])$p.value,
+               "CTP_PC7"=t.test(terre_meta[terre_meta$PD==0,"CTP_PC7"],terre_meta[terre_meta$PD==1,"CTP_PC7"])$p.value,
+               "CTP_PC8"=t.test(terre_meta[terre_meta$PD==0,"CTP_PC8"],terre_meta[terre_meta$PD==1,"CTP_PC8"])$p.value,
+               "CTP_PC9"=t.test(terre_meta[terre_meta$PD==0,"CTP_PC9"],terre_meta[terre_meta$PD==1,"CTP_PC9"])$p.value,
+               "CTP_PC10"=t.test(terre_meta[terre_meta$PD==0,"CTP_PC10"],terre_meta[terre_meta$PD==1,"CTP_PC10"])$p.value,
+               "CTP_PC11"=t.test(terre_meta[terre_meta$PD==0,"CTP_PC11"],terre_meta[terre_meta$PD==1,"CTP_PC11"])$p.value)
+sort(pvals_ext)
+#   CTP_PC2   CTP_PC10    CTP_PC9    CTP_PC8    CTP_PC3   CTP_PC11    CTP_PC6    CTP_PC7    CTP_PC1 
+#0.01352766 0.03550328 0.04210816 0.07848843 0.31645414 0.32608591 0.48153158 0.59324105 0.67059077 
+#   CTP_PC5    CTP_PC4 
+#0.91897544 0.95222397 
+
+sort(p.adjust(pvals_ext))
+#  CTP_PC2  CTP_PC10   CTP_PC9   CTP_PC8   CTP_PC1   CTP_PC3   CTP_PC4   CTP_PC5   CTP_PC6   CTP_PC7 
+#0.1488043 0.3550328 0.3789735 0.6279074 1.0000000 1.0000000 1.0000000 1.0000000 1.0000000 1.0000000 
+# CTP_PC11 
+#1.0000000 
+
+#testing significance: extended cell types, females
+pvals_ext_F <- c("CTP_PC1"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","CTP_PC1"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","CTP_PC1"])$p.value,
+               "CTP_PC2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","CTP_PC2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","CTP_PC2"])$p.value,
+               "CTP_PC3"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","CTP_PC3"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","CTP_PC3"])$p.value,
+               "CTP_PC4"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","CTP_PC4"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","CTP_PC4"])$p.value,
+               "CTP_PC5"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","CTP_PC5"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","CTP_PC5"])$p.value,
+               "CTP_PC6"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","CTP_PC6"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","CTP_PC6"])$p.value,
+               "CTP_PC7"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","CTP_PC7"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","CTP_PC7"])$p.value,
+               "CTP_PC8"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","CTP_PC8"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","CTP_PC8"])$p.value,
+               "CTP_PC9"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","CTP_PC9"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","CTP_PC9"])$p.value,
+               "CTP_PC10"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","CTP_PC10"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","CTP_PC10"])$p.value,
+               "CTP_PC11"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="F","CTP_PC11"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="F","CTP_PC11"])$p.value)
+sort(pvals_ext_F)
+#   CTP_PC10    CTP_PC11     CTP_PC8     CTP_PC5     CTP_PC3     CTP_PC6     CTP_PC2     CTP_PC4 
+#0.002062869 0.168949159 0.169289695 0.260442904 0.265388873 0.336193635 0.498455976 0.539248752 
+#    CTP_PC7     CTP_PC9     CTP_PC1 
+#0.558892214 0.804311978 0.914913761 
+
+sort(p.adjust(pvals_ext_F))
+#  CTP_PC10    CTP_PC1    CTP_PC2    CTP_PC3    CTP_PC4    CTP_PC5    CTP_PC6    CTP_PC7    CTP_PC8 
+#0.02269155 1.00000000 1.00000000 1.00000000 1.00000000 1.00000000 1.00000000 1.00000000 1.00000000 
+#   CTP_PC9   CTP_PC11 
+#1.00000000 1.00000000 
+
+#testing significance: extended cell types, males
+pvals_ext_M <-  c("CTP_PC1"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","CTP_PC1"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","CTP_PC1"])$p.value,
+               "CTP_PC2"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","CTP_PC2"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","CTP_PC2"])$p.value,
+               "CTP_PC3"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","CTP_PC3"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","CTP_PC3"])$p.value,
+               "CTP_PC4"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","CTP_PC4"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","CTP_PC4"])$p.value,
+               "CTP_PC5"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","CTP_PC5"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","CTP_PC5"])$p.value,
+               "CTP_PC6"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","CTP_PC6"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","CTP_PC6"])$p.value,
+               "CTP_PC7"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","CTP_PC7"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","CTP_PC7"])$p.value,
+               "CTP_PC8"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","CTP_PC8"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","CTP_PC8"])$p.value,
+               "CTP_PC9"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","CTP_PC9"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","CTP_PC9"])$p.value,
+               "CTP_PC10"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","CTP_PC10"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","CTP_PC10"])$p.value,
+               "CTP_PC11"=t.test(terre_meta[terre_meta$PD==0&terre_meta$reportedSex=="M","CTP_PC11"],terre_meta[terre_meta$PD==1&terre_meta$reportedSex=="M","CTP_PC11"])$p.value)
+sort(pvals_ext_M)
+#    CTP_PC2     CTP_PC9     CTP_PC8     CTP_PC5     CTP_PC3     CTP_PC1     CTP_PC4     CTP_PC7 
+#0.007662312 0.009762795 0.277515619 0.347747566 0.531435872 0.623494125 0.712816612 0.798630245 
+#    CTP_PC6    CTP_PC11    CTP_PC10 
+#0.812965806 0.921948436 0.967367099 
+
+sort(p.adjust(pvals_ext_M))
+#   CTP_PC2    CTP_PC9    CTP_PC1    CTP_PC3    CTP_PC4    CTP_PC5    CTP_PC6    CTP_PC7    CTP_PC8 
+#0.08428543 0.09762795 1.00000000 1.00000000 1.00000000 1.00000000 1.00000000 1.00000000 1.00000000 
+#  CTP_PC10   CTP_PC11 
+#1.00000000 1.00000000 
+```
+
+# Meta data correlation matrix
+```{r meta data cor, eval=F}
+source("/mnt/scratch/KoborLab/TERRE/sschaffner/2022/correlation_pval.R")
+
+#Create correlation matrix
+cormat <- correlation_pval(terre_meta)
+
+# Get lower triangle of the correlation matrix
+get_lower_tri<-function(cormat){
+    cormat[upper.tri(cormat)] <- NA
+    return(cormat)
+  }
+# Get upper triangle of the correlation matrix
+get_upper_tri <- function(cormat){
+    cormat[lower.tri(cormat)]<- NA
+    return(cormat)
+  }
+
+upper_tri <- get_upper_tri(cormat)
+
+#colour if sig
+for(x in 1:nrow(upper_tri)){
+  for(y in 1:ncol(upper_tri)){
+    if(is.na(upper_tri[x,y])==FALSE){
+    if(as.numeric(upper_tri[x,y])<=0.001){upper_tri[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri[x,y])<=0.01){upper_tri[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri[x,y])<=0.05){upper_tri[x,y]<-"<=0.05"}else{upper_tri[x,y]<-">0.05"}}}}
+  }}
+melted_cormat <- reshape2::melt(upper_tri, na.rm = TRUE)
+png("/mnt/scratch/KoborLab/TERRE/sschaffner/2022/meta_cor_extCTPCA_032023.png", width=1200, height=1200)
+ggplot(data = melted_cormat, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+
+## females only
+meta_F <- terre_meta[terre_meta$reportedSex=="F",]
+cormat_F <- correlation_pval(meta_F)
+upper_tri_F <- get_upper_tri(cormat_F)
+for(x in 1:nrow(upper_tri_F)){
+  for(y in 1:ncol(upper_tri_F)){
+    if(is.na(upper_tri_F[x,y])==FALSE){
+    if(as.numeric(upper_tri_F[x,y])<=0.001){upper_tri_F[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri_F[x,y])<=0.01){upper_tri_F[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri_F[x,y])<=0.05){upper_tri_F[x,y]<-"<=0.05"}else{upper_tri_F[x,y]<-">0.05"}}}}
+  }}
+melted_cormat_F <- reshape2::melt(upper_tri_F, na.rm = TRUE)
+png("/mnt/scratch/KoborLab/TERRE/sschaffner/2022/meta_cor_extCTPCA_F_032023.png", width=1200, height=1200)
+ggplot(data = melted_cormat_F, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+
+## males only
+meta_M <- terre_meta[terre_meta$reportedSex=="M",]
+cormat_M <- correlation_pval(meta_M)
+upper_tri_M <- get_upper_tri(cormat_M)
+for(x in 1:nrow(upper_tri_M)){
+  for(y in 1:ncol(upper_tri_M)){
+    if(is.na(upper_tri_M[x,y])==FALSE){
+    if(as.numeric(upper_tri_M[x,y])<=0.001){upper_tri_M[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri_M[x,y])<=0.01){upper_tri_M[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri_M[x,y])<=0.05){upper_tri_M[x,y]<-"<=0.05"}else{upper_tri_M[x,y]<-">0.05"}}}}
+  }}
+melted_cormat_M <- reshape2::melt(upper_tri_M, na.rm = TRUE)
+png("/mnt/scratch/KoborLab/TERRE/sschaffner/2022/meta_cor_extCTPCA_M_032023.png", width=1200, height=1200)
+ggplot(data = melted_cormat_M, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+
+#plotting plate vs snpoutlier probability
+#ggplot(terre_meta, aes(x=plate, y=outlier)) + geom_point(position=position_jitter(width=0.2)) + geom_smooth(method="lm") + theme_bw() + theme(legend.position = "none") + ylab("ewastools probability of SNP outliers") + stat_cor(method="spearman", label.y.npc = "top")
+```
+![Meta data correlation in both sexes](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/meta_cor_extCTPCA_032023.png)
+
+![Meta data correlation in females](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/meta_cor_extCTPCA_F_032023.png)
+
+
+![Meta data correlation in males](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/meta_cor_extCTPCA_M_032023.png)
+
+
+# Principal component analysis
+
+Next I'll use PCA to look at sources of variation in the data. This will also guide batch correction with ComBat. Code from Nicole Gladish.
+
+## PCA on raw data
+```{r pca raw, eval=F}
+#terre_meta <- read.csv("~/KoborLab/Projects/TERRE/sschaffner/terre_meta_cellprop.csv")
+
+load("~/KoborLab/Projects/TERRE/sschaffner/TERRE_RG_filtered.RData")
+load("~/KoborLab/Projects/TERRE/sschaffner/TERRE_RG_Raw_noout.RData")
+
+# Here are the arguments you can add (and their defaults): 
+# PCA_Plot(PCA_Object, type = c("All", "Sparse"), nPCs = 10, MTC = F, Discrete = T, label.y_size = 12, label.x_size = 12, angle.x = 30, vjust.x = 0.5)
+# Here is what some arguments do: 
+# type = c("All", "Sparse") - this is to tell it whether your PCA_Object results from a sparse or regular PCA (it does not do it for you it just tells the function what you have).
+# nPCs - how many PCs do you want to plot
+# MTC = F - do you want the associations multiple test corrected? BH is the method I include here
+# Discrete = T, do you want a continuous display of significane values or discrete?
+
+#restructing meta data and subsetting to categorical/continuous
+nrow(terre_meta <- terre_meta[terre_meta$patient %in% sampleNames(PD_RG_Raw_noout),]) #231
+str(terre_meta)
+terre_meta$levodopa <- as.factor(terre_meta$levodopa)
+terre_meta$edu <- as.factor(terre_meta$edu)
+terre_meta$reportedSex <- as.factor(terre_meta$reportedSex)
+terre_meta$smoking <- as.factor(terre_meta$smoking)
+terre_meta$pesticides <- as.factor(terre_meta$pesticides)
+terre_meta$head_trauma <- as.factor(terre_meta$head_trauma)
+terre_meta$PD <- as.factor(terre_meta$PD)
+terre_meta$agonist <- as.factor(terre_meta$agonist)
+terre_meta$SentrixBarcode_A <- as.factor(terre_meta$SentrixBarcode_A)
+terre_meta$plate <- as.factor(terre_meta$plate)
+terre_meta$alcohol1 <- as.factor(terre_meta$alcohol1)
+terre_meta$alochol5 <- as.factor(terre_meta$alcohol5)
+terre_meta$ethnicity <- as.factor(terre_meta$ethnicity)
+terre_meta$marital <- as.factor(terre_meta$marital)
+rownames(terre_meta) <- terre_meta$patient
+
+meta_categorical <- terre_meta[,c("plate", "SentrixBarcode_A", "SentrixPosition_A", "Sample_Well", "reportedSex", "PD", "ethnicity", "levodopa", "agonist", "edu", "smoking", "pesticides", "head_trauma", "marital", "alcohol1", "alcohol5")]
+
+meta_continuous <- terre_meta[,c("age", "age_onset", "dis_duration","MMS", "time_sto", "bmi", "alcohol2", "alcohol3", "alcohol4", "CD8T", "CD4T", "NK", "Bcell", "Mono", "Neu")]
+
+#PCA on beta values: input
+betas_raw <- getBeta(PD_RG_Raw_noout)
+all.equal(colnames(betas_raw), rownames(meta_categorical)) #TRUE
+PCA_full<-princomp(betas_raw[complete.cases(betas_raw),])
+
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+PCA_Plot(PCA_full, type="sparse", MTC=T, Discrete=T)
+```
+![PCA on raw data - scree](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/PCA_raw_scree_celltype.png)
+
+![PCA on raw data - heat map](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/PCA_raw_heat_legend_celltype.png)
+
+Batch effects, sex, smoking, pesticides, alcohol, and cell type are the largest contributors to variation.
+
+## PCA on normalized and probe-filtered data
+```{r pca norm, eval=F}
+betas_norm <- getBeta(PD_RG_filtered)
+all.equal(colnames(betas_norm), rownames(meta_categorical)) #TRUE
+
+#PCA on beta values: input
+PCA_full<-princomp(betas_norm[complete.cases(betas_norm),])
+
+PCA_Plot(PCA_full, type="sparse", MTC=T, Discrete=T)
+```
+![PCA on normalized and filtered data - scree](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/PCA_norm_scree_celltype.png)
+
+![PCA on normalized and filtered data - heat map](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/PCA_norm_heat_legend_celltype.png)
+
+After normalization and probe filtering, batch effects contribution was slightly reduced but still high. Sex, smoking, pesticides, and alcohol are still loading onto the first PCs, now accompanied by stronger effects of age and cell type (CD8T). PD is not loading onto the first 10 PCs...
+
+## Females PCA
+```{r pca norm F, eval=F}
+meta_F <- terre_meta[terre_meta$reportedSex=="F",]
+betas_norm_F <- getBeta(PD_RG_filtered[,sampleNames(PD_RG_filtered) %in% meta_F$patient])
+all.equal(colnames(betas_norm_F), rownames(meta_F)) #TRUE
+
+#PCA on beta values: input
+PCA_full<-princomp(betas_norm_F[complete.cases(betas_norm_F),])
+meta_categorical <- meta_F[,c("plate", "SentrixBarcode_A", "SentrixPosition_A", "Sample_Well", "PD", "ethnicity", "levodopa", "agonist", "edu", "smoking", "pesticides", "head_trauma", "marital", "alcohol1", "alcohol5")]
+meta_continuous <- meta_F[,c("age", "age_onset", "dis_duration","MMS", "time_sto", "bmi", "CD8T", "CD4T", "NK", "Bcell", "Mono", "Neu")]
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)
+```
+![PCA scree plot for females: normalized, uncorrected data](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/PCA_F_norm_scree_celltype.png)
+
+![PCA heat map for females: normalized, uncorrected data](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/PCA_F_norm_heat_legend_celltype.png)
+
+Batch effects are less prominent, no smoking effects, and cell type effects are more prominent when data is subset to females.
+
+## Males PCA
+```{r pca norm M, eval=F}
+meta_M <- terre_meta[terre_meta$reportedSex=="M",]
+betas_norm_M <- getBeta(PD_RG_filtered[,sampleNames(PD_RG_filtered) %in% meta_M$patient])
+all.equal(colnames(betas_norm_M), rownames(meta_M)) #TRUE
+
+#PCA on beta values: input
+PCA_full<-princomp(betas_norm_M[complete.cases(betas_norm_M),])
+meta_categorical <- meta_M[,c("plate", "SentrixBarcode_A", "SentrixPosition_A", "Sample_Well", "PD", "ethnicity", "levodopa", "agonist", "edu", "smoking", "pesticides", "head_trauma", "marital", "alcohol1", "alcohol5", "CD8T", "CD4T", "NK", "Bcell", "Mono", "Neu")]
+meta_continuous <- meta_M[,c("age", "age_onset", "dis_duration","MMS", "time_sto", "bmi", "alcohol2", "alcohol3", "alcohol4")]
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)
+```
+![PCA scree plot for males: normalized, uncorrected data](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/PCA_M_norm_scree_celltype.png)
+
+![PCA heat map for males: normalized, uncorrected data](/mnt/scratch/KoborLab/TERRE/sschaffner/2022/PCA_M_norm_heat_legend_celltype.png)
+
+Batch effects are less pronounced and cell type effects are more pronounced. There's no pesticides effect but there is a smoking effect.
+
+## Checking sex balancing by batch
+
+Amy Inkster advised that if sex is balanced across batches, this step can be applied on all the data. 
+
+```{r sex by batch, eval=F}
+table(terre_meta$reportedSex, terre_meta$plate)
+#     5  6  7  8  9
+#  F  9 39 33 20  7
+#  M  0  0 27 57 40
+
+table(terre_meta$reportedSex, terre_meta$SentrixBarcode_A)
+#    201118840064 201118840095 201118840141 201125090022 201125090037 201125090052 201125090073 201125090081 201125090084 201125090123
+#  F            3            3            1            3            4            2            2            4            2            3
+#  M            0            0            5            0            4            0            0            0            0            0
+#   
+#    201125090147 201125090195 201125400113 201134840014 201134840017 201134840034 201134840044 201134840047 201134840057 201134840059
+#  F            3            3            2            1            0            3            3            4            2            0
+#  M            0            0            0            0            3            3            4            0            3            6
+#   
+#    201134840060 201134840063 201134840071 201134840089 201134840091 201134840093 201134840095 201134840096 201134840113 201194000097
+#  F            0            0            5            3            4            3            4            5            3            3
+#  M            7            5            0            2            0            0            0            3            4            0
+#   
+#    201194000136 201194000150 201194000177 201194010037 201194010039 201194010095 201194010096 201194010132 201194010153 201516260026
+#  F            3            3            3            0            6            3            2            2            1            0
+# M            0            4            4            8            0            5            4            4            6            5
+#   
+#    201516290020 201516290022 201516290023 201516290027 201516350005 201516350030 201516350035
+#  F            3            1            0            0            3            0            0
+#  M            3            6            6            6            3            6            5
+
+table(terre_meta$reportedSex, terre_meta$SentrixPosition_A)
+#    R01C01 R02C01 R03C01 R04C01 R05C01 R06C01 R07C01 R08C01
+#  F     16     16     15     10     10     17     14     10
+#  M     18     17     17     13     14     17     16     12
+
+table(terre_meta$reportedSex, terre_meta$Sample_Well)
+#    A01 A02 A03 A04 A05 A06 A07 A08 A09 A10 A11 A12 B01 B02 B03 B04 B05 B06 B07 B08 B09 B10 B11 B12 C01 C02 C03 C04 C05 C06 C07 C08 C09 C10 C11
+#  F   1   0   1   2   0   0   1   2   2   3   2   2   1   0   2   2   0   0   1   2   2   3   1   2   1   0   1   1   0   0   1   2   2   3   2
+#  M   1   2   1   1   2   3   2   1   1   1   2   1   1   2   1   1   2   2   2   2   1   1   2   0   1   2   1   1   2   2   2   1   1   1   2
+#   
+#    C12 D01 D02 D03 D04 D06 D07 D08 D09 D10 D11 D12 E01 E02 E03 E04 E05 E06 E07 E08 E09 E10 E11 E12 F01 F02 F03 F04 F05 F06 F07 F08 F09 F10 F11
+#  F   2   0   2   1   0   1   1   2   0   2   1   0   2   2   0   0   0   2   1   0   1   1   1   0   3   3   0   2   2   1   0   0   2   1   2
+#  M   1   2   1   1   1   0   2   2   1   1   1   1   1   1   2   1   1   1   2   3   0   0   0   2   1   1   3   2   1   3   2   2   0   0   0
+#   
+#    F12 G01 G02 G03 G04 G05 G06 G07 G08 G09 G10 G11 G12 H02 H03 H04 H05 H06 H07 H08 H09 H10 H11 H12
+#  F   1   3   0   0   2   2   1   0   0   2   1   0   3   0   0   2   3   1   0   0   1   0   0   3
+#  M   2   0   1   3   2   0   3   3   1   0   1   2   0   1   2   1   0   2   1   2   0   1   2   0
+```
+
+Sexes are well balanced across rows and moderately across chips, but not balanced across plates. I'll try including batch as a covariate later in analysis stage instead of correcting for it here.
+
+# Tech reps correlation and removal
+
+Note: In the updated meta data (received March 24th, 2020), tech reps were removed from the sample list, and didn't end up in the RGChannelSet object since they were not in the sample info. In the previous version of the meta data, tech reps were included, however. 
+
+The below code was run using the older meta data version including tech reps (Feb 2020). The raw data has not changed, so correlations based on raw should be accurate.
+
+```{r tech reps, eval=F}
+RepCor  <- function(x,y) {
+  sRep <- x[, sampleNames(x)%in%y]
+  cor.dat<- cor(betas(sRep), use = "pairwise.complete.obs")
+  return(result = cor.dat[1, 2])
+}
+
+##  define technical replicates
+reps.1 <-c("065-2", "065-2_rep")
+reps.2 <-c("065-3", "065-3_rep")
+reps.3 <-c("065-4", "065-4_rep")
+
+## compute correlations for raw data
+cor(betas_raw[,colnames(betas_raw) %in% reps.1], use="pairwise.complete.obs")[1,2] #0.9947661
+cor(betas_raw[,colnames(betas_raw) %in% reps.2], use="pairwise.complete.obs")[1,2] # 0.9948012
+cor(betas_raw[,colnames(betas_raw) %in% reps.3], use="pairwise.complete.obs")[1,2] #0.9933456
+
+## compute correlations for corrected data
+cor(betas_combat[,colnames(betas_combat) %in% reps.1], use="pairwise.complete.obs")[1,2] #0.9977099
+cor(betas_combat[,colnames(betas_combat) %in% reps.2], use="pairwise.complete.obs")[1,2] #0.9980107
+cor(betas_combat[,colnames(betas_combat) %in% reps.3], use="pairwise.complete.obs")[1,2] #0.9975436
+
+##compute RMSE between tech reps
+rmse(betas_combat[,colnames(betas_combat) == reps.1[1]], betas_combat[,colnames(betas_combat) == reps.1[2]]) # 0.0238427
+rmse(betas_combat[,colnames(betas_combat) == reps.2[1]], betas_combat[,colnames(betas_combat) == reps.2[2]]) #0.02150841
+rmse(betas_combat[,colnames(betas_combat) == reps.3[1]], betas_combat[,colnames(betas_combat) == reps.3[2]]) # 0.02448616
+```
+

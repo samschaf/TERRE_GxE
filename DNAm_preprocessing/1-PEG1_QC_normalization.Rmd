@@ -1,0 +1,1392 @@
+---
+title: "PEG1_Preprocessing"
+author: "SS"
+date: "09/28/2022"
+output:
+  html_document:
+    df_print: paged
+  rmdformats::readthedown:
+    fig_caption: yes
+    gallery: no
+    highlight: kate
+    lightbox: yes
+    self_contained: yes
+    thumbnails: no
+---
+PEG1 PreProcessing and Normalization
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: Sept 28, 2022
+
+The general steps we take, with methods included in this script, are:
+
+Removing outlier samples
+
+Cell type prediction (blood)
+
+Performing normalization using control probes (funnorm)
+
+Removing poor performing probes
+
+Removing variation due to batch effects (ComBat)
+
+### Libraries and outside functions
+```{r results='hide', warning=FALSE, message=FALSE, eval=F}
+setwd("~/")
+library(sva)
+library(Metrics)
+library(methylumi)
+library(dendextend)
+library(locfdr)
+library(gplots)
+library(lattice)
+#library(wateRmelon) #problem with lumi, can't load wateRmelon
+library("RColorBrewer")
+library(plyr)
+library(VennDiagram)
+library(ggplot2)
+library(qvalue)
+library("sva")
+library(parallel)
+library(gridExtra)
+library(grid)
+library("reshape2")
+library("corrplot")
+library(rgr)
+library(viridis)
+#library(lumi) #can't load
+library(missMethyl)
+library(hydroGOF)
+library(quadprog)
+library(genefilter)
+library(matrixStats)
+library(limma)
+library(FlowSorted.Blood.450k)
+library(FlowSorted.Blood.EPIC)
+library(ewastools)
+library(ggrepel)
+library(conumee)
+library(doParallel)
+library(ggplotify)
+library(cowplot)
+library(ggpubr)
+library(tibble)
+library(dplyr)
+
+#lumi and wateRmelon functions defined externally
+source('~/kobor_shared_coding_resource/lumi_detectOutlier.R')
+source('~/kobor_shared_coding_resource/lumi_plotSampleRelation.R')
+source('~/kobor_shared_coding_resource/wateRmelon_outlyx.R')
+source('~/kobor_shared_coding_resource/wateRmelon_adjustedFunnorm.R')
+source('~/kobor_shared_coding_resource/wateRmelon_beadcount.R')
+
+#custom functions
+source("~/kobor_shared_coding_resource/PCA_Plot_Function.R")
+#source("~/kobor_shared_coding_resource/BadProbe_Function.R")
+#source('~/kobor_shared_coding_resource/ECC11.R')
+source("~/kobor_shared_coding_resource/correlation_pval.R") #modified slightly so that corr between perfectly confounded variables (PD with dis_duration and age_onset) is 0; also made function verbose
+source("~/kobor_shared_coding_resource/heatmap.3_CK.R")
+source("~/kobor_shared_coding_resource/Age_Pred_Horvath_NG_SS.R")
+```
+
+## Load data and create objects for preprocessing
+```{r create RG obj, eval=F}
+#read in meta data to get chip IDs for PEG1
+PEG1_meta <- read.csv("~/4-replication/Chuang_2017/Chuang_2017_meta.csv")
+dim(PEG1_meta) #572 patients
+PEG1_meta$source_name_ch1 <- gsub("X", "", PEG1_meta$source_name_ch1)
+idats <- list.files("~/4-replication/Chuang_2017/GSE111629/idat/")
+idats <- idats[-(grep("GPL", idats))]
+length(PEG1_idats <- idats[substr(idats, 12, 28) %in% PEG1_meta$source_name_ch1]) #1134 (2 for each of 567 samples)
+
+#subset meta to files with idats
+PEG1_meta <- PEG1_meta[PEG1_meta$source_name_ch1 %in% substr(PEG1_idats,12,28),]
+
+all(substr(PEG1_meta$source_name_ch1, 1, 17) %in% substr(idats, 12, 28)) #TRUE - all meta files are in idats
+all(substr(idats, 12, 28) %in% substr(PEG1_meta$source_name_ch1, 1, 17)) #FALSE - not all idats are in meta
+extra_idats <- substr(idats, 12, 28)[-which(substr(idats, 12, 28) %in% substr(PEG1_meta$source_name_ch1, 1, 17))]
+#[1] "3999984061_R03C01" "3999984061_R03C01" "3999984061_R04C01" "3999984061_R04C01" "3999984061_R05C01"
+#[6] "3999984061_R05C01" "3999984061_R06C01" "3999984061_R06C01"
+
+idats_sub <- idats_sub[match(substr(PEG1_meta$source_name_ch1, 1, 17), substr(idats_sub, 12, 28))]
+all(substr(idats_sub, 12, 28) == substr(PEG1_meta$source_name_ch1, 1, 17))
+
+PEG1_meta$Basename <- paste(PEG1_meta$geo_accession, substr(PEG1_meta$source_name_ch1, 1, 17), sep="_")
+PEG1_meta$Chip_Position <- paste(substr(PEG1_meta$source_name_ch1, 12, 14), substr(PEG1_meta$source_name_ch1, 15, 17), sep="_")
+PEG1_meta$Basename <- file.path("~/4-replication/Chuang_2017/GSE111629/idat", PEG1_meta$Basename) # Need to have the full pathnames without the ending _Grn.idat or _Red.idat
+
+PEG1_RG_Raw <- read.metharray(basenames = PEG1_meta$Basename, extended = T, force = T)
+
+# Replace sampleNames with simpler identifiers
+PEG1_meta$Sample_Name <- paste("PEG1", seq(1:nrow(PEG1_meta)), sep="_")
+identical(sampleNames(PEG1_RG_Raw), substr(PEG1_meta$Basename, 44, 71)) #TRUE
+sampleNames(PEG1_RG_Raw) <- PEG1_meta$Sample_Name
+save(PEG1_RG_Raw, file="~/4-replication/Chuang_2017/PEG1_RG_Raw.RData")
+
+# Creating object to use with ewastools
+meth <- read_idats(PEG1_meta$Basename)
+save(meth, file="~/4-replication/Chuang_2017/PEG1_ewastools_obj_raw.RData")
+
+# Creating MethylSet from RGSet to use with minfi
+MSet <- preprocessRaw(PEG1_RG_Raw) 
+save(MSet, file="~/4-replication/Chuang_2017/PEG1_MSet_raw.RData")
+```
+
+# Sample quality control checks
+
+## ewastools
+This check uses the Illumina’s 636 control probes to assess technical parameters including array staining, extension, hybridization, target removal, specificity, and bisulfite conversion.
+```{r ewastools, eval=F}
+ctrls = control_metrics(meth)
+stripchart(ctrls$`Bisulfite Conversion II`,method="jitter",pch=4,xlab='Bisulfite Conversion II',xlim=c(0,10))
+abline(v=1,col=2,lty=3) # all samples appear to pass
+
+PEG1_meta$failed = sample_failure(ctrls)
+table(PEG1_meta$failed)
+#FALSE  TRUE 
+#  565     2 
+
+#checking individual metrics with the default pass/fail thresholds (reccommended by Illumina)
+length(ctrls$Restoration[ctrls$Restoration>0]) 
+length(ctrls$`Staining Green`[ctrls$`Staining Green`>5])  
+length(ctrls$`Staining Red`[ctrls$`Staining Red`>5])  
+length(ctrls$`Extension Green`[ctrls$`Extension Green`>5])  
+length(ctrls$`Extension Red`[ctrls$`Extension Red`>5])  
+length(ctrls$`Hybridization High/Medium`[ctrls$`Hybridization High/Medium`>1])  
+length(ctrls$`Hybridization Medium/Low`[ctrls$`Hybridization Medium/Low`>1]) 
+length(ctrls$`Target Removal 1`[ctrls$`Target Removal 1`>1]) 
+length(ctrls$`Target Removal 2`[ctrls$`Target Removal 2`>1]) 
+length(ctrls$`Bisulfite Conversion I Green`[ctrls$`Bisulfite Conversion I Green`>1]) 
+length(ctrls$`Bisulfite Conversion I Red`[ctrls$`Bisulfite Conversion I Red`>1]) 
+length(ctrls$`Bisulfite Conversion II`[ctrls$`Bisulfite Conversion II`>1]) 
+
+length(ctrls$`Specificity I Green`[ctrls$`Specificity I Green`>1]) #1 failed
+specIgrn <- ctrls$`Specificity I Green`
+names(specIgrn) <- meth$meta$sample_id
+names(specIgrn[specIgrn<1]) #"GSM3035688_3999984150_R02C02"
+
+length(ctrls$`Specificity I Red`[ctrls$`Specificity I Red`>1]) 
+length(ctrls$`Specificity II`[ctrls$`Specificity II`>1]) 
+
+length(ctrls$`Non-polymorphic Green`[ctrls$`Non-polymorphic Green`>5]) #2 failed
+npgrn <- ctrls$`Non-polymorphic Green`
+names(npgrn) <- meth$meta$sample_id
+names(npgrn[npgrn<5]) #"GSM3035688_3999984150_R02C02" "GSM3035693_3999984150_R06C01"
+
+length(ctrls$`Non-polymorphic Red`[ctrls$`Non-polymorphic Red`>5]) 
+
+PEG1_meta[PEG1_meta$failed==TRUE,c("source_name_ch1","Sample_Name")]
+#      source_name_ch1 Sample_Name
+#288 3999984150_R02C02    PEG1_283
+#293 3999984150_R06C01    PEG1_288
+
+ewastools <- "PEG1_283"
+```
+![ewastools bisulfite conversion II](/home1/NEURO/schaffner/4-replication/Chuang_2017/ewastools_bisulfiteII.png)
+
+The sample "PEG1_283" failed two ewastools checks (Specificity I Green and Non-polymorphic Green), while the sample "PEG1_288" failed one check (Non-polymorphic Green).
+
+## M/U channel intensity
+```{r minfi, eval=F}
+qc <- getQC(MSet)
+plotQC(qc)
+
+minfiqc <- "PEG1_283"
+```
+![Minfi plotQC](/home1/NEURO/schaffner/4-replication/Chuang_2017/PEG1_plotQC_minfi.png)
+
+The same sample (PEG1_283) flagged in ewastools was also flagged in the minfi check.
+
+# Sex checks
+
+## X chromosome PCA
+```{r sex matching, eval=F}
+#get the names of X and Y chromosome probes using Kasper Hansen's EPIC annotation
+KH_Anno <- read.csv("~/kobor_shared_coding_resource/EPIC_KH_Annotation.csv", row.names = 1)
+length(Xprobes <- KH_Anno[KH_Anno$chr=="chrX","Name"]) #19,120
+length(Yprobes <- KH_Anno[KH_Anno$chr=="chrY","Name"]) #561
+
+#X chromosome PCA
+betas_raw <- getBeta(MSet)
+betas_X <- betas_raw[rownames(betas_raw) %in% Xprobes,]
+PCA_X <- princomp(betas_X[complete.cases(betas_X),])
+X_loadings <- as.data.frame(unclass(PCA_X$loadings))
+all.equal(rownames(X_loadings), as.character(PEG1_meta$Sample_Name)) #TRUE
+
+X_loadings$sex <- PEG1_meta$gender.ch1
+X_loadings$sex <- as.factor(X_loadings$sex)
+ggplot(X_loadings[,c(1,2,3,ncol(X_loadings))], aes(x=Comp.1, y=Comp.2, col=sex)) + theme_bw() + geom_text(label=rownames(X_loadings))
+#PEG1_283 (male) clusters away from main centroid. So does PEG1_118 (female)
+#Along PC3, PEG1_272 (male) also clusters away, though not as far as PEG1_283
+
+#collecting potential mismatches for conumee
+#skip 282 (will remove regardless since it was already flagged for technical problems)
+Xchr_check <- c("PEG1_272","PEG1_118")
+```
+![X chromosome PC1 vs PC2](/home1/NEURO/schaffner/4-replication/Chuang_2017/Xchr_PCA.png)
+
+![X chromosome PC2 vs PC3](/home1/NEURO/schaffner/4-replication/Chuang_2017/Xchr_PCA_2.png)
+
+## Y chromosome missing values
+```{r Y missing, eval=F}
+#Y chromosome percent missing values per sample (fewer probes than samples, can't do PCA)
+betas_Y <- betas_raw[rownames(betas_raw) %in% Yprobes,]
+betas_Y_t <- as.data.frame(t(as.matrix(betas_Y)))
+all.equal(rownames(betas_Y_t), as.character(PEG1_meta$Sample_Name)) #TRUE
+betas_Y_t$missing <- rowSums(is.na(betas_Y_t))/ncol(betas_Y_t)
+betas_Y_t$sex <- PEG1_meta$gender.ch1
+
+betas_Y_missing <- betas_Y_t[,c("sex","missing")]
+ggplot(betas_Y_missing, aes(x=sex, y=missing, col=sex, group=sex)) + geom_jitter() + theme_bw()
+
+#there are a few males with missing Y chromosome values
+#collecting missing Y individuals
+Ychr_check <- rownames(betas_Y_missing[betas_Y_missing$sex=="Male" & betas_Y_missing$missing>0,]) #9 to check
+length(Ychr_check[Ychr_check %in% Xchr_check]) #0
+```
+![Y chromosome missing values](/home1/NEURO/schaffner/4-replication/Chuang_2017/Ychr_missing.png)
+
+Many of the females have no missingness on the Y chromosome, indicating a background signal. Some of the males don't have missingness either.
+
+## Sex prediction with minfi
+In this section, we infer the sex of all samples using minfi’s “getSex” function. getSex() works by comparing median total fluorescent intensity of the X chromosome probes and Y-chromosome probes. minfi separates the points by using a default cutoff of -2 for log2med(Y)−log2med(Y), although cutoff can be preferentially specified (use plotSex to get an idea of appropriate cutoffs). NOTE: Males and females should cluster seperately
+```{r pred sex, eval=F}
+Gset <- mapToGenome(ratioConvert(MSet))
+predictedSex <- getSex(Gset, cutoff = -2) #getSex() Estimates samples sex based on methylation data.
+predictedSex_dt <-as.data.frame(predictedSex)
+predictedSex_dt$id <- rownames(predictedSex_dt)
+colnames(predictedSex_dt)[3] <- "Predicted_Sex"
+
+sex_flagged_ids <- predictedSex_dt[predictedSex_dt$yMed > 10 &  predictedSex_dt$Predicted_Sex=="F" | predictedSex_dt$xMed < 12.5 &  predictedSex_dt$Predicted_Sex=="F" | predictedSex_dt$xMed < 12 &  predictedSex_dt$Predicted_Sex=="M" | predictedSex_dt$yMed < 12 &  predictedSex_dt$Predicted_Sex=="M","id"] #6 flagged
+#[1] "PEG1_170" "PEG1_283" "PEG1_489" "PEG1_540" "PEG1_541" "PEG1_558"
+
+#plotting predicted vs reported
+nrow(predictedSex_dt) #567
+PEG1_meta <- PEG1_meta[match(predictedSex_dt$id, PEG1_meta$Sample_Name),]
+PEG1_meta <- cbind(PEG1_meta, predictedSex_dt[,1:3])
+colnames(PEG1_meta)[41] <- "reportedSex"
+table(PEG1_meta$Predicted_Sex, PEG1_meta$reportedSex)
+#    Female Male
+#  F    247    0
+#  M      0  320
+
+#no mismatches
+
+ggplot(PEG1_meta, aes(x=xMed, y=yMed, col=reportedSex)) + geom_point() + theme_bw() + ggtitle("minfi Sex Prediction") + geom_label_repel(data = PEG1_meta %>% 
+                     dplyr::filter(yMed > 10 &  reportedSex=="Female" | yMed < 12.5 & reportedSex=="Male" | xMed < 12.5), aes(label = Sample_Name), size = 3, nudge_y = -0.1)
+
+PEG1_meta$flag <- NA
+PEG1_meta[PEG1_meta$Sample_Name %in% sex_flagged_ids,"flag"] <- "Far from XY cluster centroid"
+minfi_check <- PEG1_meta[complete.cases(PEG1_meta$flag),"Sample_Name"] #6 to check
+```
+![Sex prediction based on minfi](/home1/NEURO/schaffner/4-replication/Chuang_2017/minfi_sex_check_labelled.png)
+Several male samples cluster away from centroids, though none have predicted/reported mismatches.
+
+## Using CNVs to examine sex-flagged samples
+
+To further investigate the samples failing sex QC, we used CNV profiles to identify sex based on X and Y chromosomal copy number variations in the respective samples. For this analysis, we used the conumee R package that performs CNV analysis using Illumina 450k or EPIC DNA methylation arrays. CNV analysis is performed by normalizing the combined intensity values of both ‘methylated’ and ‘unmethylated’ channel of each CpG using a set of normal controls (i.e. with a flat genome, not showing any copy-number alterations).
+
+Code from Rebecca Asiimwe.
+
+#### Preparing data sets
+We want to choose a subset of controls (Rebecca did 50 for 17 samples) to compare samples to, since conumee is time intensive and produces an individual comparison plot for every control.
+```{r data_prep conumee, eval=F}
+#collecting samples to check
+length(Xchr_check) #2
+length(Ychr_check) #9
+length(minfi_check) #6
+length(conumee_ids <- unique(c(Xchr_check, Ychr_check, as.character(minfi_check)))) #17
+
+#Subsetting dataset to exclude sex mismatched samples and samples failing control probe checks, and selecting only males as our controls
+controls <- PEG1_meta[-which(PEG1_meta$Sample_Name %in% conumee_ids|PEG1_meta$Sample_Name %in% ewastools),]
+controls_filtered <- controls[controls$reportedSex=="Male",]
+controls_filtered <- controls_filtered[1:50,] #selecting 50 controls for 17 cases
+
+#Creating one metadata object with selected controls and sex mismatched samples
+meta_sex_mismatch_control <- rbind(controls_filtered, PEG1_meta[PEG1_meta$Sample_Name %in% conumee_ids,])
+rownames(meta_sex_mismatch_control) <- meta_sex_mismatch_control$Sample_Name
+
+#Filtering RGset to select control samples
+RGset_subset <- PEG1_RG_Raw[, sampleNames(PEG1_RG_Raw) %in% meta_sex_mismatch_control$Sample_Name]
+dim(RGset_subset) #622399     67
+
+#Matching sample names in control metadata with filtered RGset
+all(colnames(RGset_subset) %in% rownames(meta_sex_mismatch_control)) #TRUE
+meta_sex_mismatch_control <- meta_sex_mismatch_control[match(colnames(RGset_subset), rownames(meta_sex_mismatch_control)),]
+identical(colnames(RGset_subset), rownames(meta_sex_mismatch_control)) #TRUE
+
+#Creating an mset object required to run conumee
+mset_conumee <- preprocessIllumina(RGset_subset)
+```
+
+#### Identifying conumee controls and CNV calling
+```{r conumee_call, eval=F}
+#Conumee annotation 
+anno <- CNV.create_anno(array_type="450k", chrXY=TRUE, bin_minprobes=15, bin_minsize=50000)
+anno #482421 probes
+mranges_cnv <- mapToGenome(mset_conumee) 
+anno@probes <- subsetByOverlaps(anno@probes, granges(mranges_cnv)) # method to subset S4 object (anno)
+anno #482421 probes
+annoProbes <- as.data.frame(anno@probes)
+mset_conumee <- mset_conumee[which(rownames(mset_conumee) %in% rownames(annoProbes)), ] 
+dim(mset_conumee) #482421 probes
+
+#Identify Conumee Controls
+#Telling conumee which samples in our data and metadata objects are our “karyotypically normal” control samples for comparison to.
+all.equal(colnames(mset_conumee), as.character(meta_sex_mismatch_control$Sample_Name)) # must be TRUE
+
+#Specifying which samples will be used as CNV controls
+meta_sex_mismatch_control$Status <- NA
+meta_sex_mismatch_control[meta_sex_mismatch_control$Sample_Name %in% conumee_ids,"Status"] <- "MISMATCH"
+meta_sex_mismatch_control[-which(meta_sex_mismatch_control$Sample_Name %in% conumee_ids),"Status"] <- "CONTROL"
+summary(as.factor(meta_sex_mismatch_control$Status))
+# CONTROL MISMATCH 
+#      50       17
+
+cnv_controls <-  meta_sex_mismatch_control$Status == "CONTROL"
+cnv_controls 
+
+#Parallel CNV Calling
+#Load into cnv calling format
+cnv_input <- CNV.load(mset_conumee) #intensities are abnormally low (< 5000).
+
+#Parallelizing the CNV calling so that multiple samples are called at once
+#Initialize cluster
+cl <- makeCluster(24)
+registerDoParallel(cl)
+
+#Parallel cnv fit
+cnv_calls <- foreach (i =  1:ncol(mset_conumee),
+                      .export = c("CNV.fit", "CNV.bin", "CNV.segment")) %dopar% 
+  CNV.segment(
+    CNV.bin(
+      CNV.fit(
+        cnv_input[i], ref = cnv_input[cnv_controls], anno = anno)))
+
+#Kill cluster
+stopCluster(cl)
+
+names(cnv_calls)
+names(cnv_calls) <- meta_sex_mismatch_control$Sample_Name
+```
+
+#### Samples flagged as mismatches or those far from cluster centroids 
+```{r flagged_samples_plac, eval=F}
+#Recall of samples flagged as ar from cluster centroids
+meta_sex_mismatch_control[meta_sex_mismatch_control$Status=="MISMATCH","Sample_Name"]
+# [1] "PEG1_118" "PEG1_153" "PEG1_155" "PEG1_157" "PEG1_163" "PEG1_170" "PEG1_174" "PEG1_194" "PEG1_195" "PEG1_200" "PEG1_272" "PEG1_283" "PEG1_336" "PEG1_489"
+#[15] "PEG1_540" "PEG1_541" "PEG1_558"
+```
+
+#### CNV plots
+```{r cnv_plots, eval=F}
+#Function to loop through cnv_calls object and plot all samples (controls and mismatches)
+for(i in names(cnv_calls)){
+  
+  p1 <- as.grob(~CNV.genomeplot(cnv_calls[[i]], chr = "all", chrX = TRUE, chrY = TRUE, 
+                                centromere = TRUE, detail = TRUE, main = i,
+                                ylim = c(-1.25, 1.25), set_par = TRUE, cols = c("blue", "blue","gray", "red", "red")))
+  #chrX
+  p2 <- as.grob(~CNV.genomeplot(cnv_calls[[i]], chr = "chrX", 
+                                centromere = TRUE, detail = TRUE, main = "chrX",
+                                ylim = c(-1.25, 1.25), set_par = TRUE, cols = c("blue", "blue","gray", "red", "red")))
+  #chrY
+  p3 <- as.grob(~CNV.genomeplot(cnv_calls[[i]], chr = "chrY",  
+                                centromere = TRUE, detail = TRUE, main = "chrY",
+                                ylim = c(-1.25, 1.25), set_par = TRUE, cols = c("blue", "blue","gray", "red", "red"))) 
+  
+  grid1 <- plot_grid(p1, nrow = 1, ncol = 1, scale = c(.8))
+  merged_grids <- plot_grid(p2, p3, nrow = 1, ncol = 2, scale = c(.8))
+  plot <- plot_grid(grid1, merged_grids, nrow = 2, ncol = 1, align = "h", scale = c(.8))
+  
+  sample_id <- paste0("# ", i)
+  sample_id <- noquote(sample_id)
+  print(sample_id)
+  
+  if(i %in% conumee_ids){ lab="FLAG_" } else { lab = "" }
+  
+  png(paste("~/4-replication/Chuang_2017/conumee/", lab, i, ".png", sep=""))
+  print(plot)
+  dev.off()
+  
+}
+
+#examined resulting plots and recorded likely sex via CNV profiles
+#reading in conumee results and adding to metadata
+conumee <- read.csv("~/4-replication/Chuang_2017/conumee/PEG1_conumee.csv", stringsAsFactors=FALSE)
+all(conumee$ID %in% PEG1_meta$Sample_Name) #TRUE
+
+meta_sub1 <- PEG1_meta[PEG1_meta$Sample_Name %in% conumee$ID,]
+meta_sub1 <- meta_sub1[match(conumee$ID, meta_sub1$Sample_Name),]
+all(meta_sub1$Sample_Name==conumee$ID) #TRUE
+meta_sub1$conumeeSex <- conumee$conumee
+
+meta_sub2 <- PEG1_meta[-which(PEG1_meta$Sample_Name %in% conumee$ID),]
+meta_sub2$conumeeSex <- NA
+
+PEG1_meta <- rbind(meta_sub1, meta_sub2)
+rm(meta_sub1, meta_sub2)
+PEG1_meta$reportedSex <- gsub("Female", "F", gsub("Male", "M", PEG1_meta$reportedSex))
+
+sex_mismatch <- PEG1_meta[PEG1_meta$reportedSex!=PEG1_meta$conumeeSex & complete.cases(PEG1_meta$conumeeSex),c("Sample_Name","reportedSex","Predicted_Sex","conumeeSex")]
+#    Sample_Name reportedSex Predicted_Sex   conumeeSex
+#171    PEG1_170           M             M inconclusive
+#200    PEG1_195           M             M inconclusive
+#277    PEG1_272           M             M inconclusive
+#288    PEG1_283           M             M inconclusive
+#494    PEG1_489           M             M inconclusive
+#563    PEG1_558           M             M inconclusive
+
+#save for later
+save(sex_mismatch, ewastools, minfiqc, PEG1_meta, file="~/4-replication/Chuang_2017/PEG1_sexchecked_objs.RData")
+```
+![Example of normal male in conumee](/home1/NEURO/schaffner/4-replication/Chuang_2017/conumee/PEG1_30.png)
+
+![Example 1 of inconclusive sex in conumee](/home1/NEURO/schaffner/4-replication/Chuang_2017/conumee/FLAG_PEG1_170.png)
+
+X chromosome copy number is normal for males, while Y is low.
+
+![Example 2 of inconclusive sex in conumee](/home1/NEURO/schaffner/4-replication/Chuang_2017/conumee/FLAG_PEG1_283.png)
+
+The signal is extremely inconsistent across all chromosomes - likely an issue with the sample.
+
+### Samples flagged for removal
+
+CNV analysis was able to confirm sex for some individuals who clustered away from centroids. Individuals with with inconclusive sex will be removed: 
+
+PEG1_170
+
+PEG1_195
+
+PEG1_272
+
+PEG1_283
+
+PEG1_489
+
+PEG1_558
+
+## SNP Control Probes Sample Clustering
+There are 65 control probes which measure single nucleotide polymorphisms which we use for quality control. These are stored in their own slot in the RGChannelSet object, so they don't need to be filtered out since we will use getBeta() to later pull out the information for non-SNP probes only.
+The SNP probe beta values can be pulled separately using getSnpBeta() for QC checks.
+
+```{r SNP probes, eval=F}
+length(locusNames <- getManifestInfo(PEG1_RG_Raw, "locusNames")) # Gets all probe names
+#485,512 probes are in the RGChannelSet
+
+#getSnpInfo() provides the columns with rs, maf info for each probe/CpG on the array
+#getSnpBeta() provides the DNAm values for the 65 SNP control probes
+rs.probes <- getSnpBeta(PEG1_RG_Raw)
+plotSampleRelation(rs.probes,cex=1,method="cluster")
+
+SNPcluster <- "PEG1_134"
+```
+![SNP probe clustering: all samples](/home1/NEURO/schaffner/4-replication/Chuang_2017/PEG1_SNPcluster.png)
+
+Sample PEG1_134 clusters away from the others. There are also a few sample pairs clustering together. Could these be reps or related individuals?
+
+## Contamination check
+```{r contamination, eval=F}
+# While ewastools implements the LOESS normalization (Heiss and Brenner, 2015), the developers of the package says not use the normalization "as it does little to protect against batch effects but can result in the removal of genuine biological signal". They recommended to adjust for relevant technical covariates in regression models later.
+
+#use ewastools object
+beta <- dont_normalize(meth)
+
+#pulling out the SNP probes
+snps <- meth$manifest[probe_type=="rs",index]
+snps <- beta[snps,]
+
+# These SNPs are then used as input for call_genotypes(). This function estimates the parameters of a mixture model consisting of three Beta distributions representing the heterozygous and the two homozygous genotypes, and a fourth component, a uniform distribution, representing outliers. The functions returns posterior probabilities used for soft classification. 
+#In simple words, we are determining the probability for every SNP whether they belong to 1 of 4 distributions, 3 of which correspond to the 3 expected genotypes (AA, AB, BB), and the 4th distribution corresponds to outside / in-between these expected genotype distributions. SNPs with a higher probability of belonging to this 4th distribution indicate mixing between more than one genotype
+
+genotypes_called <- call_genotypes(snps,learn=T)
+
+# fit mixture model to call genotypes
+snps_called <- call_genotypes(snps, learn = T)
+
+# call genotype clusters
+PEG1_meta <- PEG1_meta %>% mutate(genotype_cluster = as.factor(enumerate_sample_donors(genotypes_called)))
+
+# examine probability outlier
+plot(snp_outliers(genotypes_called) %>% sort)
+PEG1_meta$outlier = snp_outliers(genotypes_called)
+SNPoutliers <- PEG1_meta[PEG1_meta$outlier > -4,"Sample_Name"]
+#"PEG1_277"
+```
+![ewastools genotype calling](/home1/NEURO/schaffner/4-replication/Chuang_2017/PEG1_SNP_outliers.png)
+1 sample (PEG1_277) was flagged for potential contamination.
+
+## Detection p-value (minfi)
+
+Here we can define outlier samples simply if more than 5% of their probes have a pvalue below 0.01.
+
+```{r samples bad probes, eval=F}
+#1e-16 threshold
+detP <- detectionP.minfi(PEG1_RG_Raw)
+probe_num <- round(nrow(detP)*0.05)
+badDetP <- detP>=0.01
+avgPval <- as.data.frame(colSums(badDetP))
+avgPval$Sample <- rownames(avgPval)
+colnames(avgPval) <- c("Number_Bad_Probes", "Sample_ID")
+(badSamps <- avgPval$Sample_ID[avgPval$Number_Bad_Probes>=probe_num]) #"PEG1_272" "PEG1_275" "PEG1_283" "PEG1_288" "PEG1_310" "PEG1_312" "PEG1_314"
+length(badSamps) #7
+
+# Visualization of outlier samples
+ggplot(avgPval)+  
+  geom_point(aes(as.factor(Sample_ID), Number_Bad_Probes, fill=Sample_ID), shape=21, size=3)+
+  geom_hline(yintercept = probe_num, linetype = "dashed", color = "red", size = 1)+
+  theme(legend.position = "none")
+```
+![Outlier Samp >5% bad probes at p > 0.01](/home1/NEURO/schaffner/4-replication/Chuang_2017/badsamps_detP_0.01.png)
+## Bead count
+Every probe has multiple beads which serves as replicate readings/multiple measurements per sample. If a given sample has fewer than 3 beads/reads that value is given an NA(missing).
+```{r bead count, eval=F}
+# calculates the number of samples with bead count <3 for each probe in matrix of bead count values
+bead <- beadcount(PEG1_RG_Raw)
+colnames(bead) <- gsub('X', '', gsub("\\.", "-", colnames(bead)))
+all(colnames(bead)%in%PEG1_meta$Sample_Name) #TRUE
+bead <- bead[,match(PEG1_meta$Sample_Name, colnames(bead))]
+all(colnames(bead)==(PEG1_meta$Sample_Name)) #TRUE
+
+PEG1_meta <- PEG1_meta %>% mutate(beadcount = colSums(is.na(bead)))
+
+#plot
+PEG1_meta %>% 
+  mutate(PEG1_meta = factor(as.character(Sample_Name), levels = Sample_Name)) %>%
+  ggplot(aes(x = Sample_Name, y = beadcount)) +
+  geom_point(shape = 21, size = 2, alpha=0.8, col="black")+
+  geom_hline(yintercept = 0.01*nrow(bead), linetype = 'dashed', color = 'gray') +
+  geom_text(aes(x = 0, y = 0.01*nrow(bead)), 
+            label = '1%', vjust = -0.5, hjust = -0.5, color = 'gray')+
+  labs(x = 'Samples', y = '', title = '# samples with probes with bead count < 3') +
+  theme(axis.text.x = element_blank()) +
+  scale_y_continuous(limits = c(0, 14000), breaks = seq(0,14000, 2000)) +
+  theme_classic()+
+  theme(axis.text.x = element_blank())+
+  geom_label_repel(data = PEG1_meta %>% filter(beadcount > (0.01*nrow(bead))), 
+aes(label = Sample_Name), size = 4, force = 15, nudge_x = 0.8, nudge_y = 0.5) 
+
+PEG1_meta[PEG1_meta$beadcount > (0.01*nrow(bead)),"Sample_Name"] #all samples passed bead count check
+```
+![Samples with bead count < 3](/home1/NEURO/schaffner/4-replication/Chuang_2017/beadcount.png)
+No samples were flagged for low bead count.
+
+## Average intensity
+```{r avg intensity, eval=F}
+green <- getGreen(PEG1_RG_Raw)
+red <- getRed(PEG1_RG_Raw)
+greenred <- green + red
+
+# add to sampleInfo
+PEG1_meta <- PEG1_meta %>% mutate(Average_intensity = colMeans(greenred))
+
+PEG1_meta %>% 
+  mutate(Sample_Name = factor(as.character(Sample_Name), levels = Sample_Name)) %>%
+  ggplot(aes(x = Sample_Name, y = Average_intensity)) +
+  geom_point(alpha = 0.7, color = 'black') + theme_classic() +
+  theme(axis.text.x = element_blank()) +
+  geom_hline(yintercept = mean(PEG1_meta$Average_intensity) - 2*sd(PEG1_meta$Average_intensity),
+             linetype = 'dashed', col = 'blue')+
+  geom_hline(yintercept = mean(PEG1_meta$Average_intensity) + 2*sd(PEG1_meta$Average_intensity),
+             linetype = 'dashed', col = 'red') +
+  geom_label_repel(data = PEG1_meta[PEG1_meta$Average_intensity < mean(PEG1_meta$Average_intensity) -
+                             2*sd(PEG1_meta$Average_intensity),],
+                  aes(label = Sample_Name), force = 10, nudge_y = -2500, show.legend = F)+
+  scale_y_continuous(limits = c(0, 25000)) +
+  labs(x = 'Samples')
+
+threshold <- mean(PEG1_meta$Average_intensity) -2*sd(PEG1_meta$Average_intensity)
+length(lowintensity <- PEG1_meta[PEG1_meta$Average_intensity < threshold,"Sample_Name"]) #8
+```
+![Average intensity](/home1/NEURO/schaffner/4-replication/Chuang_2017/avgintensity.png)
+8 samples have average intensity below mean - 2 standard deviations.
+
+## Outlier Detection - Lumi
+This function is contained in the lumi package. The current outlier detection is based on the distance from the sample to the center (average of all samples). The assumption of the outlier detection is that there is only one single cluster and the distance from the sample to the center is Gaussian distributed.
+
+The outlier is detected when its distance to the center is larger than a certain threshold. The threshold is calculated as Th * median distances to the center.
+
+```{r lumi outlier, eval=FALSE}
+betas_raw <- getBeta(PEG1_RG_Raw)
+
+Project_detout <- detectOutlier(betas_raw, Th = 1.5) # This calculates potential outliers
+length(which(Project_detout)) #16
+outlier_lumi <- names(which(Project_detout)) # This pulls the sample names of calculated outliers
+outlier_lumi <- sort(outlier_lumi)
+outlier_lumi
+# [1] "PEG1_118" "PEG1_170" "PEG1_172" "PEG1_223" "PEG1_239" "PEG1_272" "PEG1_275" "PEG1_283" "PEG1_286" "PEG1_288"
+#[11] "PEG1_304" "PEG1_310" "PEG1_312" "PEG1_314" "PEG1_382" "PEG1_45"
+```
+
+## Outlier Detection - wateRmelon
+
+This is a wateRmelon package outlier detection method which uses the function pcout. Based on the robustly sphered data, semi-robust principal components are computed which are needed for determining distances for each observation. Separate weights for location and scatter outliers are computed based on these distances. The combined weights are used for outlier identification.
+
+There are two criteria which have to pass a given threshold to be considered an outlier: iqr and mv. It is sometimes useful to take a look at samples which pass one but fail the second as well, perhaps these samples should still be removed?
+
+```{r wateRmelon outlier, eval=F}
+Project_pcout <- outlyx(getBeta(PEG1_RG_Raw)) # This calculates potential outliers
+#"pcout.png"
+
+Project_pcout$Sample_ID <- rownames(Project_pcout)
+out <- Project_pcout[which(Project_pcout$outliers == T),"Sample_ID"] # Pulling sample names deemed to be outliers
+#These are the overlaps between iqr and mv methods
+#"PEG1_118" "PEG1_272" "PEG1_275" "PEG1_310" "PEG1_312" "PEG1_382"
+
+iqrout <- Project_pcout[which(Project_pcout$iqr == T),"Sample_ID"] # Pulling samples which failed the iqr threshold
+#"PEG1_118" "PEG1_272" "PEG1_275" "PEG1_283" "PEG1_310" "PEG1_312" "PEG1_382"  
+
+mvout <- Project_pcout[which(Project_pcout$mv == T),"Sample_ID"] # Pulling samples which failed the mv threshold
+# [1] "PEG1_13"  "PEG1_16"  "PEG1_45"  "PEG1_88"  "PEG1_96"  "PEG1_99"  "PEG1_114" "PEG1_115" "PEG1_116" "PEG1_118" "PEG1_174"
+#[12] "PEG1_175" "PEG1_176" "PEG1_178" "PEG1_191" "PEG1_202" "PEG1_203" "PEG1_204" "PEG1_217" "PEG1_223" "PEG1_239" "PEG1_255"
+#[23] "PEG1_272" "PEG1_275" "PEG1_286" "PEG1_288" "PEG1_309" "PEG1_310" "PEG1_312" "PEG1_314" "PEG1_332" "PEG1_347" "PEG1_361"
+#[34] "PEG1_364" "PEG1_365" "PEG1_366" "PEG1_382" "PEG1_383" "PEG1_494" "PEG1_520" "PEG1_526" "PEG1_548"
+
+#which are outliers in all 3?
+outlier_melon <- out[out %in% iqrout & out %in% mvout]
+outlier_melon
+#"PEG1_118" "PEG1_272" "PEG1_275" "PEG1_310" "PEG1_312" "PEG1_382"
+```
+
+
+## Inter-sample correlation
+Intersample correlation analysis is performed to looked at pairwise corrlations between all the samples. Samples from the same tissues are expected to have high correlation (>90%).
+```{r sample sample cor, eval=F}
+cor <-cor(betas_raw,use="pairwise.complete.obs") #have saved this as it takes a while
+save(cor, file="~/4-replication/Chuang_2017/PEG1_sample_cor.RData")
+summary(as.vector(cor))
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 0.8312  0.9807  0.9837  0.9826  0.9876  1.0000 
+ 
+col.Sex <- gsub("M", "#AAAB9B", gsub("F", "#EFE7B8", PEG1_meta$reportedSex))
+col.Sex <- as.matrix(col.Sex)
+
+#Define custom dist and hclust functions for use with heatmaps
+mydist=function(c) {dist(c,method="euclidian")}
+myclust=function(c) {hclust(c,method="average")}
+
+#par(mar=c(7,4,1,2)+0.1) 
+grey<-colorRampPalette(brewer.pal(n=9,"Greys"))
+
+jpeg("~/4-replication/Chuang_2017/PEG1_intersamplecorrelation.jpeg", width = 1250, height = 1100)
+intersamplecorrelation <- heatmap.3(cor,hclustfun=myclust, distfun=mydist,na.rm = TRUE, scale="none", dendrogram="col", margins=c(6,12), Rowv=TRUE, Colv=TRUE, symbreaks=FALSE, key=TRUE, symkey=FALSE, density.info="none", trace="none", ColSideColors=col.Sex, labCol=PEG1_meta$Sample_Name, labRow=PEG1_meta$Sample_Name, cexRow=1, col=grey,ColSideColorsSize=5,KeyValueName="Pearson's r",keysize=1,cexCol=1.2) 
+print(intersamplecorrelation)
+dev.off()
+
+#getting per-sample summary
+cor_summary <- colMeans(cor)
+length(cor_summary[cor_summary<0.95]) #4 samples with poor correlation
+samplecor <- names(cor_summary[cor_summary<0.95])
+#"PEG1_118" "PEG1_272" "PEG1_283" "PEG1_382"
+```
+![PEG1 inter-sample correlation](/home1/NEURO/schaffner/4-replication/Chuang_2017/PEG1_intersamplecorrelation.jpeg)
+
+There are four samples with mean inter-sample correlation < 0.95.
+
+## PCA
+```{r PCA, eval=F}
+PCA_full <-princomp(na.omit(betas_raw))
+Loadings <-as.data.frame(unclass(PCA_full$loadings))
+all(rownames(Loadings)==PEG1_meta$Sample_Name) #FALSE
+all(rownames(Loadings)%in%PEG1_meta$Sample_Name) #TRUE
+PEG1_meta <- PEG1_meta[match(rownames(Loadings),PEG1_meta$Sample_Name),]
+all(rownames(Loadings)==PEG1_meta$Sample_Name) #TRUE
+pca_meta <- cbind(PEG1_meta, Loadings)
+saveRDS(pca_meta,"/home1/NEURO/schaffner/4-replication/Chuang_2017/pca_meta.rds") #this has the PCA loadings 
+
+ggplot(pca_meta, aes(Comp.1, Comp.2, color=reportedSex)) + geom_point(size = 3, alpha=0.8) +  
+theme_classic() + theme(axis.text = element_text(size =15),
+axis.title = element_text(size =15)) + geom_label_repel(data = pca_meta %>% 
+                     dplyr::filter(Comp.1<0.038), aes(label = Sample_Name))
+
+#get outliers with PC1 loadings < 0.038
+nrow(PCAout <- pca_meta[pca_meta$Comp.1<0.038,]) #5
+```
+![PCA on raw betas, coloured by sex](/home1/NEURO/schaffner/4-replication/Chuang_2017/initial_PCA_scatterplot.png)
+
+## Epigenetic age prediction (Horvath)
+If there are any large deviations from chronological age this could be a flag.
+```{r epigenetic age, eval=F}
+epiage <- HorvathAge_NG(MSet, Tissue="WB")
+#[1] "You have 350 out of 353 probes needed for the age clock. Missing 3 altogether."
+#[1] "Resulting in 1 % missingness. Data will be imputed using training data."
+write.table(epiage, file="/home1/NEURO/schaffner/4-replication/Chuang_2017/epiage_Horvath_raw.txt", sep="\t", row.names=F)
+all(epiage$SampleID %in% PEG1_meta$Sample_Name) #TRUE
+all.equal(as.character(epiage$SampleID), as.character(PEG1_meta$Sample_Name)) #TRUE
+PEG1_meta$DNAmAge_Horvath <- epiage$DNAmAge
+
+min <- min(c(PEG1_meta$Age, PEG1_meta$DNAmAge_Horvath))
+max <- max(c(PEG1_meta$Age, PEG1_meta$DNAmAge_Horvath))
+str(PEG1_meta$disease.state.ch1)
+str(PEG1_meta$age.ch1)
+
+#with outlier samples labelled
+ggplot(PEG1_meta, aes(x = age.ch1, y = DNAmAge_Horvath)) + geom_point(colour="#E69F00") + labs(x = "Reported age", y = "Predicted DNAm age (Horvath)", caption = "Age: DNAm vs. chronological") +  xlim(min,max) + ylim(min,max) +
+  geom_smooth(method="lm", colour="grey", size=0.5) +
+  stat_cor(method = "spearman", size = 3.5,label.x.npc = 0.7,label.y.npc = "bottom") +
+  theme_bw() + theme(panel.border = element_blank(),
+                     panel.grid.major = element_blank(),
+                     panel.grid.minor = element_blank(),
+                     axis.line = element_line(colour = "black"),
+                     axis.text = element_text(),
+                     axis.title = element_text(size = 10),
+                     plot.caption = element_text(hjust = 0.5, size = rel(1)),
+                     strip.background = element_blank(),
+                     strip.text.x = element_blank())+
+    geom_label_repel(data = PEG1_meta %>% filter(PEG1_meta$DNAmAge_Horvath > 90),
+            aes(label = Sample_Name), size = 2.5, force = 20)
+
+age_outliers <- PEG1_meta[PEG1_meta$DNAmAge_Horvath>90,"Sample_Name"]
+#"PEG1_118" "PEG1_171" "PEG1_223" "PEG1_304" "PEG1_382"
+
+#split by sex and PD case/control status
+ggplot(PEG1_meta, aes(x = age.ch1, y = DNAmAge_Horvath, group=disease.state.ch1, color=disease.state.ch1)) + geom_point() + scale_colour_manual(values=c("black","red")) + labs(x = "Reported age", y = "Predicted DNAm age (Horvath)", caption = "Age: DNAm vs. chronological") +  xlim(min,max) + ylim(min,max) +
+  geom_smooth(method="lm", colour="grey", size=0.5) +
+  stat_cor(method = "spearman", size = 3.5,label.x.npc = 0.7,label.y.npc = "bottom") +
+  theme_classic() + facet_wrap(~reportedSex, nrow=2)
+```
+![Horvath DNAm age](/home1/NEURO/schaffner/4-replication/Chuang_2017/horvath_age_outlier_lab.png)
+
+Most samples are well correlated between predicted and chronological age. A handful of samples show epigenetic age acceleration, with predicted age ~20 years older than chronological.
+
+![Horvath DNAm age by sex and PD status](/home1/NEURO/schaffner/4-replication/Chuang_2017/horvath_age_by_sex_PD.png)
+
+## Raw beta distibutions check
+
+```{r raw beta distr, eval=F}
+#plotting beta distributions before
+#split by sexchr/autosomes
+load("~/kobor_shared_coding_resource/HM450_fdat.RData")
+length(Xprobes <- fData_450[fData_450$CHR=="X","TargetID"]) #11,232
+length(Yprobes <- fData_450[fData_450$CHR=="Y","TargetID"]) #416
+
+## raw data
+dim(MSet) #485512    567
+all.equal(sampleNames(MSet), as.character(PEG1_meta$Sample_Name)) #TRUE
+dim(MSet_raw_auto <- MSet[-which(rownames(MSet) %in% Xprobes|rownames(MSet) %in% Yprobes),]) #473864    567
+dim(MSet_raw_X <- MSet[which(rownames(MSet) %in% Xprobes),]) #11232   567
+dim(MSet_raw_Y <- MSet[which(rownames(MSet) %in% Yprobes),]) #416 567
+
+### autosomes
+Betas_raw_auto <-betas(MSet_raw_auto)
+Beta_raw_auto_sample<-Betas_raw_auto[sample(1:nrow(Betas_raw_auto), 100000),]
+Beta_raw_auto_sample_melted<- melt(Beta_raw_auto_sample)
+Beta_raw_auto_Plot<-Beta_raw_auto_sample_melted[which(Beta_raw_auto_sample_melted$value >= 0),]
+Beta_raw_auto_Plot<-merge(Beta_raw_auto_Plot,PEG1_meta, by.x="Var2", by.y="Sample_Name")
+raw_auto <- ggplot(Beta_raw_auto_Plot, aes(value, group=Var2, color=Var2))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw autosomes") + theme(legend.position = "none")
+
+### X
+Betas_raw_X <-betas(MSet_raw_X)
+Beta_raw_X_sample_melted<- melt(Betas_raw_X)
+Beta_raw_X_Plot<-Beta_raw_X_sample_melted[which(Beta_raw_X_sample_melted$value >= 0),]
+Beta_raw_X_Plot<-merge(Beta_raw_X_Plot,PEG1_meta, by.x="Var2", by.y="Sample_Name")
+raw_X <- ggplot(Beta_raw_X_Plot, aes(value, group=Var2, color=Var2))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Xchr") + theme(legend.position = "none")
+
+### Y
+Betas_raw_Y <-betas(MSet_raw_Y)
+Beta_raw_Y_sample_melted<- melt(Betas_raw_Y)
+Beta_raw_Y_Plot<-Beta_raw_Y_sample_melted[which(Beta_raw_Y_sample_melted$value >= 0),]
+Beta_raw_Y_Plot<-merge(Beta_raw_Y_Plot,PEG1_meta, by.x="Var2", by.y="Sample_Name")
+raw_Y <- ggplot(Beta_raw_Y_Plot, aes(value, group=Var2, color=Var2))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Ychr") + theme(legend.position = "none")
+
+#plot all
+grid.arrange(raw_auto, raw_X, raw_Y, ncol=1, nrow=3)
+```
+![Raw data beta distributions](/home1/NEURO/schaffner/4-replication/Chuang_2017/beta_distr_raw.png)
+
+Some samples have off distributions, particularly on the sex chromosomes. Will check these further.
+
+### X and Y chr beta distributions check
+
+Subsetting to samples flagged during earlier outlier/sex checks.
+
+```{r x check raw, eval=F}
+#samples initially flagged for conumee sex confirmation
+#NA means not flagged
+summary(as.factor(PEG1_meta$conumeeSex))
+#           F inconclusive            M         NA's 
+#           3            6            8          550 
+
+#flagged samples only, coloured by individual
+X_raw <- ggplot(Beta_raw_X_Plot[complete.cases(Beta_raw_X_Plot$conumeeSex),], aes(value, group=Var2, color=Var2))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Xchr")
+Y_raw <- ggplot(Beta_raw_Y_Plot[complete.cases(Beta_raw_Y_Plot$conumeeSex),], aes(value, group=Var2, color=Var2))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Ychr")
+grid.arrange(X_raw, Y_raw, nrow=2, ncol=1)
+
+#flagged samples only, coloured by sex
+X_raw <- ggplot(Beta_raw_X_Plot[complete.cases(Beta_raw_X_Plot$conumeeSex),], aes(value, group=Var2, color=conumeeSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Xchr")
+Y_raw <- ggplot(Beta_raw_Y_Plot[complete.cases(Beta_raw_Y_Plot$conumeeSex),], aes(value, group=Var2, color=conumeeSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Ychr")
+grid.arrange(X_raw, Y_raw, nrow=2, ncol=1)
+
+#autosomes with flagged samples
+### autosomes
+auto_raw <- ggplot(Beta_raw_auto_Plot[complete.cases(Beta_raw_auto_Plot$conumeeSex),], aes(value, group=Var2, color=conumeeSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw autosomes")
+grid.arrange(auto_raw, X_raw, Y_raw, nrow=3, ncol=1)
+```
+![Beta distributions for samples intially flagged in sex check: by flag](/home1/NEURO/schaffner/4-replication/Chuang_2017/beta_dist_by_flag.png)
+
+All samples with odd X/Y distributions were "inconclusive" in conumee and are already flagged for removal.
+
+
+## Summary of flagged samples
+
+For each metric here I'll only list additional samples not identified by the metrics above it.
+
+ewastools control metrics: 1
+
+minfi M/U intensity: 0
+
+sex mismatches: 5
+
+SNP control probes clustering: 1
+
+SNP outliers: 1
+
+detection p-value: 5
+
+bead count: 0
+
+average intensity: 7
+
+lumi outlier detection: 8
+
+wateRmelon outlier detection: 0
+
+inter-sample correlation: 0
+
+PCA clustering: 0
+
+epigenetic age: 0
+
+beta distribution: 0
+
+In total there are **28** samples flagged for removal.
+
+## Samples to remove
+```{r sample removal, eval=F}
+to_remove <- unique(c(as.character(minfiqc), as.character(sex_mismatch$Sample_Name), as.character(SNPoutliers), as.character(SNPcluster), badSamps, as.character(lowintensity), outlier_lumi, samplecor, outlier_melon))
+to_remove #28 in total
+# [1] "PEG1_283" "PEG1_170" "PEG1_195" "PEG1_272" "PEG1_489" "PEG1_558" "PEG1_277"
+# [8] "PEG1_134" "PEG1_275" "PEG1_288" "PEG1_310" "PEG1_312" "PEG1_314" "PEG1_160"
+#[15] "PEG1_201" "PEG1_202" "PEG1_444" "PEG1_467" "PEG1_556" "PEG1_566" "PEG1_118"
+#[22] "PEG1_172" "PEG1_223" "PEG1_239" "PEG1_286" "PEG1_304" "PEG1_382" "PEG1_45" 
+
+#remove and save object
+dim(PEG1_RG_Raw) #[1] 622399    567
+dim(PEG1_RG_Raw_noout <- PEG1_RG_Raw[,-which(sampleNames(PEG1_RG_Raw) %in% to_remove)]) #622399    539
+save(PEG1_RG_Raw_noout, file="/home1/NEURO/schaffner/4-replication/Chuang_2017/PEG1_RG_Raw_noout.RData")
+```
+
+# Normalization
+
+Since analysis will be sex stratified, sex chromosomes can be retained; however, special considerations should be taken into account for normalization due to differing DNAm distirbutions of sex chromosomes and autosomes (e.g. from X inactivation). 
+
+I will use the "adjustedFunnorm" function from the wateRmelon package (Wang et al., Bioinformatics 2022). This approach first normalizes autosomes, then uses the methylation values from the autosomes to "correct" methylation measurements on the sex chromosomes. Adjusted Funnorm may reduce artificial bias between sexes as compared to traditional Funnorm.
+
+The adjustedFunnorm function includes noob background and dye bias correction by default.
+
+## adjustedFunnorm
+```{r adjfunnorm, eval=F}
+write.csv(PEG1_meta, file="/home1/NEURO/schaffner/4-replication/Chuang_2017/PEG1_meta_10052022.csv")
+PEG1_RG_norm <- adjustedFunnorm(PEG1_RG_Raw_noout)
+save(PEG1_RG_norm, file="/home1/NEURO/schaffner/4-replication/Chuang_2017/PEG1_RG_norm.RData")
+nrow(PEG1_meta_sub <- PEG1_meta[PEG1_meta$Sample_Name %in% sampleNames(PEG1_RG_norm),]) #539
+
+#plotting beta distributions before/after normalization
+#split by sexchr/autosomes
+load("~/kobor_shared_coding_resource/HM450_fdat.RData")
+length(Xprobes <- fData_450[fData_450$CHR=="X","TargetID"]) #11,232
+length(Yprobes <- fData_450[fData_450$CHR=="Y","TargetID"]) #416
+
+## raw data
+MSet_raw <- preprocessRaw(PEG1_RG_Raw_noout) 
+dim(MSet_raw) #485512    539
+all(sampleNames(MSet_raw) %in% as.character(PEG1_meta_sub$Sample_Name)) #TRUE
+PEG1_meta_sub <- PEG1_meta_sub[match(sampleNames(MSet_raw), PEG1_meta_sub$Sample_Name),]
+all(sampleNames(MSet_raw) == as.character(PEG1_meta_sub$Sample_Name)) #TRUE
+dim(MSet_raw_auto <- MSet_raw[-which(rownames(MSet_raw) %in% Xprobes|rownames(MSet_raw) %in% Yprobes),]) # 473864    539
+dim(MSet_raw_X <- MSet_raw[which(rownames(MSet_raw) %in% Xprobes),]) #11232   539
+dim(MSet_raw_Y <- MSet_raw[which(rownames(MSet_raw) %in% Yprobes),]) #416 539
+
+### autosomes
+Betas_raw_auto <-betas(MSet_raw_auto)
+Beta_raw_auto_sample<-Betas_raw_auto[sample(1:nrow(Betas_raw_auto), 100000),]
+Beta_raw_auto_sample_melted<- melt(Beta_raw_auto_sample)
+Beta_raw_auto_Plot<-Beta_raw_auto_sample_melted[which(Beta_raw_auto_sample_melted$value >= 0),]
+Beta_raw_auto_Plot<-merge(Beta_raw_auto_Plot,PEG1_meta_sub, by.x="Var2", by.y="Sample_Name")
+raw_auto <- ggplot(Beta_raw_auto_Plot, aes(value, group=Var2, color=reportedSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw autosomes")
+
+### X
+Betas_raw_X <-betas(MSet_raw_X)
+Beta_raw_X_sample_melted<- melt(Betas_raw_X)
+Beta_raw_X_Plot<-Beta_raw_X_sample_melted[which(Beta_raw_X_sample_melted$value >= 0),]
+Beta_raw_X_Plot<-merge(Beta_raw_X_Plot,PEG1_meta_sub, by.x="Var2", by.y="Sample_Name")
+raw_X <- ggplot(Beta_raw_X_Plot, aes(value, group=Var2, color=reportedSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Xchr")
+
+### Y
+Betas_raw_Y <-betas(MSet_raw_Y)
+Beta_raw_Y_sample_melted<- melt(Betas_raw_Y)
+Beta_raw_Y_Plot<-Beta_raw_Y_sample_melted[which(Beta_raw_Y_sample_melted$value >= 0),]
+Beta_raw_Y_Plot<-merge(Beta_raw_Y_Plot,PEG1_meta_sub, by.x="Var2", by.y="Sample_Name")
+raw_Y <- ggplot(Beta_raw_Y_Plot, aes(value, group=Var2, color=reportedSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Raw Ychr")
+
+## normalized data
+dim(PEG1_RG_norm) #485512    539
+dim(GSet_norm_auto <- PEG1_RG_norm[-which(rownames(PEG1_RG_norm) %in% Xprobes|rownames(PEG1_RG_norm) %in% Yprobes),]) # 473864    539
+dim(GSet_norm_X <- PEG1_RG_norm[which(rownames(PEG1_RG_norm) %in% Xprobes),]) #11232   539
+dim(GSet_norm_Y <- PEG1_RG_norm[which(rownames(PEG1_RG_norm) %in% Yprobes),]) #416 539
+
+### autosomes
+Betas_norm_auto <-getBeta(GSet_norm_auto)
+Beta_norm_auto_sample<-Betas_norm_auto[sample(1:nrow(Betas_norm_auto), 100000),]
+Beta_norm_auto_sample_melted<- melt(Beta_norm_auto_sample)
+Beta_norm_auto_Plot<-Beta_norm_auto_sample_melted[which(Beta_norm_auto_sample_melted$value >= 0),]
+Beta_norm_auto_Plot<-merge(Beta_norm_auto_Plot,PEG1_meta_sub, by.x="Var2", by.y="Sample_Name")
+norm_auto <- ggplot(Beta_norm_auto_Plot, aes(value, group=Var2, color=reportedSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Normalized autosomes")
+
+### X
+Betas_norm_X <-getBeta(GSet_norm_X)
+Beta_norm_X_sample_melted<- melt(Betas_norm_X)
+Beta_norm_X_Plot<-Beta_norm_X_sample_melted[which(Beta_norm_X_sample_melted$value >= 0),]
+Beta_norm_X_Plot<-merge(Beta_norm_X_Plot,PEG1_meta_sub, by.x="Var2", by.y="Sample_Name")
+norm_X <- ggplot(Beta_norm_X_Plot, aes(value, group=Var2, color=reportedSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Normalized Xchr")
+
+### Y
+Betas_norm_Y <-getBeta(GSet_norm_Y)
+Beta_norm_Y_sample_melted<- melt(Betas_norm_Y)
+Beta_norm_Y_Plot<-Beta_norm_Y_sample_melted[which(Beta_norm_Y_sample_melted$value >= 0),]
+Beta_norm_Y_Plot<-merge(Beta_norm_Y_Plot,PEG1_meta_sub, by.x="Var2", by.y="Sample_Name")
+norm_Y <- ggplot(Beta_norm_Y_Plot, aes(value, group=Var2, color=reportedSex))+
+  geom_density(size=1)+theme_bw() + ggtitle("Normalized Ychr")
+
+#plot all
+png("~/4-replication/Chuang_2017/beta_distr_norm_539n.png")
+grid.arrange(raw_auto, norm_auto, raw_X, norm_X, raw_Y, norm_Y, ncol=2, nrow=3)
+dev.off()
+```
+![Beta distributions before and after normalization](/home1/NEURO/schaffner/4-replication/Chuang_2017/beta_distr_norm_539n.png)
+
+After outlier removal and normalization, beta distributions for autosomes and sex chromosomes look as expected. There is a higher unmethylated peak in Xchr data here than there was for TERRE and DIG-PD - maybe due to difference between EPIC and 450K?
+
+# List of probes to filter
+
+I will first calculate the QC metrics/list of probes to remove using the raw object (BEFORE normalization). This is because funnorm imputes missing values, which might make probes that failed technical checks appear to be usable after normalization. Then I'll remove those probes from the normalized object.
+
+Probes to filter out:
+
+1. Those with low bead count/too many NA's (excluding female Ychr background signal)
+
+2. Cross-hybridizing probes
+
+3. Polymorphic probes
+
+## Poor performing probes
+
+Detection p values indicate whether a particular methylation intensity is statistically different from the average intensity over the negative control probes/background. P values which are greater than 0.01 are considered poor quality measurements.
+
+Every probe has multiple beads which serves as replicate readings/multiple measurements per sample. If a given probe for a given sample has fewer than 3 beads/reads that value is given an NA. Typically if a probe has NAs in 1% of samples or more then it is removed.
+
+```{r badprobe, eval=F}
+#getting detection p-values and bead count again (not saved)
+detP <- minfi::detectionP(PEG1_RG_Raw_noout)
+
+#replacing female Ychr values with NA so they don't count toward total 
+detP_noY <- detP
+detP_noY[rownames(detP_noY) %in% Yprobes,colnames(detP_noY) %in% PEG1_meta_sub[PEG1_meta_sub$reportedSex=="F","Sample_Name"]] <- NA
+detP <- detP[,match(PEG1_meta_sub$Sample_Name, colnames(detP))]
+detP_noY <- detP_noY[,match(PEG1_meta_sub$Sample_Name, colnames(detP_noY))]
+all(colnames(detP)==(as.character(PEG1_meta_sub$Sample_Name))) #TRUE
+all(colnames(detP_noY)==(as.character(PEG1_meta_sub$Sample_Name))) #TRUE
+
+bead <- beadcount(PEG1_RG_Raw_noout)
+all(colnames(bead)%in%PEG1_meta_sub$Sample_Name) #TRUE
+all(colnames(bead)==(as.character(PEG1_meta_sub$Sample_Name))) #TRUE
+
+# create a dummy matrix
+bad_probes <- matrix(data = F, nrow = nrow(detP), ncol = ncol(detP),
+                        dimnames = list(rownames(detP), colnames(detP))) %>% as.data.frame
+
+# now let us put 'TRUE' where detp > 0.01, or beadcount is < 3
+bad_probes[is.na(bead)] <- T
+bad_probes[detP_noY > 0.01] <- T #excluding female Y probes
+
+#Number of probes that had a significant amount of bad performing probes:
+n <- ncol(PEG1_RG_Raw_noout)
+bad_probes_count <- rowSums(bad_probes)
+sum(bad_probes_count > 0.010*n) #8757
+sum(bad_probes_count > 0.025*n) #3105
+sum(bad_probes_count > 0.05*n) #1462
+
+# bad probes, remove if > 5% missing
+probe_anno <- tibble(probe_ID = rownames(detP)) %>%
+  mutate(number_bad_probes = bad_probes_count)
+nrow(probe_bad <- probe_anno %>% filter(number_bad_probes > 0.05*n)  %>% pull(probe_ID)  %>%  as.data.frame()) 
+#1,462 bad probes
+
+length(probe_bad$.[probe_bad$. %in% featureNames(PEG1_RG_norm)])
+#[1] 1,462
+```
+
+## Cross-hybrizing probes
+
+Probes which are predicted to unintentionally bind to other regions throughout the genome other than their target region should be removed (cross hybridizing probes). Pidsley et. al (2016) did analysis to measure 450K cross reactive probes. I will remove any probes which have been predicted to cross hybridize on the 450K array.
+
+```{r cross hyb probes, eval=F}
+load("~/kobor_shared_coding_resource/Complete_450K_Annotation.RData")
+CH_probes <- Complete_450K_Annotation[Complete_450K_Annotation$CH_450_Aut%in%"Yes"|Complete_450K_Annotation$CH_450_XY%in%"Yes","TargetID"] 
+length(unique(CH_probes))
+#[1] 39037
+
+#Price list
+load("~/kobor_shared_coding_resource/Cross_Hybr_Probes_450K.RData")
+length(unique(Cross_Hybr_Probes_450K)) #41937
+all(as.character(CH_probes) %in% Cross_Hybr_Probes_450K) #TRUE
+
+length(HM450_CH_Probes_additional <- Cross_Hybr_Probes_450K[Cross_Hybr_Probes_450K %in% featureNames(PEG1_RG_norm)]) #41,937
+length(HM450_CH_Probes_additional <- HM450_CH_Probes_additional[-which(HM450_CH_Probes_additional %in% probe_bad$.)]) #41,808
+```
+
+## Polymorphic probes
+
+We remove probes which either measure a CpG which is also a SNP (polymorphic CpG) or contain a SNP within the probe. Only SNPs present in >5% of the population were removed.
+
+```{r polymorphic probes, eval=F}
+# Keep probes that were NOT poorly designed 
+load("~/kobor_shared_coding_resource/Complete_450K_Annotation.RData")
+fdat_sub <- Complete_450K_Annotation[Complete_450K_Annotation$TargetID %in% featureNames(PEG1_RG_norm),] #everything except 65 SNP probes
+length(Conf_Probes <- as.character(fdat_sub[complete.cases(fdat_sub$n_SNPCpG),"TargetID"])) #20,869
+```
+
+# Probe filtering
+```{r probe filter, eval=F}
+length(probes_to_filter <- unique(c(as.character(probe_bad$.), HM450_CH_Probes_additional, Conf_Probes))) #61,249
+length(probes_to_filter[probes_to_filter %in% featureNames(PEG1_RG_norm)]) #61,249
+dim(PEG1_RG_filtered <- PEG1_RG_norm[-which(featureNames(PEG1_RG_norm) %in% probes_to_filter),]) #424263    539
+save(PEG1_RG_filtered, file="~/4-replication/Chuang_2017/PEG1_RG_filtered.RData")
+
+rm(PEG1_RG_norm, detP, detP_noY, bad_probes, bead)
+write.csv(PEG1_meta_sub, file="~/4-replication/Chuang_2017/PEG1_meta_prbfilter.csv", row.names=F)
+```
+
+# Predicting cell type proportions
+
+I will predict cell type using the Houseman algorithm and IDOL-picked reference probes on RAW data. Note ECC11 in-house function produced odd estimates, so I am using the estimateCellCounts2 function.
+
+### IDOL reference (estimateCellCounts2)
+```{r celltype estimatecell2, eval=F}
+source('~/kobor_shared_coding_resource/ECC2_SS.R') #manually calls experimenthub object created 9/2/22
+data("IDOLOptimizedCpGs450klegacy")
+cellprop_ecc2_idol <- ECC2_SS(PEG1_RG_Raw_noout, compositeCellType = "Blood", probeSelect="IDOL", IDOLOptimizedCpGs = IDOLOptimizedCpGs450klegacy, referencePlatform = "IlluminaHumanMethylation450k")
+
+counts <- cellprop_ecc2_idol$counts
+counts <- counts[match(PEG1_meta_sub$Sample_Name, rownames(counts)),]
+all.equal(rownames(counts), as.character(PEG1_meta_sub$Sample_Name)) #TRUE
+PEG1_meta <- cbind(PEG1_meta_sub, counts)
+write.csv(PEG1_meta, file="~/4-replication/Chuang_2017/PEG1_meta_cellprop.csv", row.names=F)
+
+cellprop_melt <- melt(PEG1_meta[,57:62])
+ggplot(cellprop_melt, aes(x=variable, y=value, col=variable)) + geom_jitter() + theme_bw() + ggtitle("estimateCellCounts2: raw data with IDOL probes")
+
+#plot by PD
+cellprop_melt <- melt(PEG1_meta[,c(39,41,57:62)], id.vars=c("reportedSex","disease.state.ch1"))
+cellprop_melt$disease.state.ch1 <- as.factor(cellprop_melt$disease.state.ch1)
+ggplot(cellprop_melt, aes(x=variable, y=value, fill=disease.state.ch1)) + geom_boxplot() + theme_bw() + ggtitle("Standard cell types") + theme(axis.text.x=element_text(angle=90, hjust=1), axis.title.x=element_blank()) + ylim(c(0,1))
+
+#plot by sex and PD
+ggplot(cellprop_melt, aes(x=variable, y=value, fill=disease.state.ch1)) + geom_boxplot() + theme_bw() + ggtitle("Standard cell types") + theme(axis.text.x=element_text(angle=90, hjust=1), axis.title.x=element_blank()) + ylim(c(0,1)) + facet_wrap(~reportedSex)
+
+
+########## standard cell types significance test
+#testing significance: standard cell types, sexes combined
+pvals_std <- c("CD8T"=t.test(PEG1_meta[PEG1_meta$disease.state.ch1=="PD-free control","CD8T"],PEG1_meta[PEG1_meta$disease.state.ch1=="Parkinson's disease (PD)","CD8T"])$p.value,
+               "CD4T"=t.test(PEG1_meta[PEG1_meta$disease.state.ch1=="PD-free control","CD4T"],PEG1_meta[PEG1_meta$disease.state.ch1=="Parkinson's disease (PD)","CD4T"])$p.value,
+               "NK"=t.test(PEG1_meta[PEG1_meta$disease.state.ch1=="PD-free control","NK"],PEG1_meta[PEG1_meta$disease.state.ch1=="Parkinson's disease (PD)","NK"])$p.value,
+               "Bcell"=t.test(PEG1_meta[PEG1_meta$disease.state.ch1=="PD-free control","Bcell"],PEG1_meta[PEG1_meta$disease.state.ch1=="Parkinson's disease (PD)","Bcell"])$p.value,
+               "Mono"=t.test(PEG1_meta[PEG1_meta$disease.state.ch1=="PD-free control","Mono"],PEG1_meta[PEG1_meta$disease.state.ch1=="Parkinson's disease (PD)","Mono"])$p.value,
+               "Neu"=t.test(PEG1_meta[PEG1_meta$disease.state.ch1=="PD-free control","Neu"],PEG1_meta[PEG1_meta$disease.state.ch1=="Parkinson's disease (PD)","Neu"])$p.value)
+sort(pvals_std)
+#         Neu        Bcell         CD4T         CD8T         Mono           NK 
+#1.789167e-11 5.296029e-11 4.274804e-09 1.375268e-04 3.522579e-03 1.126899e-01 
+
+sort(p.adjust(pvals_std))
+#         Neu        Bcell         CD4T         CD8T         Mono           NK 
+#1.073500e-10 2.648015e-10 1.709922e-08 4.125804e-04 7.045159e-03 1.126899e-01 
+
+#testing significance: standard cell types, females
+pvals_std_F <- c("CD8T"=t.test(PEG1_meta[PEG1_meta$disease.state.ch1=="PD-free control"&PEG1_meta$reportedSex=="F","CD8T"],PEG1_meta[PEG1_meta$disease.state.ch1=="Parkinson's disease (PD)"&PEG1_meta$reportedSex=="F","CD8T"])$p.value,
+               "CD4T"=t.test(PEG1_meta[PEG1_meta$disease.state.ch1=="PD-free control"&PEG1_meta$reportedSex=="F","CD4T"],PEG1_meta[PEG1_meta$disease.state.ch1=="Parkinson's disease (PD)"&PEG1_meta$reportedSex=="F","CD4T"])$p.value,
+               "NK"=t.test(PEG1_meta[PEG1_meta$disease.state.ch1=="PD-free control"&PEG1_meta$reportedSex=="F","NK"],PEG1_meta[PEG1_meta$disease.state.ch1=="Parkinson's disease (PD)"&PEG1_meta$reportedSex=="F","NK"])$p.value,
+               "Bcell"=t.test(PEG1_meta[PEG1_meta$disease.state.ch1=="PD-free control"&PEG1_meta$reportedSex=="F","Bcell"],PEG1_meta[PEG1_meta$disease.state.ch1=="Parkinson's disease (PD)"&PEG1_meta$reportedSex=="F","Bcell"])$p.value,
+               "Mono"=t.test(PEG1_meta[PEG1_meta$disease.state.ch1=="PD-free control"&PEG1_meta$reportedSex=="F","Mono"],PEG1_meta[PEG1_meta$disease.state.ch1=="Parkinson's disease (PD)"&PEG1_meta$reportedSex=="F","Mono"])$p.value,
+               "Neu"=t.test(PEG1_meta[PEG1_meta$disease.state.ch1=="PD-free control"&PEG1_meta$reportedSex=="F","Neu"],PEG1_meta[PEG1_meta$disease.state.ch1=="Parkinson's disease (PD)"&PEG1_meta$reportedSex=="F","Neu"])$p.value)
+sort(pvals_std_F)
+#        CD4T          Neu        Bcell         Mono         CD8T           NK 
+#.823607e-06 2.007391e-06 1.671452e-05 8.727565e-03 3.767250e-02 3.634470e-01 
+
+sort(p.adjust(pvals_std_F))
+#        CD4T          Neu        Bcell         Mono         CD8T           NK 
+#1.094164e-05 1.094164e-05 6.685807e-05 2.618270e-02 7.534501e-02 3.634470e-01 
+
+#testing significance: standard cell types, males
+pvals_std_M <- c("CD8T"=t.test(PEG1_meta[PEG1_meta$disease.state.ch1=="PD-free control"&PEG1_meta$reportedSex=="M","CD8T"],PEG1_meta[PEG1_meta$disease.state.ch1=="Parkinson's disease (PD)"&PEG1_meta$reportedSex=="M","CD8T"])$p.value,
+               "CD4T"=t.test(PEG1_meta[PEG1_meta$disease.state.ch1=="PD-free control"&PEG1_meta$reportedSex=="M","CD4T"],PEG1_meta[PEG1_meta$disease.state.ch1=="Parkinson's disease (PD)"&PEG1_meta$reportedSex=="M","CD4T"])$p.value,
+               "NK"=t.test(PEG1_meta[PEG1_meta$disease.state.ch1=="PD-free control"&PEG1_meta$reportedSex=="M","NK"],PEG1_meta[PEG1_meta$disease.state.ch1=="Parkinson's disease (PD)"&PEG1_meta$reportedSex=="M","NK"])$p.value,
+               "Bcell"=t.test(PEG1_meta[PEG1_meta$disease.state.ch1=="PD-free control"&PEG1_meta$reportedSex=="M","Bcell"],PEG1_meta[PEG1_meta$disease.state.ch1=="Parkinson's disease (PD)"&PEG1_meta$reportedSex=="M","Bcell"])$p.value,
+               "Mono"=t.test(PEG1_meta[PEG1_meta$disease.state.ch1=="PD-free control"&PEG1_meta$reportedSex=="M","Mono"],PEG1_meta[PEG1_meta$disease.state.ch1=="Parkinson's disease (PD)"&PEG1_meta$reportedSex=="M","Mono"])$p.value,
+               "Neu"=t.test(PEG1_meta[PEG1_meta$disease.state.ch1=="PD-free control"&PEG1_meta$reportedSex=="M","Neu"],PEG1_meta[PEG1_meta$disease.state.ch1=="Parkinson's disease (PD)"&PEG1_meta$reportedSex=="M","Neu"])$p.value)
+sort(pvals_std_M)
+#       Bcell          Neu         CD4T         CD8T         Mono           NK 
+#4.752997e-06 7.116914e-06 1.089385e-03 5.115110e-03 4.348581e-02 9.425349e-02 
+
+sort(p.adjust(pvals_std_M))
+#       Bcell          Neu         CD4T         CD8T         Mono           NK 
+#2.851798e-05 3.558457e-05 4.357540e-03 1.534533e-02 8.697162e-02 9.425349e-02 
+```
+![ECC2 predicted cell type proportions with IDOL reference](/home1/NEURO/schaffner/4-replication/Chuang_2017/celltype_ecc2_idol.png)
+
+![Predicted cell type proportions split by PD status, with sexes combined](/home1/NEURO/schaffner/4-replication/Chuang_2017/celltype_by_PD.png)
+
+PD cases have elevated neutrophils.
+
+![Predicted cell type proportions split by PD status, with sex stratification](/home1/NEURO/schaffner/4-replication/Chuang_2017/celltype_by_sex_PD.png)
+
+PD case-control differences within each sex are similar.
+
+# Meta data correlation matrix
+```{r meta data cor, eval=F}
+#Create correlation matrix
+PEG1_meta$Chip <- substr(PEG1_meta$source_name_ch1, start=1, stop=10)
+PEG1_meta_cor <- PEG1_meta[,38:63]
+rownames(PEG1_meta_cor) <- PEG1_meta$Sample_Name
+str(PEG1_meta_cor)
+PEG1_meta_cor$reportedSex <- as.factor(PEG1_meta_cor$reportedSex)
+PEG1_meta_cor$Chip <- as.factor(PEG1_meta_cor$Chip)
+PEG1_meta_cor$Chip_Position <- as.factor(PEG1_meta_cor$Chip_Position)
+PEG1_meta_cor <- PEG1_meta_cor[,-c(5,6,8)]
+
+cormat <- correlation_pval(PEG1_meta_cor)
+
+# Get lower triangle of the correlation matrix
+get_lower_tri<-function(cormat){
+    cormat[upper.tri(cormat)] <- NA
+    return(cormat)
+  }
+# Get upper triangle of the correlation matrix
+get_upper_tri <- function(cormat){
+    cormat[lower.tri(cormat)]<- NA
+    return(cormat)
+  }
+
+upper_tri <- get_upper_tri(cormat)
+
+#colour if sig
+for(x in 1:nrow(upper_tri)){
+  for(y in 1:ncol(upper_tri)){
+    if(is.na(upper_tri[x,y])==FALSE){
+    if(as.numeric(upper_tri[x,y])<=0.001){upper_tri[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri[x,y])<=0.01){upper_tri[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri[x,y])<=0.05){upper_tri[x,y]<-"<=0.05"}else{upper_tri[x,y]<-">0.05"}}}}
+  }}
+melted_cormat <- reshape2::melt(upper_tri, na.rm = TRUE)
+png("~/4-replication/Chuang_2017/meta_cor.png", width=900, height=900)
+ggplot(data = melted_cormat, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+
+## females only
+meta_F <- PEG1_meta_cor[PEG1_meta_cor$reportedSex=="F",-(c(4))]
+cormat_F <- correlation_pval(meta_F)
+upper_tri_F <- get_upper_tri(cormat_F)
+for(x in 1:nrow(upper_tri_F)){
+  for(y in 1:ncol(upper_tri_F)){
+    if(is.na(upper_tri_F[x,y])==FALSE){
+    if(as.numeric(upper_tri_F[x,y])<=0.001){upper_tri_F[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri_F[x,y])<=0.01){upper_tri_F[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri_F[x,y])<=0.05){upper_tri_F[x,y]<-"<=0.05"}else{upper_tri_F[x,y]<-">0.05"}}}}
+  }}
+melted_cormat_F <- reshape2::melt(upper_tri_F, na.rm = TRUE)
+png("~/4-replication/Chuang_2017/meta_cor_F.png", width=900, height=900)
+ggplot(data = melted_cormat_F, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+
+## males only
+meta_M <- PEG1_meta_cor[PEG1_meta_cor$reportedSex=="M",-(c(4))]
+cormat_M <- correlation_pval(meta_M)
+upper_tri_M <- get_upper_tri(cormat_M)
+for(x in 1:nrow(upper_tri_M)){
+  for(y in 1:ncol(upper_tri_M)){
+    if(is.na(upper_tri_M[x,y])==FALSE){
+    if(as.numeric(upper_tri_M[x,y])<=0.001){upper_tri_M[x,y]<-"<=0.001"}else{
+    if(as.numeric(upper_tri_M[x,y])<=0.01){upper_tri_M[x,y]<-"<=0.01"}else{
+      if(as.numeric(upper_tri_M[x,y])<=0.05){upper_tri_M[x,y]<-"<=0.05"}else{upper_tri_M[x,y]<-">0.05"}}}}
+  }}
+melted_cormat_M <- reshape2::melt(upper_tri_M, na.rm = TRUE)
+png("~/4-replication/Chuang_2017/meta_cor_M_092022.png", width=900, height=900)
+ggplot(data = melted_cormat_M, aes(Var2, Var1, fill = value))+
+ geom_tile(color = "white")+
+scale_fill_manual(values=c("#084594","#4292c6","#9ecae1","#deebf7"), name="p-value") +
+  theme_minimal()+ 
+ theme(axis.text.x = element_text(angle = 45, vjust = 1, 
+    size = 12, hjust = 1))+
+ coord_fixed()
+dev.off()
+```
+![Meta data correlation in both sexes](/home1/NEURO/schaffner/4-replication/Chuang_2017/meta_cor.png)
+
+Chip is correlated to age, disease status, and ethnicity, but chip position is not.
+
+![Meta data correlation in females](/home1/NEURO/schaffner/4-replication/Chuang_2017/meta_cor_F.png)
+
+
+![Meta data correlation in males](/home1/NEURO/schaffner/4-replication/Chuang_2017/meta_cor_M.png)
+
+
+# Principal component analysis
+
+Next I'll use PCA to look at sources of variation in the data. Code from Nicole Gladish.
+
+## PCA on raw data
+```{r pca raw, eval=F}
+# Here are the arguments you can add (and their defaults): 
+# PCA_Plot(PCA_Object, type = c("All", "Sparse"), nPCs = 10, MTC = F, Discrete = T, label.y_size = 12, label.x_size = 12, angle.x = 30, vjust.x = 0.5)
+# Here is what some arguments do: 
+# type = c("All", "Sparse") - this is to tell it whether your PCA_Object results from a sparse or regular PCA (it does not do it for you it just tells the function what you have).
+# nPCs - how many PCs do you want to plot
+# MTC = F - do you want the associations multiple test corrected? BH is the method I include here
+# Discrete = T, do you want a continuous display of significane values or discrete?
+
+#restructing meta data and subsetting to categorical/continuous
+PEG1_meta_cor <- PEG1_meta_cor[match(sampleNames(PEG1_RG_Raw_noout), rownames(PEG1_meta_cor)),]
+str(PEG1_meta_cor)
+PEG1_meta_cor <- PEG1_meta_cor[,-c(9:11)]
+
+meta_categorical <- PEG1_meta_cor[,c("disease.state.ch1","ethnicity.ch1","reportedSex","Chip","Chip_Position","genotype_cluster")]
+
+meta_continuous <- PEG1_meta_cor[,c("age.ch1","xMed","yMed","outlier","beadcount","Average_intensity","DNAmAge_Horvath","CD8T","CD4T","NK","Bcell","Mono","Neu")]
+
+#PCA on beta values: input
+betas_raw <- getBeta(PEG1_RG_Raw_noout)
+all(colnames(betas_raw) == rownames(meta_categorical)) #TRUE
+PCA_full<-princomp(betas_raw[complete.cases(betas_raw),])
+
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)
+```
+![PCA on raw data - scree](/home1/NEURO/schaffner/4-replication/Chuang_2017/pca_raw_scree.png)
+
+![PCA on raw data - heat map](/home1/NEURO/schaffner/4-replication/Chuang_2017/pca_raw_heat_legend.png)
+
+Sex and cell type associate strongest with DNAm, followed by age. PD shows good association as well.
+
+## PCA on normalized and probe-filtered data
+```{r pca norm, eval=F}
+betas_norm <- getBeta(PEG1_RG_filtered)
+all.equal(colnames(betas_norm), rownames(meta_categorical)) #TRUE
+
+#PCA on beta values: input
+PCA_full<-princomp(betas_norm[complete.cases(betas_norm),])
+
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)
+```
+![PCA on normalized and filtered data - scree](/home1/NEURO/schaffner/4-replication/Chuang_2017/pca_norm_scree.png)
+
+![PCA on normalized and filtered data - heat map](/home1/NEURO/schaffner/4-replication/Chuang_2017/pca_norm_heat_legend.png)
+
+## Females PCA
+```{r pca norm F, eval=F}
+betas_norm_F <- getBeta(PEG1_RG_filtered[,sampleNames(PEG1_RG_filtered) %in% rownames(PEG1_meta_cor[PEG1_meta_cor$reportedSex=="F",])])
+meta_F <- PEG1_meta_cor[PEG1_meta_cor$reportedSex=="F",]
+all.equal(colnames(betas_norm_F), rownames(meta_F)) #TRUE
+
+#PCA on beta values: input
+PCA_full<-princomp(betas_norm_F[complete.cases(betas_norm_F),])
+meta_categorical <- meta_F[,c("disease.state.ch1","ethnicity.ch1","Chip","Chip_Position","genotype_cluster")]
+meta_continuous <- meta_F[,c("age.ch1","xMed","yMed","outlier","beadcount","Average_intensity","DNAmAge_Horvath","CD8T","CD4T","NK","Bcell","Mono","Neu")]
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)
+```
+![PCA scree plot for females: normalized, uncorrected data](/home1/NEURO/schaffner/4-replication/Chuang_2017/pca_F_norm_scree.png)
+
+![PCA heat map for females: normalized, uncorrected data](/home1/NEURO/schaffner/4-replication/Chuang_2017/pca_F_norm_heat_legend.png)
+
+## Males PCA
+```{r pca norm M, eval=F}
+betas_norm_M <- getBeta(PEG1_RG_filtered[,sampleNames(PEG1_RG_filtered) %in% rownames(PEG1_meta_cor[PEG1_meta_cor$reportedSex=="M",])])
+meta_M <- PEG1_meta_cor[PEG1_meta_cor$reportedSex=="M",]
+all.equal(colnames(betas_norm_M), rownames(meta_M)) #TRUE
+
+#PCA on beta values: input
+PCA_full<-princomp(betas_norm_M[complete.cases(betas_norm_M),])
+meta_categorical <- meta_M[,c("disease.state.ch1","ethnicity.ch1","Chip","Chip_Position","genotype_cluster")]
+meta_continuous <- meta_M[,c("age.ch1","xMed","yMed","outlier","beadcount","Average_intensity","DNAmAge_Horvath","CD8T","CD4T","NK","Bcell","Mono","Neu")]
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+PCA_Plot(PCA_full, type="Sparse", MTC=T, Discrete=T)
+```
+![PCA scree plot for males: normalized, uncorrected data](/home1/NEURO/schaffner/4-replication/Chuang_2017/pca_M_norm_scree.png)
+
+![PCA heat map for males: normalized, uncorrected data](/home1/NEURO/schaffner/4-replication/Chuang_2017/pca_M_norm_heat_legend.png)
+# ComBat
+
+I'll apply ComBat correction for chip position, but not chip, since it was correlated with disease status.
+
+##ComBat batch correction - row
+```{r ComBat chip, eval=F}
+#get Mvals for input and convert any infinite values to an extreme negative
+Mvals <- getM(PEG1_RG_filtered)
+Mvals[Mvals==-Inf] <- min(Mvals[Mvals>-Inf])
+
+all(PEG1_meta$Sample_Name==sampleNames(PEG1_RG_filtered)) #TRUE
+
+Mvals_combat <- ComBat(Mvals, PEG1_meta$Chip_Position) #12 batches
+
+m2beta <- function (m) 
+{
+    beta <- 2^m/(2^m + 1)
+    return(beta)
+}
+betas_combat <- m2beta(Mvals_combat)
+save(betas_combat, file="~/4-replication/Chuang_2017/PEG1_betas_combat.RData")
+```
+
+##PCA on ComBat-corrected data 
+```{r pca combat chip, eval=F}
+all.equal(colnames(betas_combat), rownames(meta_categorical)) #TRUE
+all.equal(colnames(betas_combat), rownames(meta_continuous)) #TRUE
+
+#PCA on beta values: input
+PCA_full<-princomp(betas_combat[complete.cases(betas_combat),])
+
+PCA_Plot(PCA_full, type="sparse", MTC=T, Discrete=T)
+```
+![PCA scree plot: ComBat-corrected data](/home1/NEURO/schaffner/4-replication/Chuang_2017/pca_combat_scree.png)
+
+![PCA heat map: ComBat-corrected data](/home1/NEURO/schaffner/4-replication/Chuang_2017/pca_combat_heat_legend.png)
+
+All chip effects are gone.
+
+
+--
