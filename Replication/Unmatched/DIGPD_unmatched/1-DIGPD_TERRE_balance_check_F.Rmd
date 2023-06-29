@@ -1,0 +1,130 @@
+---
+itle: "DIGPD_Matching"
+author: "SS"
+date: "05/03/2023"
+output:
+  html_document:
+    df_print: paged
+  rmdformats::readthedown:
+    fig_caption: yes
+    gallery: no
+    highlight: kate
+    lightbox: yes
+    self_contained: yes
+    thumbnails: no
+---
+DIGPD Propensity Matching
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: May 3, 2023
+
+From the MatchIt vignette:
+
+"MatchIt implements the suggestions of Ho et al. (2007) for improving parametric statistical models for estimating treatment effects in observational studies and reducing model dependence by preprocessing data with semi-parametric and non-parametric matching methods. After appropriately preprocessing with MatchIt, researchers can use whatever parametric model they would have used without MatchIt and produce inferences that are more robust and less sensitive to modeling assumptions...
+
+...The goal of matching is to produce **covariate balance**, that is, for the distributions of covariates in the two groups to be approximately equal to each other, as they would be in a successful randomized experiment."
+
+### Libraries and outside functions
+```{r results='hide', warning=FALSE, message=FALSE, eval=F}
+setwd("~/")
+library(MatchIt)
+library(optmatch)
+library(car)
+library(DescTools)
+library(Rglpk)
+```
+
+# Matching in females
+
+## Checking initial imbalances
+
+Values of standardized mean differences and eCDF statistics close to zero and values of variance ratios close to one indicate good balance.
+
+```{r intial check F, eval=F}
+smoking <- read.csv("~/4-replication/predicted_smoking/pred_smoking_all_cohorts.csv")
+DIGPD_meta <- read.csv("~/1-preprocessing/DIGPD/digpd_meta_visit1_celltypePCs_ancestryPCs_nomut.csv")
+smoking_DIGPD <- smoking[match(DIGPD_meta$Sample_Name, smoking$Sample_Name),]
+all.equal(smoking_DIGPD$Sample_Name,DIGPD_meta$Sample_Name) #TRUE
+DIGPD_meta$smokingScore <- smoking_DIGPD$smokingScore
+
+DIGPD_meta_sub <- DIGPD_meta[,c("reportedSex","PD","Age","smokingScore","Neu","Sample_Name")]
+colnames(DIGPD_meta_sub)[2:3] <- c("PD","age")
+DIGPD_meta_sub$PD <- as.character(DIGPD_meta_sub$PD)
+DIGPD_meta_sub[DIGPD_meta_sub$PD=="1","PD"] <- "Case"
+DIGPD_meta_sub[DIGPD_meta_sub$PD=="0","PD"] <- "Control"
+DIGPD_meta_sub$cohort <- "DIGPD"
+
+TERRE_meta <- read.csv("~/1-preprocessing/TERRE/terre_meta_extcelltypePCs2_ancestryPCs_complete.csv") #includes individuals with matched genotype only, includes extended cell types estimation only
+meta2 <- read.csv("~/1-preprocessing/TERRE/terre_meta_cellprop_ext2_02272023.csv") #includes individuals without genotype, and 6-cell type reference estimations (want to use the latter estimation for matching with other cohorts so the reference is consistent)
+meta2 <- meta2[match(TERRE_meta$Sample_Name, meta2$Sample_Name),]
+all.equal(meta2$Sample_Name, TERRE_meta$Sample_Name) #TRUE
+TERRE_meta$Neu <- meta2$Neu
+smoking_TERRE <- smoking[match(TERRE_meta$Sample_Name, smoking$Sample_Name),]
+all.equal(smoking_TERRE$Sample_Name,TERRE_meta$Sample_Name) #TRUE
+TERRE_meta$smokingScore <- smoking_TERRE$smokingScore
+
+TERRE_meta_sub <- TERRE_meta[,c("reportedSex","PD","age","smokingScore","Neu","Sample_Name")]
+TERRE_meta_sub$PD <- gsub(0, "Control", gsub(1, "Case", TERRE_meta_sub$PD))
+TERRE_meta_sub$cohort <- "TERRE"
+
+meta_combined <- rbind(DIGPD_meta_sub, TERRE_meta_sub)
+meta_combined$cohort <- as.factor(meta_combined$cohort)
+meta_combined$cohort <- reorder.factor(meta_combined$cohort, new.order=c("TERRE","DIGPD"))
+
+meta_F <- meta_combined[meta_combined$reportedSex=="F",]
+
+#create a matchit object relating the treatment to the covariates
+F.out0 <- summary(matchit(cohort ~ age + smokingScore + Neu, data = meta_F,
+                 method = NULL, distance = "glm"))$sum.all
+
+F.out0
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio  eCDF Mean   eCDF Max
+#distance         0.5496474     0.4188280       0.7847230   1.033555 0.22429328 0.37268817
+#age             63.2162967    65.6310746      -0.2477021   2.416722 0.09861353 0.21763441
+#smokingScore    -6.1629974    -6.5929367       0.1332361   1.869444 0.03730236 0.09505376
+#Neu              0.6105197     0.5564054       0.5802541   0.766663 0.17129645 0.29666667
+#             Std. Pair Dist.
+#distance                  NA
+#age                       NA
+#smokingScore              NA
+#Neu                       NA
+```
+
+
+## Matching within DIGPD PD cases/controls
+
+"Optimal" pair matching aims to make the overall means comparable between groups. This is a good way of making two populations more similar to each other, without forcing each individual in the population to be similar.
+```{r matching F, eval=F}
+DIGPD_F <- meta_F[meta_F$cohort=="DIGPD",]
+DIGPD_F$PD <- as.factor(DIGPD_F$PD)
+
+F.out3 <- matchit(PD ~ age + smokingScore + Neu, data = DIGPD_F, method = "optimal", distance = "glm", link="probit")
+
+summary(F.out3)
+#Summary of Balance for All Data:
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio eCDF Mean eCDF Max
+#distance            0.5396        0.4521          0.5671     1.3215    0.1550   0.2673
+#age                64.6061       61.8560          0.2983     0.8240    0.0888   0.2026
+#smokingScore       -5.8992       -6.4212          0.1451     1.6104    0.0510   0.1591
+#Neu                 0.5869        0.6336         -0.4672     1.5344    0.1402   0.2303
+#
+#Summary of Balance for Matched Data:
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio eCDF Mean eCDF Max
+#distance            0.5396        0.4585          0.5260     1.4437    0.1463   0.2609
+#age                64.6061       62.3790          0.2416     0.9208    0.0795   0.1957
+#mokingScore       -5.8992       -6.3272          0.1190     1.6614    0.0517   0.1522
+#Neu                 0.5869        0.6313         -0.4442     1.5603    0.1321   0.2174
+#             Std. Pair Dist.
+#distance              0.5343
+#age                   1.0578
+#smokingScore          0.9203
+#Neu                   0.7740
+
+#Sample Sizes:
+#          Control Treated
+#All            47      46
+#Matched        46      46
+#Unmatched       1       0
+#Discarded       0       0
+```

@@ -1,0 +1,124 @@
+TERRE Differential DNAm Analysis
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: Nov 10, 2022
+  
+The *TERRE* cohort (subset containing n=88 cases and n=177 controls) consists of French agricultural workers enrolled in the Mutualite Sociale Agricole health insurance system. All PD cases in this subset of data have a disease duration of one year or less. 
+
+Here I am checking the PD delta betas of CMRs differentially methylated in TERRE in individuals from DIG-PD.
+
+Update Apr 18, 2023: Use individuals matched with MatchIt 4.5.3, probit link function.
+
+#Libraries
+```{r libraries, eval=F}
+setwd("/home1/NEURO/schaffner")
+library(ggplot2) #For plotting
+library(dplyr)
+library(reshape2)
+library(gridExtra)
+library(MASS)
+library(sfsmisc)
+```
+
+## Male-male overlap (FDR < 0.05): with adjustment for smoking
+
+```{r CMRplot M, eval=F}
+sig.cpgs <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_M_adjDB_042023.csv")
+nrow(sig.cpgs <- sig.cpgs[sig.cpgs$adjP_BH<=0.05,]) #7
+
+load("~/2-EWAS_CMRs/DIGPD/DIGPD_refCMR_medB_M.RData")
+ncol(refCMR_medB_M <- refCMR_medB_M[,match(sig.cpgs$TargetID, colnames(refCMR_medB_M))]) #7
+all(colnames(refCMR_medB_M)==sig.cpgs$TargetID) #TRUE
+
+#calculate case-control delta betas for DIGPD
+meta <- read.csv("~/1-preprocessing/DIGPD/digpd_meta_visit1_celltypePCs_ancestryPCs_nomut.csv")
+meta_M <- meta[meta$reportedSex=="M",]
+meta_M <- meta_M[match(rownames(refCMR_medB_M), meta_M$Sample_Name),]
+all(meta_M$Sample_Name==rownames(refCMR_medB_M)) #TRUE
+
+#combine with smoking score
+smoking <- read.csv("~/4-replication/predicted_smoking/pred_smoking_all_cohorts.csv")
+smoking <- smoking[match(meta_M$Sample_Name, smoking$Sample_Name),]
+all(smoking$Sample_Name==meta_M$Sample_Name) #TRUE
+meta_M$smokingScore <- smoking$smokingScore
+
+#4 cell type PCs account for 89% of variance
+#many variables are collected for PD cases only, including edu, smoking, head trauma, alcohol
+#will correct for age, 4 cell type PCs, 3 ancestry PCs, plate, and row
+str(meta_M[,c("PD","Age","plate","smokingScore","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","ancestryPC1","ancestryPC2","ancestryPC3")])
+meta_M$PD <- as.factor(meta_M$PD)
+meta_M$plate <- as.factor(meta_M$plate)
+
+coefs_DIGPD_M <- lapply(1:ncol(refCMR_medB_M), function(x) {
+ rlm(refCMR_medB_M[,x] ~ meta_M$PD + meta_M$Age + meta_M$plate + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3 + meta_M$CTP_PC4 + meta_M$ancestryPC1 + meta_M$ancestryPC2 + meta_M$ancestryPC3 + meta_M$smokingScore, psi = psi.huber, maxit=500)$coefficients[2]
+})
+all(colnames(refCMR_medB_M)==sig.cpgs$TargetID) #TRUE
+sig.cpgs$adjDB_DIGPD <- unlist(coefs_DIGPD_M)
+
+#plotting case-control beta difference at every CMR CpG
+summary(c(sig.cpgs$adjDB, sig.cpgs$adjDB_DIGPD))
+#     Min.   1st Qu.    Median      Mean   3rd Qu.      Max. 
+#-0.024022 -0.003479  0.007301  0.008667  0.021781  0.046613 
+
+summary(c(sig.cpgs$adjDB))
+summary(c(sig.cpgs$adjDB_DIGPD))
+
+cor.test(sig.cpgs$adjDB, sig.cpgs$adjDB_DIGPD)
+#	Pearson's product-moment correlation
+#
+#data:  sig.cpgs$adjDB and sig.cpgs$adjDB_DIGPD
+#t = 0.026807, df = 5, p-value = 0.9797
+#alternative hypothesis: true correlation is not equal to 0
+#95 percent confidence interval:
+# -0.7478214  0.7582011
+#sample estimates:
+#       cor 
+#0.01198746 
+
+sig.cpgs[sign(sig.cpgs$adjDB)==sign(sig.cpgs$adjDB_DIGPD) & abs(sig.cpgs$adjDB)>=0.03 & abs(sig.cpgs$adjDB_DIGPD)>=0.03,c("cmrGR","geneSymbol","adjDB","adjDB_DIGPD")] #none
+
+sig.cpgs$lab <- as.character(sig.cpgs$geneSymbol)
+
+png("~/4-replication/DIGPD/validation_unmatched/Figs/TERRE_DIGPD_adjDB_M_BH0.05_probit_matched.png", width=300, height=300)
+ggplot(sig.cpgs, aes(x=adjDB, y=adjDB_DIGPD))  + geom_point(color="lightsteelblue4", size=5, alpha=0.6) + theme_bw() + xlab("TERRE Adjusted Delta Beta") + ylab("DIGPD Adjusted Delta Beta") + xlim(c(-0.16,0.16)) + ylim(c(-0.05,0.05)) + ggtitle("TERRE (n = 118) vs. DIGPD (n = 129)") + coord_cartesian(clip="off")  + geom_label_repel(data=sig.cpgs, aes(label = lab), size = 3, force=50, max.overlaps=Inf)
+dev.off()
+
+signs <- sign(sig.cpgs$adjDB)==sign(sig.cpgs$adjDB_DIGPD)
+length(signs[signs==TRUE]) #5
+
+#making a table of hits in TERRE and their effect sizes in DIGPD
+hits <- sig.cpgs[sig.cpgs$threshold_adjDB==TRUE,] #2/2 CMRs covered in DIGPD
+write.csv(hits[,c("cmrGR","UCSC_REFGENE_NAME","adjP_BH","adjDB","adjDB_DIGPD")], file="~/4-replication/DIGPD/validation_unmatched/TERRE_CMRs_DIGPD_DB_M_probit.csv", row.names=F)
+```
+![CMR CpGs from TERRE males (FDR < 0.05) in DIGPD males](/home1/NEURO/schaffner/4-replication/DIGPD/validation_unmatched/Figs/TERRE_DIGPD_adjDB_M_BH0.05_probit_matched.png)
+
+## Permuting effect directions: FDR < 0.05
+```{r rlm, eval=F}
+load("~/2-EWAS_CMRs/TERRE/refCMR_medB_M_var.RData")
+dim(discovery_betas <- t(refCMR_medB_M_var)) #29190   118
+rlm_TERRE_M <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_M_adjDB_042023.csv")
+all(rownames(discovery_betas)==rlm_TERRE_M$TargetID) #TRUE
+discovery_DBs <- rlm_TERRE_M$adjDB
+names(discovery_DBs) <- as.character(rlm_TERRE_M$TargetID)
+all(names(discovery_DBs)==rownames(discovery_betas))
+
+#for validation set, subset to data overlapping with discovery
+load("~/2-EWAS_CMRs/DIGPD/DIGPD_refCMR_medB_M.RData")
+dim(validation_betas <- t(refCMR_medB_M[,colnames(refCMR_medB_M) %in% rownames(discovery_betas)])) # 9119   129
+
+#calculate case-control delta betas for validation
+all(meta_M$Sample_Name==colnames(validation_betas)) #TRUE
+str(meta_M[,c("PD","Age","plate","smokingScore","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","ancestryPC1","ancestryPC2","ancestryPC3")])
+
+validation_DBs <- unlist(lapply(1:nrow(validation_betas), function(x) {
+ rlm(validation_betas[x,] ~ meta_M$PD + meta_M$Age + meta_M$plate + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3 + meta_M$CTP_PC4 + meta_M$ancestryPC1 + meta_M$ancestryPC2 + meta_M$ancestryPC3 + meta_M$smokingScore, psi = psi.huber, maxit=500)$coefficients[2]
+}))
+names(validation_DBs) <- rownames(validation_betas)
+save(discovery_DBs, validation_DBs, file="~/4-replication/DIGPD/validation_unmatched/all_adjDBs_TERRE_DIGPD_M_probit.RData")
+
+source('~/4-replication/sign_perm.R')
+sign_perm(sig.cpgs, discovery_betas, discovery_DBs, validation_betas, validation_DBs, n_validation=5, permutation_number=1000)
+#[1] "Permutation P values for enrichment and depletion"
+#[1] "Enrichment: 0.263; Depletion 0.919"
+```
