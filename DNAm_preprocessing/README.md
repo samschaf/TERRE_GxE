@@ -1,1 +1,1 @@
-This folder contains scripts for pre-processing DNAm data from the TERRE, DIGPD, PEG1, and SGPD studies.
+This folder contains scripts for pre-processing DNAm data from the TERRE, DIGPD, PEG1, and SGPD studies, estimating cell type proportions from DNAm data for each study, and creating exploratory PCA plots and meta data correlation plots.
