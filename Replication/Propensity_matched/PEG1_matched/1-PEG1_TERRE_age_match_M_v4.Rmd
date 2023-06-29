@@ -1,0 +1,214 @@
+---
+itle: "PEG1_matching"
+author: "SS"
+date: "04/18/2023"
+output:
+  html_document:
+    df_print: paged
+  rmdformats::readthedown:
+    fig_caption: yes
+    gallery: no
+    highlight: kate
+    lightbox: yes
+    self_contained: yes
+    thumbnails: no
+---
+PEG1 Propensity Matching
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: Mar 2, 2023
+
+From the MatchIt vignette:
+
+"MatchIt implements the suggestions of Ho et al. (2007) for improving parametric statistical models for estimating treatment effects in observational studies and reducing model dependence by preprocessing data with semi-parametric and non-parametric matching methods. After appropriately preprocessing with MatchIt, researchers can use whatever parametric model they would have used without MatchIt and produce inferences that are more robust and less sensitive to modeling assumptions...
+
+...The goal of matching is to produce **covariate balance**, that is, for the distributions of covariates in the two groups to be approximately equal to each other, as they would be in a successful randomized experiment."
+
+Apr 18, 2023: Bugs were reported with MatchIt version 4.5.1 and 4.5.2 (version 4.5.1 was used here originally). Here I've updated MatchIt to the latest release (4.5.3) where bugs were fixed, and will re-run this script to check if it changes any results.
+
+### Libraries and outside functions
+```{r results='hide', warning=FALSE, message=FALSE, eval=F}
+setwd("~/")
+library(MatchIt)
+library(optmatch)
+library(car)
+library(DescTools)
+library(Rglpk)
+```
+
+# Matching in males
+
+## Checking initial imbalances
+
+Values of standardized mean differences and eCDF statistics close to zero and values of variance ratios close to one indicate good balance.
+
+```{r intial check F, eval=F}
+smoking <- read.csv("~/4-replication/predicted_smoking/pred_smoking_all_cohorts.csv")
+PEG1_meta <- read.csv("~/4-replication/Chuang_2017/preprocessing/PEG1_meta_celltypePCs.csv")
+smoking_PEG1 <- smoking[match(PEG1_meta$Sample_Name, smoking$Sample_Name),]
+all.equal(smoking_PEG1$Sample_Name,PEG1_meta$Sample_Name) #TRUE
+PEG1_meta$smokingScore <- smoking_PEG1$smokingScore
+
+PEG1_meta_sub <- PEG1_meta[,c("reportedSex","disease.state.ch1","age.ch1","smokingScore","Neu","Sample_Name")]
+colnames(PEG1_meta_sub)[2:3] <- c("PD","age")
+PEG1_meta_sub$PD <- as.character(PEG1_meta_sub$PD)
+PEG1_meta_sub[PEG1_meta_sub$PD=="Parkinson's disease (PD)","PD"] <- "Case"
+PEG1_meta_sub[PEG1_meta_sub$PD=="PD-free control","PD"] <- "Control"
+PEG1_meta_sub$cohort <- "PEG1"
+
+TERRE_meta <- read.csv("~/1-preprocessing/TERRE/terre_meta_extcelltypePCs2_ancestryPCs_complete.csv") #includes individuals with matched genotype only, includes extended cell types estimation only
+meta2 <- read.csv("~/1-preprocessing/TERRE/terre_meta_cellprop_ext2_02272023.csv") #includes individuals without genotype, and 6-cell type reference estimations (want to use the latter estimation for matching with other cohorts so the reference is consistent)
+meta2 <- meta2[match(TERRE_meta$Sample_Name, meta2$Sample_Name),]
+all.equal(meta2$Sample_Name, TERRE_meta$Sample_Name) #TRUE
+TERRE_meta$Neu <- meta2$Neu
+smoking_TERRE <- smoking[match(TERRE_meta$Sample_Name, smoking$Sample_Name),]
+all.equal(smoking_TERRE$Sample_Name,TERRE_meta$Sample_Name) #TRUE
+TERRE_meta$smokingScore <- smoking_TERRE$smokingScore
+
+TERRE_meta_sub <- TERRE_meta[complete.cases(TERRE_meta$smoking),c("reportedSex","PD","age","smokingScore","Neu","Sample_Name")]
+TERRE_meta_sub$PD <- gsub(0, "Control", gsub(1, "Case", TERRE_meta_sub$PD))
+TERRE_meta_sub$cohort <- "TERRE"
+
+meta_combined <- rbind(PEG1_meta_sub, TERRE_meta_sub)
+meta_combined$cohort <- as.factor(meta_combined$cohort)
+meta_combined$cohort <- reorder.factor(meta_combined$cohort, new.order=c("TERRE","PEG1"))
+
+meta_M <- meta_combined[meta_combined$reportedSex=="M",]
+
+#create a matchit object relating the treatment to the covariates
+M.out0 <- summary(matchit(cohort ~ age + smokingScore + Neu, data = meta_M,
+                 method = NULL, distance = "glm"))$sum.all
+
+M.out0
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio eCDF Mean  eCDF Max Std. Pair Dist.
+#distance         0.7985704     0.5240583       1.4876654  0.5851608 0.3214542 0.5086126              NA
+#age             69.9771987    68.0240838       0.1842222  2.6545377 0.1021720 0.3400596              NA
+#smokingScore    -2.6750273    -4.4618345       0.3976890  1.0877375 0.1369152 0.2239552              NA
+#Neu              0.6754300     0.5659011       1.0536063  1.1070106 0.2820350 0.4532380              NA
+
+summary(meta_M[meta_M$PD=="Case","age"])
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#  36.00   63.00   71.00   69.64   76.00   90.00 
+
+summary(meta_M[meta_M$PD=="Control","age"])
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#  35.00   65.00   71.00   69.14   75.33   89.00 
+
+summary(meta_M[meta_M$cohort=="TERRE","age"])
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#  41.26   63.85   70.04   67.92   72.89   76.38 
+
+summary(meta_M[meta_M$cohort=="PEG1","age"])
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#  35.00   64.00   72.00   69.98   77.00   90.00 
+```
+
+The means are not too different, but there is a high variance ratio, explained by the larger age range in PEG1.
+
+## Matching within PEG1 PD cases/controls
+
+![Age by PD status, within cohorts](/home1/NEURO/schaffner/4-replication/predicted_age/age_by_cohort_PD_M.png)
+
+Male PEG1 cases and controls are already similar in age.
+
+"Optimal" pair matching aims to make the overall means comparable between groups. This is a good way of making two populations more similar to each other, without forcing each individual in the population to be similar.
+```{r matching F, eval=F}
+PEG1_M <- meta_M[meta_M$cohort=="PEG1",]
+PEG1_M$PD <- as.factor(PEG1_M$PD)
+
+M.out3 <- matchit(PD ~ age + smokingScore + Neu, data = PEG1_M, method = "optimal", distance = "glm", link="probit")
+
+summary(M.out3)
+#Summary of Balance for All Data:
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio eCDF Mean eCDF Max
+#distance            0.4413        0.3592          0.5803     1.3247    0.1828   0.3378
+#age                70.0917       69.9037          0.0163     1.3230    0.0349   0.1025
+#smokingScore       -1.7677       -3.2573          0.3057     1.3842    0.0856   0.1542
+#Neu                 0.6418        0.6970         -0.5190     1.2051    0.1612   0.2951
+#
+#Summary of Balance for Matched Data:
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio eCDF Mean eCDF Max Std. Pair Dist.
+#distance            0.4413        0.4073          0.2406     1.2841    0.0663   0.2333          0.2440
+#age                70.0917       69.7167          0.0326     1.3491    0.0433   0.1333          1.0056
+#smokingScore       -1.7677       -2.2562          0.1003     1.4089    0.0324   0.0917          0.8108
+#Neu                 0.6418        0.6645         -0.2132     1.1726    0.0632   0.1833          0.5224
+#
+#Sample Sizes:
+#          Control Treated
+#All           187     120
+#Matched       120     120
+#Unmatched      67       0
+#Discarded       0       0
+
+png("~/4-replication/Chuang_2017/validation_matched/male/eQQ_PEG1_M_probit_optimal.png")
+plot(M.out3, type = "qq", interactive = FALSE)
+dev.off()
+
+png("~/4-replication/Chuang_2017/validation_matched/male/loveplot_PEG1_M_probit_optimal.png")
+plot(summary(M.out3), xlim=c(-0.1,2), main="PEG1 male case-control matching")
+dev.off()
+
+nrow(PEG1_M_matched <- match.data(M.out3)) #240
+summary(as.factor(PEG1_M$PD))
+#   Case Control 
+#    187     120 
+    
+summary(as.factor(PEG1_M_matched$PD))
+#   Case Control 
+#    120     120 
+    
+meta_M_2 <- rbind(meta_M[meta_M$cohort=="TERRE",], as.data.frame(PEG1_M_matched[,1:7]))
+```
+![eQQ plots in PEG1 males: probit link function](/home1/NEURO/schaffner/4-replication/Chuang_2017/validation_matched/male/eQQ_PEG1_M_probit_optimal.png)
+
+![Standardized mean difference in PEG1 males: probit link function](/home1/NEURO/schaffner/4-replication/Chuang_2017/validation_matched/male/loveplot_PEG1_M_probit_optimal.png)
+
+## Matching for age across cohorts
+
+```{r matching F, eval=F}
+M.out3 <- matchit(cohort ~ age + smokingScore + Neu, data = meta_M_2, method = "optimal", distance = "glm", link="probit")
+
+summary(M.out3)
+#Summary of Balance for Matched Data:
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio eCDF Mean
+#distance            0.6072        0.5017          0.5454     0.5805    0.0974
+#age                67.9661       68.0241         -0.0054     3.2708    0.0891
+#smokingScore       -3.6713       -4.4618          0.1756     0.6008    0.0916
+#Neu                 0.5982        0.5659          0.3144     0.8296    0.0787
+#             eCDF Max Std. Pair Dist.
+#distance       0.2966          0.5458
+#age            0.3220          0.9827
+#smokingScore   0.1864          0.9184
+#Neu            0.1780          0.7580
+#
+#Sample Sizes:
+#          Control Treated
+#All           118     240
+#Matched       118     118
+#Unmatched       0     122
+#Discarded       0       0
+
+png("~/4-replication/Chuang_2017/validation_matched/male/eQQ_TERRE_PEG1_M_probit_optimal.png")
+plot(M.out3, type = "qq", interactive = FALSE)
+dev.off()
+
+png("~/4-replication/Chuang_2017/validation_matched/male/loveplot_TERRE_PEG1_M_probit_optimal.png")
+plot(summary(M.out3), xlim=c(-0.1,2), main="TERRE and PEG1 male matching")
+dev.off()
+
+nrow(meta_M_matched <- match.data(M.out3)) #236
+table(meta_M_matched$PD, meta_M_matched$cohort)
+#          TERRE PEG1
+#  Case       38   56
+#  Control    80   62
+```
+![eQQ plots in TERRE and PEG1 males: probit link function](/home1/NEURO/schaffner/4-replication/Chuang_2017/validation_matched/male/eQQ_TERRE_PEG1_M_probit_optimal.png)
+
+![Standardized mean difference in TERRE and PEG1 males: probit link function](/home1/NEURO/schaffner/4-replication/Chuang_2017/validation_matched/male/loveplot_TERRE_PEG1_M_probit_optimal.png)
+
+## Saving matched metadata
+
+```{r save, eval=F}
+write.csv(meta_M_matched, file="~/4-replication/Chuang_2017/validation_matched/male/TERRE_PEG1_meta_M_matched_probit.csv", row.names=F)
+```
