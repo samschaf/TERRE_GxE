@@ -1,0 +1,137 @@
+TERRE Differential DNAm Analysis
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: May 3, 2023
+  
+The *TERRE* cohort (subset containing n=88 cases and n=177 controls) consists of French agricultural workers enrolled in the Mutualite Sociale Agricole health insurance system. All PD cases in this subset of data have a disease duration of one year or less. 
+
+Here I am checking the PD delta betas of CMRs differentially methylated in TERRE in individuals from PEG1.
+
+#Libraries
+```{r libraries, eval=F}
+setwd("/home1/NEURO/schaffner")
+library(ggplot2) #For plotting
+library(dplyr)
+library(reshape2)
+library(gridExtra)
+library(car)
+library(MASS)
+library(sfsmisc)
+library(ggrepel)
+```
+
+## CMRs in females, FDR < 0.05: different covariates in TERRE and PEG1
+
+TERRE was adjusted for age, head trauma, smoking, alcohol consumption, cell type PCs, and ancestry PCs. PEG1 will be adjusted for age, ethnicity, smoking score, and cell type PCs.
+
+```{r CMRplot, eval=F}
+sig.cpgs <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_F_adjDB_042023.csv")
+nrow(sig.cpgs <- sig.cpgs[sig.cpgs$adjP_BH<=0.05,]) #508
+
+load("~/4-replication/Chuang_2017/PEG1_refCMR_medB_F_unmatched.RData")
+all(as.character(sig.cpgs$TargetID) %in% colnames(refCMR_medB_F)) #FALSE
+nrow(sig.cpgs.sub <- sig.cpgs[sig.cpgs$TargetID %in% colnames(refCMR_medB_F),]) #155 CpGs in 450K CMRs
+refCMR_medB_F <- refCMR_medB_F[,match(sig.cpgs.sub$TargetID, colnames(refCMR_medB_F))]
+all.equal(colnames(refCMR_medB_F),as.character(sig.cpgs.sub$TargetID)) #TRUE
+
+#metadata
+meta_CTP <- read.csv("~/4-replication/Chuang_2017/preprocessing/PEG1_meta_celltypePCs.csv")
+meta_CTP_F <- meta_CTP[match(rownames(refCMR_medB_F), meta_CTP$Sample_Name),]
+colnames(meta_CTP_F)
+
+#add smoking
+smoking <- read.csv("~/4-replication/predicted_smoking/pred_smoking_all_cohorts.csv")
+smoking <- smoking[match(meta_CTP_F$Sample_Name, smoking$Sample_Name),]
+all(smoking$Sample_Name==meta_CTP_F$Sample_Name) #TRUE
+meta_CTP_F$smokingScore <- smoking$smokingScore
+
+str(meta_CTP_F[,c("disease.state.ch1","age.ch1","ethnicity.ch1","smokingScore","CTP_PC1","CTP_PC2","CTP_PC3")])
+meta_CTP_F$disease.state.ch1 <- gsub("Parkinson's disease \\(PD\\)", "1", gsub("PD-free control","0", meta_CTP_F$disease.state.ch1))
+meta_CTP_F$disease.state.ch1 <- as.factor(meta_CTP_F$disease.state.ch1)
+meta_CTP_F$ethnicity.ch1 <- as.factor(meta_CTP_F$ethnicity.ch1)
+str(meta_CTP_F[,c("disease.state.ch1","age.ch1","ethnicity.ch1","smokingScore","CTP_PC1","CTP_PC2","CTP_PC3")])
+summary(meta_CTP_F[,c("disease.state.ch1","age.ch1","ethnicity.ch1","smokingScore","CTP_PC1","CTP_PC2","CTP_PC3")])
+all(meta_CTP_F$Sample_Name==rownames(refCMR_medB_F)) #TRUE
+
+coefs_PEG1_F <- lapply(1:ncol(refCMR_medB_F), function(x) {
+ rlm(refCMR_medB_F[,x] ~ meta_CTP_F$disease.state.ch1 + meta_CTP_F$age.ch1 + meta_CTP_F$ethnicity.ch1 + meta_CTP_F$smokingScore + meta_CTP_F$CTP_PC1 + meta_CTP_F$CTP_PC2 + meta_CTP_F$CTP_PC3, psi = psi.huber, maxit=500)$coefficients[2]
+})
+all(colnames(refCMR_medB_F)==sig.cpgs.sub$TargetID) #TRUE
+sig.cpgs.sub$adjDB_PEG1 <- unlist(coefs_PEG1_F)
+
+#plotting case-control beta difference at every CMR CpG
+#summary(c(sig.cpgs.sub$adjDB, sig.cpgs.sub$adjDB_PEG1))
+#     Min.   1st Qu.    Median      Mean   3rd Qu.      Max. 
+#-0.082337 -0.003200  0.002748  0.007889  0.018795  0.106860 
+
+summary(sig.cpgs.sub$adjDB)
+summary(sig.cpgs.sub$adjDB_PEG1)
+
+cor.test(sig.cpgs.sub$adjDB, sig.cpgs.sub$adjDB_PEG1)
+#	Pearson's product-moment correlation
+#
+#data:  sig.cpgs.sub$adjDB and sig.cpgs.sub$adjDB_PEG1
+#t = 1.7951, df = 153, p-value = 0.07461
+#alternative hypothesis: true correlation is not equal to 0
+#95 percent confidence interval:
+# -0.0143513  0.2945999
+#sample estimates:
+#      cor 
+#0.1436219 
+
+sig.cpgs.sub[sign(sig.cpgs.sub$adjDB)==sign(sig.cpgs.sub$adjDB_PEG1) & abs(sig.cpgs.sub$adjDB)>=0.03 & abs(sig.cpgs.sub$adjDB_PEG1)>=0.03,c("cmrGR","geneSymbol","adjDB","adjDB_PEG1")] #none
+
+#previous "validated" CMRs with matched data:
+#                        cmrGR geneSymbol       adjDB  adjDB_PEG1
+#8876  chr18:77280264-77280587     NFATC1  0.06383836  0.03164447
+#15018  chr6:27569167-27570549       <NA> -0.07884133 -0.03582442
+
+
+val <- sig.cpgs.sub[sig.cpgs.sub$cmrGR %in% c("chr18:77280264-77280587","chr6:27569167-27570549"),c("cmrGR","geneSymbol","adjDB","adjDB_PEG1")]
+#                        cmrGR geneSymbol       adjDB  adjDB_PEG1
+#8876  chr18:77280264-77280587     NFATC1  0.06383836  0.01272771
+#15018  chr6:27569167-27570549       <NA> -0.07884133 -0.02180821
+
+sig.cpgs.sub$lab <- as.character(sig.cpgs.sub$cmrGR)
+sig.cpgs.sub[complete.cases(sig.cpgs.sub$geneSymbol),"lab"] <- sig.cpgs.sub[complete.cases(sig.cpgs.sub$geneSymbol),"geneSymbol"]
+
+png("~/4-replication/Chuang_2017/TERRE_PEG1_adjDB_F_BH0.05_unmatched.png", width=300, height=300)
+ggplot(sig.cpgs.sub, aes(x=adjDB, y=adjDB_PEG1)) + geom_smooth(method="lm", col="grey") + geom_point(color="lightpink4", size=5, alpha=0.6) + theme_bw() + xlab("TERRE Adjusted Delta Beta") + ylab("PEG1 Adjusted Delta Beta") + xlim(c(-0.16,0.16)) + ylim(c(-0.05,0.05)) + ggtitle("TERRE (n = 100) vs. PEG1 (n = 232)") + coord_cartesian(clip="off")  + geom_label_repel(data=sig.cpgs.sub[sig.cpgs.sub$cmrGR %in% val$cmrGR,], aes(label = lab), size = 3, force=50, max.overlaps=Inf)
+dev.off()
+
+signs <- sign(sig.cpgs.sub$adjDB)==sign(sig.cpgs.sub$adjDB_PEG1)
+length(signs[signs==TRUE]) #58/155 (37%)
+```
+![CMR CpGs from TERRE females (FDR < 0.05) in PEG1 females](/home1/NEURO/schaffner/4-replication/Chuang_2017/TERRE_PEG1_adjDB_F_BH0.05_unmatched.png)
+
+## Permuting effect directions: FDR < 0.05
+```{r rlm, eval=F}
+load("~/2-EWAS_CMRs/TERRE/refCMR_medB_F_var.RData")
+dim(discovery_betas <- t(refCMR_medB_F_var)) #29363   100
+rlm_TERRE_F <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_F_adjDB_042023.csv")
+all(rownames(discovery_betas)==rlm_TERRE_F$TargetID) #TRUE
+discovery_DBs <- rlm_TERRE_F$adjDB
+names(discovery_DBs) <- as.character(rlm_TERRE_F$TargetID)
+all(names(discovery_DBs)==rownames(discovery_betas))
+
+#for validation set, subset to data overlapping with discovery
+load("~/4-replication/Chuang_2017/PEG1_refCMR_medB_F_unmatched.RData")
+dim(validation_betas <- t(refCMR_medB_F[,colnames(refCMR_medB_F) %in% rownames(discovery_betas)])) #17201   232
+
+#calculate case-control delta betas for validation
+all(meta_CTP_F$Sample_Name==colnames(validation_betas)) #TRUE
+str(meta_CTP_F[,c("disease.state.ch1","age.ch1","ethnicity.ch1","smokingScore","CTP_PC1","CTP_PC2","CTP_PC3")])
+
+validation_DBs <- unlist(lapply(1:nrow(validation_betas), function(x) {
+ rlm(validation_betas[x,] ~ meta_CTP_F$disease.state.ch1 + meta_CTP_F$age.ch1 + meta_CTP_F$ethnicity.ch1 + meta_CTP_F$smokingScore + meta_CTP_F$CTP_PC1 + meta_CTP_F$CTP_PC2 + meta_CTP_F$CTP_PC3, psi = psi.huber, maxit=500)$coefficients[2]
+}))
+names(validation_DBs) <- rownames(validation_betas)
+#save(discovery_DBs, validation_DBs, file="~/4-replication/Chuang_2017/validation_matched/female/all_adjDBs_TERRE_PEG1_F_probit_matched.RData")
+
+source('~/4-replication/sign_perm.R')
+sign_perm(sig.cpgs.sub, discovery_betas, discovery_DBs, validation_betas, validation_DBs, n_validation=58, permutation_number=1000)
+#[1] "Permutation P values for enrichment and depletion"
+#[1] "Enrichment: 0.999; Depletion 0.001"
+```
+
