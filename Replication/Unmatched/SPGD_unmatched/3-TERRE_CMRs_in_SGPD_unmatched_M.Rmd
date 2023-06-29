@@ -1,0 +1,97 @@
+TERRE Differential DNAm Analysis
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: May 8, 2023
+  
+The *TERRE* cohort (subset containing n=88 cases and n=177 controls) consists of French agricultural workers enrolled in the Mutualite Sociale Agricole health insurance system. All PD cases in this subset of data have a disease duration of one year or less. 
+
+Here I am checking the PD delta betas of CMRs differentially methylated in TERRE in individuals from SGPD.
+
+#Libraries
+```{r libraries, eval=F}
+setwd("/home1/NEURO/schaffner")
+library(ggplot2) #For plotting
+library(dplyr)
+library(reshape2)
+library(gridExtra)
+library(car)
+library(MASS)
+library(sfsmisc)
+library(ggrepel)
+```
+
+## CMRs in males, FDR < 0.05: different covariates in TERRE and SGPD
+
+TERRE was adjusted for age, head trauma, smoking, alcohol consumption, cell type PCs, and ancestry PCs. SGPD will be adjusted for age, smoking score, and cell type PCs.
+
+```{r CMRplot, eval=F}
+sig.cpgs <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_M_adjDB_042023.csv")
+nrow(sig.cpgs <- sig.cpgs[sig.cpgs$adjP_BH<=0.05,]) #7
+
+load("~/4-replication/Vallerga_2020/SGPD_refCMR_medB_M_unmatched.RData")
+all(as.character(sig.cpgs$TargetID) %in% colnames(refCMR_medB_M)) #FALSE
+nrow(sig.cpgs.sub <- sig.cpgs[sig.cpgs$TargetID %in% colnames(refCMR_medB_M),]) #4 CpGs in 450K CMRs
+refCMR_medB_M <- refCMR_medB_M[,match(sig.cpgs.sub$TargetID, colnames(refCMR_medB_M))]
+all.equal(colnames(refCMR_medB_M),as.character(sig.cpgs.sub$TargetID)) #TRUE
+
+#calculate case-control delta betas for SGPD
+meta <- read.csv("~/4-replication/Vallerga_2020/preprocessing/SGPD_meta_celltypePCs_age.csv")
+meta_M <- meta[meta$reportedSex=="M" & complete.cases(meta$age),]
+all(meta_M$Sample_Name%in%rownames(refCMR_medB_M)) #TRUE
+
+#subset the median CMR betas to those with complete age data
+refCMR_medB_M <- refCMR_medB_M[match(meta_M$Sample_Name, rownames(refCMR_medB_M)),]
+all(meta_M$Sample_Name==rownames(refCMR_medB_M)) #TRUE
+
+#combine with the rest of the metadata
+smoking <- read.csv("~/4-replication/predicted_smoking/pred_smoking_all_cohorts.csv")
+smoking <- smoking[match(meta_M$Sample_Name, smoking$Sample_Name),]
+all(smoking$Sample_Name==meta_M$Sample_Name)
+meta_M$smokingScore <- smoking$smokingScore
+
+str(meta_M[,c("disease.state.ch1","age","smokingScore","CTP_PC1","CTP_PC2","CTP_PC3")])
+meta_M$disease.state.ch1 <- gsub("Parkinson's disease", "1", gsub("Control","0", meta_M$disease.state.ch1))
+meta_M$disease.state.ch1 <- as.factor(meta_M$disease.state.ch1)
+str(meta_M[,c("disease.state.ch1","age","smokingScore","CTP_PC1","CTP_PC2","CTP_PC3")])
+summary(meta_M[,c("disease.state.ch1","age","smokingScore","CTP_PC1","CTP_PC2","CTP_PC3")])
+
+coefs_SGPD_M <- lapply(1:ncol(refCMR_medB_M), function(x) {
+ rlm(refCMR_medB_M[,x] ~ meta_M$disease.state.ch1 + meta_M$age + meta_M$smokingScore + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3, psi = psi.huber, maxit=500)$coefficients[2]
+})
+all(colnames(refCMR_medB_M)==sig.cpgs.sub$TargetID) #TRUE
+sig.cpgs.sub$adjDB_SGPD <- unlist(coefs_SGPD_M)
+
+#plotting case-control beta difference at every CMR
+summary(c(sig.cpgs.sub$adjDB, sig.cpgs.sub$adjDB_SGPD))
+#     Min.   1st Qu.    Median      Mean   3rd Qu.      Max. 
+#-0.008962 -0.003650  0.009939  0.013992  0.028030  0.046613 
+
+summary(sig.cpgs.sub$adjDB)
+summary(sig.cpgs.sub$adjDB_SGPD)
+
+cor.test(sig.cpgs.sub$adjDB, sig.cpgs.sub$adjDB_SGPD)
+#	Pearson's product-moment correlation
+#
+#data:  sig.cpgs.sub$adjDB and sig.cpgs.sub$adjDB_SGPD
+#t = -0.04298, df = 2, p-value = 0.9696
+#alternative hypothesis: true correlation is not equal to 0
+#95 percent confidence interval:
+# -0.9633395  0.9586992
+#sample estimates:
+#        cor 
+#-0.03037731
+
+sig.cpgs.sub[sign(sig.cpgs.sub$adjDB)==sign(sig.cpgs.sub$adjDB_SGPD) & abs(sig.cpgs.sub$adjDB)>=0.03 & abs(sig.cpgs.sub$adjDB_SGPD)>=0.03,c("cmrGR","geneSymbol","adjDB","adjDB_SGPD")] #none
+
+sig.cpgs.sub$lab <- as.character(sig.cpgs.sub$cmrGR)
+sig.cpgs.sub[complete.cases(sig.cpgs.sub$geneSymbol),"lab"] <- sig.cpgs.sub[complete.cases(sig.cpgs.sub$geneSymbol),"geneSymbol"]
+
+png("~/4-replication/Vallerga_2020/TERRE_SGPD_adjDB_M_BH0.05_unmatched.png", width=300, height=300)
+ggplot(sig.cpgs.sub, aes(x=adjDB, y=adjDB_SGPD)) + geom_point(color="lightsteelblue4", size=5, alpha=0.6) + theme_bw() + xlab("TERRE Adjusted Delta Beta") + ylab("SGPD Adjusted Delta Beta") + xlim(c(-0.16,0.16)) + ylim(c(-0.05,0.05)) + ggtitle("TERRE (n = 118) vs. SGPD (n = 778)") + coord_cartesian(clip="off")+ geom_label_repel(data=sig.cpgs.sub, aes(label = lab), size = 3, force=50, max.overlaps=Inf)
+dev.off()
+
+signs <- sign(sig.cpgs.sub$adjDB)==sign(sig.cpgs.sub$adjDB_SGPD)
+length(signs[signs==TRUE]) #88/155 (57%)
+```
+![CMR CpGs from TERRE females (FDR < 0.05) in SGPD females](/home1/NEURO/schaffner/4-replication/Vallerga_2020/TERRE_SGPD_adjDB_F_BH0.05_unmatched.png)

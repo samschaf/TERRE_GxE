@@ -1,0 +1,77 @@
+SGPD CMR beta calculation
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: May 5, 2023
+
+### Libraries
+```{r libraries, eval=F}
+setwd("/home1/NEURO/schaffner")
+library(ggplot2) #For plotting
+library(dplyr)
+library(reshape2)
+library(gridExtra)
+library(limma)
+library(comeback)
+library(car)
+```
+
+## Load meta data and betas
+
+### Females
+```{r load data, eval=F}
+load("~/4-replication/Vallerga_2020/preprocessing/SGPD_betas_combat.RData")
+
+#Meta data
+meta <- read.csv("~/4-replication/Vallerga_2020/preprocessing/SGPD_meta_celltypePCs_age.csv")
+meta_F <- meta[meta$reportedSex=="F",]
+
+summary(as.factor(meta_F$disease.state.ch1))
+#            Control Parkinson's disease 
+#                468                 327 
+
+#subset betas
+dim(betas_F <- betas_combat[,colnames(betas_combat) %in% meta_F$Sample_Name]) #424699    795
+```
+
+## Calculating CMR median betas
+
+Using pre-defined blood reference CMRs. 
+
+### Females
+```{r CoMeBack F, eval=F}
+betas_F_t <- t(betas_F)
+
+#get reference CMRs (1k)
+#refCMRs <- readRDS("~/kobor_shared_coding_resource/reference_CMRs/S3_cmr_Scor30_mxd1K.rds")
+
+#covert to a list, where each element contains CpG probe names, and names correspond to chromosome
+#refCMRlist <- lapply(1:nrow(refCMRs), function(x){
+#  probes <- unlist(strsplit(as.character(refCMRs$cmr[x]), split=","))
+#  
+#})
+
+#subset to CMRs contained in QC'ed data
+#CMRcheck <- sapply(1:length(refCMRlist), function(x){
+#  probes <- refCMRlist[[x]]
+#  return(all(probes %in% colnames(betas_F_t)))
+#})
+#summary(CMRcheck)
+#   Mode   FALSE    TRUE 
+#logical    1735   28514 
+
+#length(refCMRlist <- refCMRlist[CMRcheck]) #28,154
+#save(refCMRlist, file="~/4-replication/Vallerga_2020/validation_matched/refCMRs_in_SGPD.RData")
+load("~/4-replication/Vallerga_2020/validation_matched/refCMRs_in_SGPD.RData")
+
+# use uncorrrected betas to calculate CMR median betas
+# with this function from the package, an error "Error in Mdata[,x]: index type "list" is incorrect" occurs.  Looking at cmr_comp, line 22 specifies to unlist all the CMRs into one vector (as opposed to a list of lists containing CMRs per chromosome) only if there are fewer than 24 chromosomes. 
+#cmr_cor40_cmpB=cmr_comp(cmrs = refCMRlist, Mdata = beta_noCTC)
+#save(cmr_cor40_cmpB, file="/home1/NEURO/schaffner/CoMeBack/CMR_cmpB.Rdata")
+
+#I have 24 exactly, and it seems like the CMRs need to be unlisted for the next part of the function to work. I commented out this line and saved a new R script, "cmr_comp2.R," which I will try on my data.
+source("/home1/NEURO/schaffner/2-EWAS_CMRs/cmr_comp2.R")
+
+refCMR_medB_F=cmr_comp2(cmrs = refCMRlist, Mdata = betas_F_t, cmethod="median")
+save(refCMR_medB_F, file="/home1/NEURO/schaffner/4-replication/Vallerga_2020/SGPD_refCMR_medB_F_unmatched.RData")
+```
