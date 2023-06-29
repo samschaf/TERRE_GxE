@@ -1,0 +1,256 @@
+TERRE Differential DNAm Analysis
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: Feb 15, 2023
+  
+  This code was written by Dr. Sarah Merrill.
+  
+  # Robust Principle Components Analysis for Compositional Data
+  
+  ##Problem and Solution of PCA for Compositional Data
+  Compositional data is unique, and as such, cannot be easily used in ANCOVAs, linear regressions, or Principle Components Analysis (PCA) due to breaking necessary assumptions - specifically the assumptions of independence and little multicolinearity. Compositional data are strictly positive and multivariate that are constrained to have a unit sum (Aitchison, 1982). Therefore, predicted cell type proportions using reference methods like Houseman et al. (2012) are compositional data. 
+
+With compositional data, you can perform a PCA of the orthonormal relative structure (isometric logratio transformation) of the proportions instead of the values of their original components to create linearly uncorrelated variables to include in your standard model (Filzmoser, Hron & Reimann, 2009). This approach uses the principles of compositional data (scale invariance, subcompositional coherence, and permutation invariance) to maintain relative distances among the components. PCA is then performed to reduce data into the variability in the relative distances among the cell type proportions. 
+
+The Robust PCA method for compositional data also uses Minimum Covariance Determinant (MCD) estimators of location and covariance inquire ILR coordinates to obtain full rank data in order to get the MCD estimate of the covariance matrix and the respective matrix of eigenvectors. This is to reduce the potential affect of outliers (Filzmoser, Hron & Reimann, 2009). 
+
+## Loading Libraries
+```{r libraries, eval=F}
+setwd("/home1/NEURO/schaffner/")
+#library(methylumi)
+#library(robCompositions)
+library(dplyr)
+library(ggplot2)
+library(comeback)
+library(DescTools)
+source("/home1/NEURO/schaffner/kobor_shared_coding_resource/pcaCoDa_NG.R")
+source("/home1/NEURO/schaffner/kobor_shared_coding_resource/PCA_Plot_Function.R")
+source("/home1/NEURO/schaffner/kobor_shared_coding_resource/correlation_pval.R") #modified slightly so that corr between perfectly confounded variables (PD with dis_duration and age_onset) is 0; also made function verbose
+```
+
+# Loading in processed DNAm data
+```{r}
+load("~/1-preprocessing/TERRE/normalized_filtered/TERRE_RG_filtered.RData")
+betas <- getBeta(PD_RG_filtered)
+meta_terre <- read.csv("~/1-preprocessing/TERRE/normalized_filtered/terre_meta_extcelltypePCs_ancestryPCs_complete2.csv")
+betas_sub <- betas[,colnames(betas) %in% meta_terre$patient]
+rm(PD_RG_filtered, betas)
+```
+
+# Cell Type Correction
+Cell type-corrected betas will be used to construct the CMRs without bias due to cell type. I will correct for four cell type PCs, which account for 90% of variance in cell type composition.
+```{r cell type corr, eval=F}
+all(meta_terre$patient==colnames(betas_sub)) #TRUE
+
+#Running regression model to regress out cell type
+betas.lm <- lapply(1:nrow(betas_sub), function(x){
+  residuals(summary(lm(betas_sub[x,]~meta_terre$CTP_PC1 + meta_terre$CTP_PC2 + meta_terre$CTP_PC3 + meta_terre$CTP_PC4)))
+})
+results.all <- as.data.frame(do.call(rbind, betas.lm)) #coercing list into data frame 
+rownames(results.all) <- rownames(betas_sub)
+residuals <- results.all
+# add the residuals of each regression model to the mean methylation value of each probe (mean across all samples by row) to obtain the "adjusted" methylation data.
+adj.residuals <- residuals+matrix(apply(betas_sub, 1, mean), nrow = nrow(residuals), ncol = ncol(residuals)) 
+head(adj.residuals)
+# To make sure we do not induce any NAs into the dataset when we convert the beta values back M-values (by log2 transformation), we need to ensure we do not have any corrected beta values that are greater or equal to zero or any beta values that are greater than 1.
+adj.residuals[adj.residuals<=0] <- 0.0000001 # convert any values that are less than or equal to zero to 0.001
+adj.residuals[adj.residuals>1] <- 0.9999999 # convert any values that are greater than 1 to 0.999
+terre_beta_CTC <- adj.residuals
+save(terre_beta_CTC, file="~/2-EWAS_CMRs/TERRE/custom_CMRs/TERRE_betas_CTC.RData")
+```
+
+# Running CoMeBack
+```{r CoMeBack, eval=F}
+terre_beta_CTC <- t(terre_beta_CTC) #probes should be columns 
+# construct CMRs using fixed Spearman correlation cut-off of 0.4 and maximum probe distance of 1Kbp
+##Might want a correlation cut off of 0.5, 0.4, or 0.3
+CMRs_cor30_sw1K <- cmr(terre_beta_CTC, cormethod = "spearman", corlo = 0.3, maxprbdst =1000, Iarray="EPIC")
+#[1] "Getting CpG info, about to start estimation any day now."
+#[1] "Found  801438  probes from  24  out of 24 chromosomes"
+
+save(CMRs_cor30_sw1K, file="~/2-EWAS_CMRs/TERRE/custom_CMRs/TERRE_CMRs_spearman0.3_1k.RData")
+
+# use uncorrrected betas to calculate CMR composite betas
+beta_noCTC <-t(betas_sub)
+
+# with this function from the package, an error "Error in Mdata[,x]: index type "list" is incorrect" occurs.  Looking at cmr_comp, line 22 specifies to unlist all the CMRs into one vector (as opposed to a list of lists containing CMRs per chromosome) only if there are fewer than 24 chromosomes. 
+#cmr_cor40_cmpB=cmr_comp(cmrs = CMRs_cor40_pw1K, Mdata = beta_noCTC)
+
+#I have 24 exactly, and it seems like the CMRs need to be unlisted for the next part of the function to work. I commented out this line and saved a new R script, "cmr_comp2.R," which I will try on my data.
+source("/home1/NEURO/schaffner/2-EWAS_CMRs/cmr_comp2.R")
+cmr_cor30_medB=cmr_comp2(cmrs = CMRs_cor30_sw1K, Mdata = beta_noCTC, cmethod="median")
+#[1] "Found 102723 CMRs, this may take awhile."
+
+save(cmr_cor30_medB, file="/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/custom_CMRs/TERR_CMRs_spearman0.3_1k_medB.Rdata")
+```
+
+# Sex-stratified variability filtering
+```{r sex specific cmr, eval=F}
+Variation<-function(x) {quantile(x, c(0.9), na.rm=T)[[1]]-quantile(x, c(0.1), na.rm=T)[[1]]}
+
+# females
+dim(CMR_medB_F <- cmr_cor30_medB[rownames(cmr_cor30_medB) %in% meta_terre[meta_terre$reportedSex=="F","patient"],]) #100 102723
+ref_range<-sapply(1:ncol(CMR_medB_F), function(x) Variation(CMR_medB_F[,x]))
+dim(CMR_medB_F_var <- CMR_medB_F[,which(ref_range>=0.05)]) #54,291 variable CMRs
+save(CMR_medB_F_var, file="~/2-EWAS_CMRs/TERRE/custom_CMRs/CMR_medB_F_var.RData")
+
+# males
+dim(CMR_medB_M <- cmr_cor30_medB[rownames(cmr_cor30_medB) %in% meta_terre[meta_terre$reportedSex=="M","patient"],]) #118 102723
+ref_range<-sapply(1:ncol(CMR_medB_M), function(x) Variation(CMR_medB_M[,x]))
+dim(CMR_medB_M_var <- CMR_medB_M[,which(ref_range>=0.05)]) #54,105 variable CMRs
+save(CMR_medB_M_var, file="~/2-EWAS_CMRs/TERRE/custom_CMRs/CMR_medB_M_var.RData")
+
+# comparing M/F variable CMRs
+length(colnames(CMR_medB_F_var)[colnames(CMR_medB_F_var) %in% colnames(CMR_medB_M_var)]) #50,208 CMRs variable in both sexes
+# 4,083 CMRs variable in females only (7.5% of overall variable CMRs in females)
+# 3,897 CMRs variable in males only (7.2% of overall variable CMRs in males)
+```
+
+## Annotating CMRs in a data frame
+```{r}
+# load EPIC fdata
+load("~/kobor_shared_coding_resource/EPIC_fdat.RData")
+
+#creating a data frame annotating all CMR probes with CMR and coordinate information
+cmrs_anno <- lapply(1:length(CMRs_cor30_sw1K), function(x) { #loop over each chr
+  chr <- names(CMRs_cor30_sw1K)[x]
+  if(length(CMRs_cor30_sw1K[[x]])>0){
+  cmr_list <- lapply(1:length(CMRs_cor30_sw1K[[x]]), function(y) { #loop over each cmr
+    print(paste(chr, " CMR ", y, "/", length(CMRs_cor30_sw1K[[x]]), sep=""))
+    cmr_probes <- unlist(CMRs_cor30_sw1K[[x]][y])
+    coords <- fData_EPIC[fData_EPIC$TargetID %in% cmr_probes,"MAPINFO"]
+    min <- min(coords)
+    max <- max(coords)
+    cmr_name <- paste(chr, paste(min, max, sep="-"), sep=": ")
+    
+    list_per_probe <- lapply(1:length(cmr_probes), function(z) {
+      probe <- cmr_probes[z]
+      coord <- coords[z]
+      return(list(probe=probe,chr=chr,coord=coord,cmr_start=min,cmr_end=max,cmr_id=cmr_name))
+      })
+    list_per_probe <- as.data.frame(do.call(rbind,list_per_probe))
+    
+    return(list_per_probe) }) #a list where each element is a data frame (per cmr)
+    
+  cmr_df <- as.data.frame(do.call(rbind, cmr_list)) #a data frame for all cmrs in a chromosome
+  
+  return(cmr_df)}
+  
+  })
+cmrs_anno <- as.data.frame(do.call(rbind,cmrs_anno)) #a data frame of all cmrs
+cmrs_anno <- as.data.frame(apply(cmrs_anno, 2, function(x) unlist(x)))
+cmrs_anno[,3:5] <- apply(cmrs_anno[,3:5], 2, function(x) as.integer(x))
+write.csv(cmrs_anno, file="~/2-EWAS_CMRs/TERRE/custom_CMRs/TERRE_CMRs_spearman0.3_1k_anno.csv")
+nrow(cmrs_anno) #332,512 probes
+length(unique(cmrs_anno$cmr_id)) #102,723 CMRs
+```
+
+# Overlap with reference CMRs
+```{r ref CMR overlap, eval=F}
+# need ref CMR coordinates
+
+# getting beta matrix to get probe list for filtering ref CMRs to those contained in TERRE
+load("~/1-preprocessing/TERRE/normalized_filtered/TERRE_RG_filtered.RData")
+dim(betas_F <- getBeta(PD_RG_filtered[,sampleNames(PD_RG_filtered) %in% meta_F$patient])) #803777    100
+betas_F_t <- t(betas_F)
+
+#get reference CMRs (1k)
+CMRs_450 <- readRDS("~/kobor_shared_coding_resource/reference_CMRs/S3_cmr_Scor30_mxd1K.rds")
+load("~/kobor_shared_coding_resource/reference_CMRs/S5_cmrs_epicOnly_1Kd.RData")
+refCMRs <- rbind(CMRs_450, cmrs_epicOnly_gene_df) #43,657 CMRs
+
+#covert to a list, where each element contains CpG probe names, and names correspond to chromosome
+refCMRlist <- lapply(1:nrow(refCMRs), function(x){
+  probes <- unlist(strsplit(as.character(refCMRs$cmr[x]), split=","))
+  
+})
+
+#subset to CMRs contained in QC'ed data
+CMRcheck <- sapply(1:length(refCMRlist), function(x){
+  probes <- refCMRlist[[x]]
+  return(all(probes %in% colnames(betas_F_t)))
+})
+summary(CMRcheck)
+#   Mode   FALSE    TRUE 
+#logical     881   42776
+
+#check the order matches here
+head(CMRcheck)
+head(refCMRs)
+nrow(refCMRs_in_TERRE <- refCMRs[CMRcheck,]) #42,776
+write.csv(refCMRs_in_TERRE, file="~/2-EWAS_CMRs/TERRE/refCMRs_in_TERRE_df.csv", row.names=F)
+
+length(refCMRlist <- refCMRlist[CMRcheck]) #42,776
+save(refCMRlist, file="~/2-EWAS_CMRs/TERRE/refCMRs_in_TERRE_list.RData")
+rm(PD_RG_filtered, betas_F, betas_F_t, terre_beta_CTC, beta_noCTC)
+
+# get variable CMRs that are already annotated
+rlm_F_anno <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_F_anno.csv")
+rlm_F_anno <- rlm_F_anno[,8:ncol(rlm_F_anno)]
+rlm_M_anno <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_M_anno.csv")
+rlm_M_anno <- rlm_M_anno[,8:ncol(rlm_M_anno)]
+rlm_M_anno <- rlm_M_anno[-which(rlm_M_anno$cmrGR %in% rlm_F_anno$cmrGR),] #1018 additional
+refCMR_var_anno <- rbind(rlm_F_anno, rlm_M_anno)
+write.csv(refCMR_var_anno, file="~/2-EWAS_CMRs/TERRE/refCMR_var_anno.csv", row.names=F)
+rm(rlm_F_anno, rlm_M_anno)
+
+
+# total custom/reference CMR overlap before variability filtering
+head(cmrs_anno) # custom CMRs
+head(refCMRs_in_TERRE) # ref CMRs
+cmrs_anno$cmr_id <- gsub(" ", "", cmrs_anno$cmr_id)
+head(cmrs_anno)
+
+# exact overlap
+length(cmrs_anno$cmr_id[cmrs_anno$cmr_id %in% as.character(refCMRs_in_TERRE$cmrGR)]) #0 - no exact overlap
+
+# partial overlap
+library(GenomicRanges)
+custom_CMR_gr <- GRanges(seqnames=cmrs_anno$chr, ranges=IRanges(start=cmrs_anno$cmr_start, end=cmrs_anno$cmr_end))
+refCMRs_in_TERRE$cmrGR <- as.character(refCMRs_in_TERRE$cmrGR)
+refCMR_pos <- sapply(1:nrow(refCMRs_in_TERRE), function(x) unlist(strsplit(refCMRs_in_TERRE$cmrGR[x], split=":"))[2])
+refCMR_gr <- GRanges(seqnames=sapply(1:nrow(refCMRs_in_TERRE), function(x) unlist(strsplit(refCMRs_in_TERRE$cmrGR[x], split=":"))[1]), ranges=IRanges(
+  start=sapply(1:nrow(refCMRs_in_TERRE), function(x) as.integer(unlist(strsplit(refCMR_pos[x], split="-"))[1])), end=sapply(1:nrow(refCMRs_in_TERRE), function(x) as.integer(unlist(strsplit(refCMR_pos[x], split="-"))[2]))
+))
+length(unique(subsetByOverlaps(refCMR_gr,custom_CMR_gr))) #35,561 ref CMRs overlap with custom CMRs (83%)
+length(unique(subsetByOverlaps(custom_CMR_gr,refCMR_gr))) #35,907 custom CMRs overlap with ref CMRs (35%)
+
+# total custom/reference CMR overlap after variability filtering
+# partial overlap
+custom_CMR_gr <- GRanges(seqnames=cmrs_anno$chr, ranges=IRanges(start=cmrs_anno$cmr_start, end=cmrs_anno$cmr_end))
+refCMR_var_anno$cmrGR <- as.character(refCMR_var_anno$cmrGR)
+refCMR_pos <- sapply(1:nrow(refCMR_var_anno), function(x) unlist(strsplit(refCMR_var_anno$cmrGR[x], split=":"))[2])
+refCMR_gr <- GRanges(seqnames=sapply(1:nrow(refCMR_var_anno), function(x) unlist(strsplit(refCMR_var_anno$cmrGR[x], split=":"))[1]), ranges=IRanges(
+  start=sapply(1:nrow(refCMR_var_anno), function(x) as.integer(unlist(strsplit(refCMR_pos[x], split="-"))[1])), end=sapply(1:nrow(refCMR_var_anno), function(x) as.integer(unlist(strsplit(refCMR_pos[x], split="-"))[2]))
+))
+length(unique(subsetByOverlaps(refCMR_gr,custom_CMR_gr))) #27,411/35,561 overlapping ref CMRs are variable (77%)
+length(unique(subsetByOverlaps(custom_CMR_gr,refCMR_gr))) #27,762/35,907 overlapping custom CMRs are variable (77%)
+
+# custom/reference CMR overlap for DM-CMRs
+rlm_F_anno <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_F_anno.csv")
+rlm_F_hits <- rlm_F_anno[rlm_F_anno$threshold0.1==TRUE,]
+rlm_F_hits$cmrGR <- as.character(rlm_F_hits$cmrGR)
+F_hits_pos <- sapply(1:nrow(rlm_F_hits), function(x) unlist(strsplit(rlm_F_hits$cmrGR[x], split=":"))[2])
+F_hits_gr <- GRanges(seqnames=sapply(1:nrow(rlm_F_hits), function(x) unlist(strsplit(rlm_F_hits$cmrGR[x], split=":"))[1]), ranges=IRanges(
+  start=sapply(1:nrow(rlm_F_hits), function(x) as.integer(unlist(strsplit(F_hits_pos[x], split="-"))[1])), end=sapply(1:nrow(rlm_F_hits), function(x) as.integer(unlist(strsplit(F_hits_pos[x], split="-"))[2]))
+))
+length(unique(subsetByOverlaps(F_hits_gr,custom_CMR_gr))) #All overlap with custom CMRs
+
+rlm_M_anno <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_M_anno.csv")
+rlm_M_hits <- rlm_M_anno[rlm_M_anno$threshold0.1==TRUE,]
+rlm_M_hits$cmrGR <- as.character(rlm_M_hits$cmrGR)
+M_hits_pos <- sapply(1:nrow(rlm_M_hits), function(x) unlist(strsplit(rlm_M_hits$cmrGR[x], split=":"))[2])
+M_hits_gr <- GRanges(seqnames=sapply(1:nrow(rlm_M_hits), function(x) unlist(strsplit(rlm_M_hits$cmrGR[x], split=":"))[1]), ranges=IRanges(
+  start=sapply(1:nrow(rlm_M_hits), function(x) as.integer(unlist(strsplit(M_hits_pos[x], split="-"))[1])), end=sapply(1:nrow(rlm_M_hits), function(x) as.integer(unlist(strsplit(M_hits_pos[x], split="-"))[2]))
+))
+length(unique(subsetByOverlaps(M_hits_gr,custom_CMR_gr))) #All overlap with custom CMRs
+```
+
+##References
+
+Aitchison, J. (1982). The statistical analysis of compositional data. Journal of the Royal Statistical Society: Series B (Methodological), 44(2), 139-160.
+
+Filzmoser, P., Hron, K., & Reimann, C. (2009). Principal component analysis for compositional data with outliers. Environmetrics: The Official Journal of the International Environmetrics Society, 20(6), 621-632.
+
+Houseman, E. A., Accomando, W. P., Koestler, D. C., Christensen, B. C., Marsit, C. J., Nelson, H. H., ... & Kelsey, K. T. (2012). DNA methylation arrays as surrogate measures of cell mixture distribution. BMC bioinformatics, 13(1), 86.

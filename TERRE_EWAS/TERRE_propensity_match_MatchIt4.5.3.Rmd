@@ -1,0 +1,346 @@
+---
+itle: "TERRE_matching"
+author: "SS"
+date: "04/17/2023"
+output:
+  html_document:
+    df_print: paged
+  rmdformats::readthedown:
+    fig_caption: yes
+    gallery: no
+    highlight: kate
+    lightbox: yes
+    self_contained: yes
+    thumbnails: no
+---
+TERRE Propensity Matching
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: Apr 17, 2023
+
+The *TERRE* cohort (subset containing n=88 cases and n=177 controls) consists of French agricultural workers enrolled in the Mutualite Sociale Agricole health insurance system (Elbaz et al., 2009). All PD cases in this subset of data have a disease duration of 1.5 years or less. We are performing this study in collaboration with r. Alexis Elbaz, Dr. Alexis Brice, and Dr. Jean-Christophe Corvol. EPIC arrays were run in Paris, France on bisulfite-converted DNA samples extracted from whole blood. We were provided with idat files for preprocessing and analysis.
+
+The data was re-processed in Aug-Sept 2022 (see TERRE_funnorm_082022_nocombat.Rmd). Here I will trial propensity matching PD cases and controls so that they are as similar as possible. This can help reduce confounding.
+
+From the MatchIt vignette:
+
+"MatchIt implements the suggestions of Ho et al. (2007) for improving parametric statistical models for estimating treatment effects in observational studies and reducing model dependence by preprocessing data with semi-parametric and non-parametric matching methods. After appropriately preprocessing with MatchIt, researchers can use whatever parametric model they would have used without MatchIt and produce inferences that are more robust and less sensitive to modeling assumptions...
+
+...The goal of matching is to produce **covariate balance**, that is, for the distributions of covariates in the two groups to be approximately equal to each other, as they would be in a successful randomized experiment."
+
+Apr 17, 2023: Bugs were reported with MatchIt version 4.5.1 and 4.5.2 (version 4.5.1 was used here originally). Here I've updated MatchIt to the latest release (4.5.3) where bugs were fixed, and will re-run this script to check if it changes any results.
+
+### Libraries and outside functions
+```{r results='hide', warning=FALSE, message=FALSE, eval=F}
+setwd("~/")
+library(MatchIt)
+library(optmatch)
+library(car)
+library(DescTools)
+library(ggplot2)
+library(gridExtra)
+```
+
+# Matching in females
+
+## Checking initial imbalances
+
+Values of standardized mean differences and eCDF statistics close to zero and values of variance ratios close to one indicate good balance.
+
+```{r intial check F, eval=F}
+terre_meta <- read.csv("~/1-preprocessing/TERRE/terre_meta_extcelltypePCs2_ancestryPCs_complete.csv") #Feb 28, 2023: this data frame contains updated cell type PCs (will not change matching results, simply updating code to reflect latest meta data)
+dim(terre_meta) #[1] 219  85
+colnames(terre_meta)
+
+str(terre_meta) #checking format for categorical/continous variables
+terre_meta$levodopa <- as.factor(terre_meta$levodopa)
+terre_meta$edu <- as.factor(terre_meta$edu)
+terre_meta$smoking <- as.factor(terre_meta$smoking)
+terre_meta$pesticides <- as.factor(terre_meta$pesticides)
+terre_meta$head_trauma <- as.factor(terre_meta$head_trauma)
+terre_meta$PD <- as.factor(terre_meta$PD)
+terre_meta$agonist <- as.factor(terre_meta$agonist)
+terre_meta$SentrixBarcode_A <- as.factor(terre_meta$SentrixBarcode_A)
+terre_meta$plate <- as.factor(terre_meta$plate)
+terre_meta$marital <- as.factor(terre_meta$marital)
+terre_meta$alcohol1 <- as.factor(terre_meta$alcohol1)
+terre_meta$alcohol5 <- as.factor(terre_meta$alcohol5)
+
+terre_F <- terre_meta[terre_meta$reportedSex=="F",]
+
+#create a matchit object relating the treatment to the covariates
+F.out0 <- summary(matchit(PD ~ age + alcohol1 + smoking + head_trauma, data = terre_F,
+                 method = NULL, distance = "glm"))$sum.all
+
+F.out0
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio  eCDF Mean   eCDF Max Std. Pair Dist.
+#distance        0.35974262    0.31535065      0.49288997  0.7571361 0.11750616 0.20352782              NA
+#age            64.84690851   66.01730567     -0.18240001  1.0676177 0.06253176 0.15784713              NA
+#alcohol11       0.27272727    0.25373134      0.04265281         NA 0.01899593 0.01899593              NA
+#alcohol12       0.48484848    0.56716418     -0.16470703         NA 0.08231569 0.08231569              NA
+#alcohol13       0.09090909    0.04477612      0.16047379         NA 0.04613297 0.04613297              NA
+#alcohol14       0.15151515    0.13432836      0.04793412         NA 0.01718679 0.01718679              NA
+#smoking1        0.93939394    0.92537313      0.05876125         NA 0.01402081 0.01402081              NA
+#smoking2        0.06060606    0.04477612      0.06634335         NA 0.01582994 0.01582994              NA
+#smoking3        0.00000000    0.02985075     -0.21321962         NA 0.02985075 0.02985075              NA
+#head_trauma0    0.87878788    0.80597015      0.22311156         NA 0.07281773 0.07281773              NA
+#head_trauma1    0.12121212    0.19402985     -0.22311156         NA 0.07281773 0.07281773              NA
+
+#no change with 4.5.3
+
+#checking pesticides
+terre_F_complete <- terre_F[complete.cases(terre_F$pesticides),]
+F.out0 <- summary(matchit(PD ~ pesticides, data = terre_F_complete,
+                 method = NULL, distance = "glm"))$sum.all
+F.out0
+#            Means Treated Means Control Std. Mean Diff. Var. Ratio eCDF Mean eCDF Max Std. Pair Dist.
+#distance        0.3543417     0.3228291       0.3759986   1.021207 0.1041667   0.1875              NA
+#pesticides0     0.4062500     0.5937500      -0.3817709         NA 0.1875000   0.1875              NA
+#pesticides1     0.3750000     0.2500000       0.2581989         NA 0.1250000   0.1250              NA
+#pesticides2     0.2187500     0.1562500       0.1511858         NA 0.0625000   0.0625              NA
+
+#no change with 4.5.3
+```
+
+## Matching
+```{r matching F, eval=F}
+F.out2 <- matchit(PD ~ age + alcohol1 + smoking + head_trauma, data = terre_F,
+                 method = "full", distance = "glm", link="probit")
+
+summary(F.out2)
+#Summary of Balance for Matched Data:
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio eCDF Mean eCDF Max Std. Pair Dist.
+#distance            0.3598        0.3588          0.0112     0.8878    0.0149   0.0606          0.1558
+#age                64.8469       65.0510         -0.0318     0.9491    0.0392   0.1061          0.8179
+#alcohol11           0.2727        0.2854         -0.0284          .    0.0126   0.0126          0.7698
+#alcohol12           0.4848        0.4697          0.0303          .    0.0152   0.0152          1.0005
+#alcohol13           0.0909        0.1061         -0.0527          .    0.0152   0.0152          0.3479
+#alcohol14           0.1515        0.1389          0.0352          .    0.0126   0.0126          0.7969
+#smoking1            0.9394        0.9672         -0.1164          .    0.0278   0.0278          0.4790
+#smoking2            0.0606        0.0278          0.1376          .    0.0328   0.0328          0.3592
+#smoking3            0.0000        0.0051         -0.0361          .    0.0051   0.0051          0.2041
+#head_trauma0        0.8788        0.9040         -0.0774          .    0.0253   0.0253          0.5690
+#head_trauma1        0.1212        0.0960          0.0774          .    0.0253   0.0253          0.5690
+#
+#Sample Sizes:
+#              Control Treated
+#All             67.        33
+#Matched (ESS)   36.81      33
+#Matched         67.        33
+#Unmatched        0.         0
+#Discarded        0.         0
+
+#no change with 4.5.3
+
+plot(F.out2, type = "jitter", interactive = FALSE)
+plot(F.out2, type = "qq", interactive = FALSE)
+
+F.out3 <- matchit(PD ~ age + alcohol1 + smoking + head_trauma, data = terre_F,
+                 method = "full", distance = "glm", link="logit")
+
+summary(F.out3)
+#Summary of Balance for Matched Data:
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio eCDF Mean eCDF Max Std. Pair Dist.
+#distance            0.3597        0.3584          0.0151     0.9083    0.0155   0.0606          0.1563
+#age                64.8469       65.1606         -0.0489     0.9741    0.0321   0.1061          0.8436
+#alcohol11           0.2727        0.2556          0.0386          .    0.0172   0.0172          0.8461
+#alcohol12           0.4848        0.5096         -0.0495          .    0.0247   0.0247          0.9570
+#alcohol13           0.0909        0.1061         -0.0527          .    0.0152   0.0152          0.3529
+#alcohol14           0.1515        0.1288          0.0634          .    0.0227   0.0227          0.5659
+#smoking1            0.9394        0.9495         -0.0423          .    0.0101   0.0101          0.4859
+#smoking2            0.0606        0.0455          0.0635          .    0.0152   0.0152          0.3644
+#smoking3            0.0000        0.0051         -0.0363          .    0.0051   0.0051          0.2081
+#head_trauma0        0.8788        0.9192         -0.1238          .    0.0404   0.0404          0.6217
+#head_trauma1        0.1212        0.0808          0.1238          .    0.0404   0.0404          0.6217
+#
+#Sample Sizes:
+#              Control Treated
+#All             67.        33
+#Matched (ESS)   39.27      33
+#Matched         67.        33
+#Unmatched        0.         0
+#Discarded        0.         0
+
+#slight difference in 4.5.3
+
+plot(F.out3, type = "jitter", interactive = FALSE)
+plot(F.out3, type = "qq", interactive = FALSE)
+
+plot(summary(F.out2), xlim=c(-0.1,0.5), main="TERRE females: probit link")
+plot(summary(F.out3), xlim=c(-0.1,0.5), main="TERRE females: logit link")
+
+#save(F.out2, file="~/1-preprocessing/TERRE/normalized_filtered/matching_v2/matched_F_probit.RData")
+save(F.out3, file="~/1-preprocessing/TERRE/propensity_matching/matched_F_logit_4.5.3.RData")
+```
+![Propensity score matching in females: probit link function](/home1/NEURO/schaffner/1-preprocessing/TERRE/propensity_matching/propensity_F_probit.png)
+
+![Standardized mean difference in females: probit link function](/home1/NEURO/schaffner/1-preprocessing/TERRE/propensity_matching/loveplot_F_probit.png)
+
+![Propensity score matching in females: logit link function](/home1/NEURO/schaffner/1-preprocessing/TERRE/propensity_matching/propensity_F_logit_4.5.3.png)
+
+![Standardized mean difference in females: logit link function](/home1/NEURO/schaffner/1-preprocessing/TERRE/propensity_matching/loveplot_F_logit_4.5.3.png)
+
+Probit and logit link functions perform similarly in females: probit matches well on everything except smoking, while logit matches well on everything except head trauma. However, with the logit link function, head trauma matching is improved, whereas with the probit link, smoking differences are exacerbated.
+
+# Matching in males
+
+## Checking initial imbalances
+
+Values of standardized mean differences and eCDF statistics close to zero and values of variance ratios close to one indicate good balance.
+
+```{r intial check M, eval=F}
+terre_M <- terre_meta[terre_meta$reportedSex=="M",]
+summary(terre_M[,c("PD","age","alcohol1","smoking","head_trauma")])
+#PD          age        alcohol1 smoking   head_trauma
+# 0:81   Min.   :41.26   1:11     1   :60   0:101      
+# 1:38   1st Qu.:63.85   2:21     2   :45   1: 18      
+#        Median :70.04   3:15     3   :13              
+#        Mean   :67.92   4:72     NA's: 1              
+#        3rd Qu.:72.89                                 
+#        Max.   :76.38                                 
+
+terre_M_sub <- terre_M[complete.cases(terre_M$smoking),]
+
+#create a matchit object relating the treatment to the covariates
+M.out0 <- summary(matchit(PD ~ age + alcohol1 + smoking + head_trauma, data = terre_M_sub,
+                 method = NULL, distance = "glm"))$sum.all
+
+M.out0
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio  eCDF Mean   eCDF Max
+#distance        0.39311857     0.2882687      0.69378492   1.248659 0.17618646 0.32894737
+#age            68.31903167    67.8839836      0.07928490   0.620194 0.03197818 0.09144737
+#alcohol11       0.15789474     0.0625000      0.26161184         NA 0.09539474 0.09539474
+#alcohol12       0.15789474     0.1875000     -0.08118988         NA 0.02960526 0.02960526
+#alcohol13       0.18421053     0.0875000      0.24947526         NA 0.09671053 0.09671053
+#alcohol14       0.50000000     0.6625000     -0.32500000         NA 0.16250000 0.16250000
+#smoking1        0.60526316     0.4625000      0.29207218         NA 0.14276316 0.14276316
+#smoking2        0.36842105     0.3875000     -0.03955199         NA 0.01907895 0.01907895
+#smoking3        0.02631579     0.1500000     -0.77267524         NA 0.12368421 0.12368421
+#head_trauma0    0.78947368     0.8875000     -0.24044772         NA 0.09802632 0.09802632
+#head_trauma1    0.21052632     0.1125000      0.24044772         NA 0.09802632 0.09802632
+
+#no change with 4.5.3
+
+#checking pesticides
+terre_M_complete <- terre_M[complete.cases(terre_M$pesticides),]
+M.out0 <- summary(matchit(PD ~ pesticides, data = terre_M_complete,
+                 method = NULL, distance = "glm"))$sum.all
+M.out0
+#            Means Treated Means Control Std. Mean Diff. Var. Ratio  eCDF Mean   eCDF Max Std. Pair Dist.
+#distance       0.31912442    0.29315476      0.26155424   2.773272 0.03853047 0.08736559              NA
+#pesticides0    0.12903226    0.04166667      0.26060950         NA 0.08736559 0.08736559              NA
+#pesticides1    0.09677419    0.12500000     -0.09547033         NA 0.02822581 0.02822581              NA
+#pesticides2    0.77419355    0.83333333     -0.14144474         NA 0.05913978 0.05913978              NA
+
+#no change with 4.5.3
+
+M.out0 <- as.data.frame(M.out0)
+M.out0$sex <- "M"
+F.out0 <- as.data.frame(F.out0)
+F.out0$sex <- "F"
+out0 <- rbind(M.out0, F.out0)
+out0$var <- rownames(out0)
+out0$var <- gsub("pesticides0", "None", gsub("pesticides1", "Gardening", gsub("pesticides2", "Professional", out0$var)))
+out0$var <- gsub("1", "", out0$var)
+out0_sub <- out0[-which(out0$var=="distance"),]
+out0_sub$var <- as.factor(out0_sub$var)
+out0_sub$var <- reorder.factor(out0_sub$var, new.order=c("None","Gardening","Professional"))
+
+mean_diff <- ggplot(out0_sub, aes(x=var, y=`Std. Mean Diff.`, fill=sex, group=sex)) + geom_bar(stat="identity", position="dodge") + theme_classic() + geom_hline(yintercept=0) + theme(axis.title.x=element_blank()) + ggtitle("Std Mean Difference")
+
+eCDF <- ggplot(out0_sub, aes(x=var, y=`eCDF Mean`, fill=sex, group=sex)) + geom_bar(stat="identity", position="dodge") + theme_classic() + geom_hline(yintercept=0) + theme(axis.title.x=element_blank()) + ggtitle("eCDF Mean")
+
+grid.arrange(mean_diff, eCDF, nrow=2)
+```
+![Initial PD case-control balancing for overall pesticide exposure, stratified by sex](/home1/NEURO/schaffner/1-preprocessing/TERRE/propensity_matching/pesticide_balancing_check.png)
+
+Females have a larger standard mean difference and eCDF than males for the "none" and "gardening" categories, indicating worse balancing.
+
+## Matching
+```{r matching M, eval=F}
+M.out2 <- matchit(PD ~ age + alcohol1 + smoking + head_trauma, data = terre_M_sub,
+                 method = "full", distance = "glm", link="probit")
+
+summary(M.out2)
+#Summary of Balance for Matched Data:
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio eCDF Mean eCDF Max Std. Pair Dist.
+#distance            0.3907        0.3914         -0.0052     0.9887    0.0141   0.0789          0.0254
+#age                68.3190       67.4807          0.1528     0.7911    0.0587   0.1408          0.5447
+#alcohol11           0.1579        0.2193         -0.1684          .    0.0614   0.0614          0.0946
+#alcohol12           0.1579        0.1329          0.0686          .    0.0250   0.0250          0.1576
+#alcohol13           0.1842        0.1689          0.0396          .    0.0154   0.0154          0.0890
+#alcohol14           0.5000        0.4789          0.0421          .    0.0211   0.0211          0.1149
+#smoking1            0.6053        0.6162         -0.0224          .    0.0110   0.0110          0.0705
+#smoking2            0.3684        0.3465          0.0455          .    0.0219   0.0219          0.0715
+#smoking3            0.0263        0.0373         -0.0685          .    0.0110   0.0110          0.1436
+#head_trauma0        0.7895        0.8154         -0.0635          .    0.0259   0.0259          0.1128
+#head_trauma1        0.2105        0.1846          0.0635          .    0.0259   0.0259          0.1128
+#
+#Sample Sizes:
+#              Control Treated
+#All             80.        38
+#Matched (ESS)   32.11      38
+#Matched         80.        38
+#Unmatched        0.         0
+#Discarded        0.         0
+
+#slight change from 4.5.3
+
+plot(M.out2, type = "jitter", interactive = FALSE)
+plot(M.out2, type = "qq", interactive = FALSE)
+
+
+M.out3 <- matchit(PD ~ age + alcohol1 + smoking + head_trauma, data = terre_M_sub,
+                 method = "full", distance = "glm", link="logit")
+summary(M.out3)
+#Summary of Balance for Matched Data:
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio eCDF Mean eCDF Max Std. Pair Dist.
+#distance            0.3931        0.3935         -0.0027     1.0067    0.0152   0.1053          0.0270
+#age                68.3190       67.2640          0.1923     0.6538    0.0526   0.1226          0.6066
+#alcohol11           0.1579        0.1579          0.0000          .    0.0000   0.0000          0.0706
+#alcohol12           0.1579        0.1388          0.0525          .    0.0191   0.0191          0.1291
+#alcohol13           0.1842        0.2524         -0.1759          .    0.0682   0.0682          0.2428
+#alcohol14           0.5000        0.4510          0.0981          .    0.0490   0.0490          0.1412
+#smoking1            0.6053        0.5395          0.1346          .    0.0658   0.0658          0.1685
+#smoking2            0.3684        0.4211         -0.1091          .    0.0526   0.0526          0.1463
+#smoking3            0.0263        0.0395         -0.0822          .    0.0132   0.0132          0.0735
+#head_trauma0        0.7895        0.8266         -0.0910          .    0.0371   0.0371          0.1154
+#head_trauma1        0.2105        0.1734          0.0910          .    0.0371   0.0371          0.1154
+#
+#Sample Sizes:
+#              Control Treated
+#ll             80.        38
+#Matched (ESS)   35.01      38
+#Matched         80.        38
+#Unmatched        0.         0
+#Discarded        0.         0
+
+#slight difference in 4.5.3
+
+plot(M.out3, type = "jitter", interactive = FALSE)
+plot(M.out3, type = "qq", interactive = FALSE)
+
+plot(summary(M.out2), xlim=c(-0.1,1), main="TERRE males: probit link")
+plot(summary(M.out3), xlim=c(-0.1,1), main="TERRE males: logit link")
+
+save(M.out2, file="~/1-preprocessing/TERRE/propensity_matching/matched_M_probit_4.5.3.RData")
+save(M.out3, file="~/1-preprocessing/TERRE/propensity_matching/matched_M_logit_4.5.3.RData")
+```
+![Propensity score matching in males: probit link function](/home1/NEURO/schaffner/1-preprocessing/TERRE/propensity_matching/propensity_M_probit_4.5.3.png)
+
+![Standardized mean difference in males: probit link function](/home1/NEURO/schaffner/1-preprocessing/TERRE/propensity_matching/loveplot_M_probit_4.5.3.png)
+
+![Propensity score matching in males: logit link function](/home1/NEURO/schaffner/1-preprocessing/TERRE/propensity_matching/propensity_M_logit_4.5.3.png)
+
+![Standardized mean difference in males: logit link function](/home1/NEURO/schaffner/1-preprocessing/TERRE/propensity_matching/loveplot_M_logit_4.5.3.png)
+
+In males, probit performs much better than logit on matching individual variables, although they perform similarly on total distance. I will choose probit matching for both sexes since the improvement in alcohol and smoking matching in men is much better with probit, and these are influential variables for DNAm.
+
+## Adding weights to metadata and saving
+```{r save, eval=F}
+terre_F_matched <- match.data(F.out2)
+terre_M_matched <- match.data(M.out2)
+write.csv(terre_F_matched, file="~/1-preprocessing/TERRE/propensity_matching/terre_meta_F_probit_matched_4.5.3.csv", row.names=F)
+write.csv(terre_M_matched, file="~/1-preprocessing/TERRE/propensity_matching/terre_meta_M_probit_matched_4.5.3.csv", row.names=F)
+```

@@ -1,0 +1,152 @@
+# EpiSmokEr predicted smoking status in TERRE
+## Oct 25, 2022
+
+Reference: https://www.futuremedicine.com/doi/10.2217/epi-2019-0206 
+
+R package: https://github.com/sailalithabollepalli/EpiSmokEr
+
+Vignette: http://htmlpreview.github.io/?https://github.com/sailalithabollepalli/EpiSmokEr/blob/master/vignettes/epismoker.html
+
+Before predicting smoking in other cohorts, I'll use TERRE as a test case to see which method performs best.
+
+## Libraries
+```{r libraries, eval=F}
+library("EpiSmokEr")
+library(ggplot2)
+library(methylumi)
+library(ggpubr)
+```
+
+## Smoking status (SSt) prediction
+
+The smoking status predictor uses weights from 121 CpGs selected in a lasso approach, along with sex information and intercept. It will predict whether individuals are current, never, or former smokers.
+
+### TERRE
+
+We already have this information recorded for TERRE so this is a proof of concept check to see whether the predictor will work.
+
+```{r terre, eval=F}
+load("~/1-preprocessing/TERRE/normalized_filtered/TERRE_RG_filtered.RData")
+meta <- read.csv("~/1-preprocessing/TERRE/normalized_filtered/terre_meta_extcelltypePCs_ancestryPCs_complete.csv")
+dim(betas <- getBeta(PD_RG_filtered[,sampleNames(PD_RG_filtered) %in% as.character(meta$patient)])) #803777    219
+
+#sample sheet
+#rownames as sample IDs
+#"sex" column where 1 = male and 2 = female
+rownames(meta) <- meta$patient
+colnames(meta)[7] <- "sex"
+summary(as.factor(meta$sex))
+#  F   M 
+#100 119 
+meta$sex <- as.integer(gsub("M", 1, gsub("F", 2, meta$sex)))
+str(meta$sex)
+summary(as.factor(meta$sex))
+#  1   2 
+#119 100 
+
+result_SSt <- epismoker(dataset=betas, samplesheet = meta, method = "SSt")
+#Dataset has 99 of 121 CpGs required for smoking status estimation.
+
+all.equal(meta$patient, result_SSt$SampleName) #TRUE
+meta <- cbind(meta, result_SSt[,2:8])
+
+unique(meta$PredictedSmokingStatus)
+#Never Smoker   Current Smoker Former Smoker 
+
+unique(meta$smoking)
+#NA  3  2  1
+
+meta$smoking <- gsub(1, "Never Smoker", gsub(2, "Former Smoker", gsub(3, "Current Smoker", meta$smoking)))
+meta$PredictedSmokingStatus <- as.character(meta$PredictedSmokingStatus)
+summary(meta$smoking==meta$PredictedSmokingStatus)
+#   Mode   FALSE    TRUE    NA's 
+#logical      76     142       1 
+
+#142/219 individuals (65%) have the same predicted smoking status as recorded smoking status
+
+meta$PredictedSmokingStatus <- paste("Predicted", meta$PredictedSmokingStatus, sep=" ")
+table(meta$smoking, meta$PredictedSmokingStatus)
+#                 Predicted Current Smoker Predicted Former Smoker
+#  Current Smoker                        9                       3
+#  Former Smoker                        12                      22
+#  Never Smoker                          1                      41
+#                
+#                 Predicted Never Smoker
+#  Current Smoker                      3
+#  Former Smoker                      16
+#  Never Smoker                      111
+
+meta$ever_smoking <- meta$smoking
+meta$ever_smoking[meta$ever_smoking=="Never Smoker"] <- "No"
+meta$ever_smoking[meta$ever_smoking %in% c("Current Smoker", "Former Smoker")] <- "Yes"
+
+meta$ever_smoking_pred <- meta$PredictedSmokingStatus
+meta$ever_smoking_pred[meta$ever_smoking_pred=="Predicted Never Smoker"] <- "Predicted No"
+meta$ever_smoking_pred[meta$ever_smoking_pred %in% c("Predicted Current Smoker", "Predicted Former Smoker")] <- "Predicted Yes"
+
+table(meta$ever_smoking, meta$ever_smoking_pred)
+#      Predicted No Predicted Yes
+#  No           111            42
+#  Yes           19            46
+```
+
+The predictor was only 65% accurate in classifying smoking status in TERRE. 
+
+## Smoking score (SSc)
+
+This uses 187 CpGs to calculate a smoking score (Elliot et al. 2014). Smoking score is highest for current smokers, and slightly higher in former smokers than never smokers.
+
+```{r}
+result_SSc <- epismoker(dataset = betas, samplesheet=meta, method = "SSc")
+#Dataset has 170 of 187 CpGs required for smoking status estimation.
+
+all.equal(result_SSc$SampleName, meta$patient) #TRUE
+meta$smokingScore <- result_SSc[,2]
+
+#plotting smoking score on y-axis, split by smoking status. Shape is PD status and colour is sex.
+meta$PD <- as.factor(meta$PD)
+meta$PD <- gsub(0, "Control", gsub(1, "Case", meta$PD))
+meta$sex_cat <- as.factor(meta$sex)
+meta$sex_cat <- gsub(2, "Female", gsub(1, "Male", meta$sex_cat))
+
+png("~/4-replication/TERRE_smoking_by_sex.png")
+ggboxplot(meta, y="smokingScore", x="smoking", add="jitter", facet.by="sex_cat") + theme_bw() + theme(axis.text.x=element_text(angle=90)) + stat_compare_means(method="anova")
+dev.off()
+
+png("~/4-replication/TERRE_smoking.png")
+ggboxplot(meta, y="smokingScore", x="smoking", add="jitter") + theme_bw() + theme(axis.text.x=element_text(angle=90)) + stat_compare_means(method="anova")
+dev.off()
+```
+![Smoking score in TERRE, stratified by sex](/home1/NEURO/schaffner/4-replication/TERRE_smoking_by_sex.png)
+In women data is really skewed toward never smokers, although current smokers score higher. In men, former smokers score higher than never smokers, and there is a lot of variability in the scoring for current smokers.
+
+![Smoking score in TERRE](/home1/NEURO/schaffner/4-replication/TERRE_smoking.png)
+When both sexes are merged, a trend is clearer between the three groups, where more smoking results in a higher score (current > former > never).
+
+## Methylation score (MS)
+
+Here, 4 CpGs are used for prediction (Zhang et al. 2016).
+
+```{r}
+result_MS <- epismoker(dataset = betas, samplesheet=meta, method = "MS")
+#Dataset has 2 of 4 CpGs required for Zhang et al method
+
+all.equal(result_MS$SampleName, meta$patient) #TRUE
+meta$methylationScore <- result_MS[,2]
+
+png("~/4-replication/TERRE_smoking_Zhang.png")
+ggboxplot(meta, y="methylationScore", x="smoking", add="jitter") + theme_bw() + theme(axis.text.x=element_text(angle=90)) + stat_compare_means(method="anova")
+dev.off()
+```
+![Methylation score in TERRE](/home1/NEURO/schaffner/4-replication/TERRE_smoking_Zhang.png)
+
+I thought this one was unlikely to be accurate since only 2/4 required CpGs are present. However, it performs even better than the smoking score from Elliot et al. in separating groups!
+
+## Using all methods combined
+
+```{r}
+result_all <- epismoker(dataset = betas, samplesheet=meta, method = "all")
+
+all.equal(result_all$SampleName, meta$patient) #TRUE
+meta <- cbind(meta, result_MS[,2])
+```

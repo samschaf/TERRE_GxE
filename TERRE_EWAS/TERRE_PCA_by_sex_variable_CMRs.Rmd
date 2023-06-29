@@ -1,0 +1,161 @@
+---
+title: "TERRE_plots"
+author: "SS"
+date: "09/06/2022"
+output:
+  html_document:
+    df_print: paged
+  rmdformats::readthedown:
+    fig_caption: yes
+    gallery: no
+    highlight: kate
+    lightbox: yes
+    self_contained: yes
+    thumbnails: no
+---
+TERRE Exploratory Data Analysis
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: Feb 14, 2023
+
+The *TERRE* cohort (subset containing n=88 cases and n=177 controls) consists of French agricultural workers enrolled in the Mutualite Sociale Agricole health insurance system (Elbaz et al., 2009). All PD cases in this subset of data have a disease duration of 1.5 years or less. We are performing this study in collaboration with r. Alexis Elbaz, Dr. Alexis Brice, and Dr. Jean-Christophe Corvol. EPIC arrays were run in Paris, France on bisulfite-converted DNA samples extracted from whole blood. We were provided with idat files for 1-preprocessing and analysis.
+
+The data was re-processed in Aug-Sept 2022 (see TERRE_funnorm_082022_nocombat.Rmd). Here I will assess meta data correlations and PCA within the portion we'll be analyzing for differential DNAm (with matched gentoype data). I will plot PCA heat screes for the sets of CMRs 1) variable in males and females from TERRE, 2) variable only in females from TERRE, and 3) variable only in males from TERRE.
+
+Update Feb 27, 2023: Fixed extended cell types estimation.
+
+Update May 8, 2023: Including only the subset of cell type/genotyping PCs taken forward to final models (for supplementary fig in paper).
+
+### Libraries and outside functions
+```{r results='hide', warning=FALSE, message=FALSE, eval=F}
+setwd("~/")
+library(lattice)
+library("RColorBrewer")
+library(ggplot2)
+library("reshape2")
+
+#custom functions
+source("~/kobor_shared_coding_resource/PCA_Plot_Function.R")
+```
+
+## Load data 
+```{r load data, eval=F}
+#all reference CMRs covered in QC'ed EPIC data
+load("~/2-EWAS_CMRs/TERRE/refCMR_medB_F.RData")
+load("~/2-EWAS_CMRs/TERRE/refCMR_medB_M.RData")
+dim(refCMR_medB_F) #100 42776
+dim(refCMR_medB_M) #118 42776
+
+#CMRs variable in each sex
+load("~/2-EWAS_CMRs/TERRE/refCMR_medB_F_var.RData")
+load("~/2-EWAS_CMRs/TERRE/refCMR_medB_M_var.RData")
+dim(refCMR_medB_F_var) #100 29363
+dim(refCMR_medB_M_var) #118 29190
+
+length(CMRs_var_all <- colnames(refCMR_medB_F_var)[colnames(refCMR_medB_F_var) %in% colnames(refCMR_medB_M_var)]) #28172
+length(CMRs_var_F <- colnames(refCMR_medB_F_var)[-which(colnames(refCMR_medB_F_var) %in% colnames(refCMR_medB_M_var))]) #1191
+length(CMRs_var_M <- colnames(refCMR_medB_M_var)[-which(colnames(refCMR_medB_M_var) %in% colnames(refCMR_medB_F_var))]) #1018
+
+#CMR median betas for both sexes in each of the 3 subsets (variable in one or both sexes)
+dim(refCMR_medB_var_all <- rbind(refCMR_medB_F[,colnames(refCMR_medB_F) %in% CMRs_var_all], refCMR_medB_M[,colnames(refCMR_medB_M) %in% CMRs_var_all])) #218 28172
+dim(refCMR_medB_var_F <- rbind(refCMR_medB_F[,colnames(refCMR_medB_F) %in% CMRs_var_F], refCMR_medB_M[,colnames(refCMR_medB_M) %in% CMRs_var_F])) #218 1191
+dim(refCMR_medB_var_M <- rbind(refCMR_medB_F[,colnames(refCMR_medB_F) %in% CMRs_var_M], refCMR_medB_M[,colnames(refCMR_medB_M) %in% CMRs_var_M])) #218 1018
+
+meta <- read.csv("~/1-preprocessing/TERRE/terre_meta_extcelltypePCs2_ancestryPCs_complete.csv")
+```
+
+# Principal component analysis: CMRs variable in females only
+
+## Pre-PCA set up
+```{r pca setup, eval=F}
+#restructing meta data and subsetting to categorical/continuous
+nrow(meta <- meta[meta$Sample_Name %in% colnames(refCMR_medB_var_F),]) #218
+meta <- meta[match(colnames(refCMR_medB_var_F), meta$patient),]
+str(meta)
+
+meta$levodopa <- as.factor(meta$levodopa)
+meta$edu <- as.factor(meta$edu)
+#meta$reportedSex <- gsub("FALSE", "F", meta$reportedSex)
+#meta$reportedSex <- as.factor(meta$reportedSex)
+meta$smoking <- as.factor(meta$smoking)
+meta$pesticides <- as.factor(meta$pesticides)
+meta$head_trauma <- as.factor(meta$head_trauma)
+meta$PD <- as.factor(meta$PD)
+meta$agonist <- as.factor(meta$agonist)
+meta$SentrixBarcode_A <- as.factor(meta$SentrixBarcode_A)
+meta$plate <- as.factor(meta$plate)
+meta$alcohol1 <- as.factor(meta$alcohol1)
+meta$alcohol5 <- as.factor(meta$alcohol5)
+meta$marital <- as.factor(meta$marital)
+rownames(meta) <- meta$Sample_Name
+
+meta_categorical <- meta[,c("plate", "SentrixBarcode_A", "SentrixPosition_A", "Sample_Well", "reportedSex", "PD", "ethnicity", "levodopa", "agonist", "edu", "smoking", "pesticides", "head_trauma", "marital", "alcohol1", "alcohol5")]
+
+meta_continuous <- meta[,c("age", "age_onset", "dis_duration","MMS", "time_sto", "bmi","alcohol2", "alcohol3", "alcohol4", "Neu.ext2", "Eos.ext2", "Bas.ext2", "Mono.ext2", "Bnv.ext2", "Bmem.ext2", "CD4nv.ext2", "CD4mem.ext2", "Treg.ext2", "CD8nv.ext2", "CD8mem.ext2", "NK.ext2", "CTP_PC1", "CTP_PC2", "CTP_PC3", "CTP_PC4", "CTP_PC5","CTP_PC6","ancestryPC1", "ancestryPC2", "ancestryPC3")]
+colnames(meta_continuous) <- gsub(".ext2", "", colnames(meta_continuous))
+colnames(meta_continuous)
+
+ord <- c(seq(1:(ncol(meta_categorical)+ncol(meta_continuous))))
+```
+
+## PCA on median CMR betas for CMRs variable only in females
+```{r pca norm, eval=F}
+dim(meta_categorical)
+all.equal(colnames(refCMR_medB_var_F), rownames(meta_categorical)) #TRUE
+refCMR_medB_var_F <- t(refCMR_medB_var_F)
+
+#PCA on beta values: input
+PCA_full<-princomp(refCMR_medB_var_F[complete.cases(refCMR_medB_var_F),])
+
+PCA_Plot(PCA_full, type="sparse", MTC=T, Discrete=T)
+```
+![PCA on CMRs variable in females - scree](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/var_CMRs_by_sex/PCA_var_CMRs_F_scree_ext2.png)
+
+![PCA on CMRs variable in females - heat map](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/var_CMRs_by_sex/PCA_var_CMRs_F_heat_legend_ext2_v2.png)
+
+The first PC accounts for 60% of variance in CMR DNAm and is most strongly correlated with sex, batch, smoking, pesticides, alcohol, and cell type proportion (monocytes, Bnv, T cells).
+
+## PCA on median CMR betas for CMRs variable only in males
+```{r pca norm 2, eval=F}
+all.equal(rownames(refCMR_medB_var_M), rownames(meta_categorical)) #TRUE
+refCMR_medB_var_M <- t(refCMR_medB_var_M)
+
+#PCA on beta values: input
+PCA_full<-princomp(refCMR_medB_var_M[complete.cases(refCMR_medB_var_M),])
+
+PCA_Plot(PCA_full, type="sparse", MTC=T, Discrete=T)
+```
+![PCA on CMRs variable in males - scree](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/var_CMRs_by_sex/PCA_var_CMRs_M_scree_ext2.png)
+
+![PCA on CMRs variable in males - heat map](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/var_CMRs_by_sex/PCA_var_CMRs_M_heat_legend_ext2_v2.png)
+
+For the CMRs only variable in males, the first PC contributes to only 10% of the variance in DNAm, and the second contributes approx 6%. Major sources of variation include chip and cell type. Sex only loads onto PCs 3 and lower, as do the sex-associated variables of smoking, pesticides, and alcohol consumption.
+
+## PCA on median CMR betas for CMRs variable in both sexes
+```{r pca norm 3, eval=F}
+all.equal(rownames(refCMR_medB_var_all), rownames(meta_categorical)) #TRUE
+refCMR_medB_var_all <- t(refCMR_medB_var_all)
+
+#PCA on beta values: input
+PCA_full<-princomp(refCMR_medB_var_all[complete.cases(refCMR_medB_var_all),])
+
+PCA_Plot(PCA_full, type="sparse", MTC=T, Discrete=T)
+```
+![PCA on CMRs variable in both sexes - scree](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/var_CMRs_by_sex/PCA_var_CMRs_all_scree_ext2.png)
+
+![PCA on CMRs variable in both sexes - heat map](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/var_CMRs_by_sex/PCA_var_CMRs_all_heat_legend_ext2_v2.png)
+
+The first PC accounts for more variance than the others, at approx 12-15%. It is correlated with head trauma and cell type proportion, and to a lesser extent, age. Batch, sex, smoking, pesticides, and alcohol load onto PCs 2 and onward.
+
+---
+
+Altogether, this indicates that:
+
+1. The majority of blood reference CMRs were variable in both sexes, and the majority of variance in CMR DNAm was due to cell type proportion and history of head trauma (PC1, controlled for as covariates in EWAS), with less variance due to batch and sex (PC2), and further less due to sex-dependent exposures (PC3). A small number of these CMRs were differentially methylated with PD status, in either males or females. This could represent a combination of the sex-dependent and/or sex-associated-exposure-dependent signals in PCs 2 and 3.
+
+2. The vast majority of variance in CMR DNAm for the small number of blood reference CMRs only variable in females was associated with sex and sex-dependent exposures including smoking, pesticides, and alcohol consumption. This variance was also associated specifically with monocyte proportion (may be related to sex-dependent exposures). None of these CMRs were differentially methylated with PD status in either sex in TERRE.
+
+3. A small proportion of variance in CMR DNAm for blood reference CMRs only variable in males was associated with overall cell type composition and chip, with an even smaller proportion of variance associated with sex and the sex-dependent exposures mentioned above. None of these CMRs were differentially methylated with PD status in either sex in TERRE.
+
+

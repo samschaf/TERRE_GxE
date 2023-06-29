@@ -1,0 +1,318 @@
+TERRE Model Selection
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: Apr 17, 2023
+  
+The *TERRE* cohort (subset containing n=88 cases and n=177 controls) consists of French agricultural workers enrolled in the Mutualite Sociale Agricole health insurance system. All PD cases in this subset of data have a disease duration of one year or less. 
+
+In this script I will test the fit of various models using Q-Q plots, p-value histograms, and AIC.
+
+Update Feb 28, 2023: Using fixed extended cell type PCs.
+
+Update Apr 17, 2023: Using updated propensity matched weights (from MatchIt 4.5.3).
+
+### Libraries
+```{r libraries, eval=F}
+setwd("/home1/NEURO/schaffner")
+library(ggplot2) #For plotting
+library(dplyr)
+library(reshape2)
+library(gridExtra)
+library(limma)
+library(comeback)
+library(car)
+library(minfi)
+source("~/kobor_shared_coding_resource/qqplot_NG.R")
+```
+
+## Load meta data and betas
+
+### Females
+```{r load data, eval=F}
+load("~/1-preprocessing/TERRE/TERRE_RG_filtered.RData")
+
+#Meta data
+meta_F <- read.csv("~/1-preprocessing/TERRE/propensity_matching/terre_meta_F_probit_matched_4.5.3.csv")
+
+#ensure categorical variables are factors
+meta_F$levodopa <- as.factor(meta_F$levodopa)
+meta_F$edu <- as.factor(meta_F$edu)
+meta_F$smoking <- as.factor(meta_F$smoking)
+meta_F$pesticides <- as.factor(meta_F$pesticides)
+meta_F$head_trauma <- as.factor(meta_F$head_trauma)
+meta_F$PD <- as.factor(meta_F$PD)
+meta_F$agonist <- as.factor(meta_F$agonist)
+meta_F$SentrixBarcode_A <- as.factor(meta_F$SentrixBarcode_A)
+meta_F$plate <- as.factor(meta_F$plate)
+meta_F$marital <- as.factor(meta_F$marital)
+meta_F$ethnicity <- as.factor(meta_F$ethnicity)
+meta_F$alcohol1<- as.factor(meta_F$alcohol1)
+meta_F$alcohol5<- as.factor(meta_F$alcohol5)
+
+#ensure continuous variables are numeric
+meta_F$MMS <- as.numeric(meta_F$MMS)
+meta_F$age_onset <- as.numeric(meta_F$age_onset)
+
+#subset betas
+dim(betas_F <- getBeta(PD_RG_filtered[,sampleNames(PD_RG_filtered) %in% meta_F$patient])) #803777    100
+```
+
+### Males
+```{r load data M, eval=F}
+#Meta data
+meta_M <- read.csv("~/1-preprocessing/TERRE/propensity_matching/terre_meta_M_probit_matched_4.5.3.csv")
+
+#ensure categorical variables are factors
+meta_M$levodopa <- as.factor(meta_M$levodopa)
+meta_M$edu <- as.factor(meta_M$edu)
+meta_M$smoking <- as.factor(meta_M$smoking)
+meta_M$pesticides <- as.factor(meta_M$pesticides)
+meta_M$head_trauma <- as.factor(meta_M$head_trauma)
+meta_M$PD <- as.factor(meta_M$PD)
+meta_M$agonist <- as.factor(meta_M$agonist)
+meta_M$SentrixBarcode_A <- as.factor(meta_M$SentrixBarcode_A)
+meta_M$plate <- as.factor(meta_M$plate)
+meta_M$marital <- as.factor(meta_M$marital)
+meta_M$ethnicity <- as.factor(meta_M$ethnicity)
+meta_M$alcohol1<- as.factor(meta_M$alcohol1)
+meta_M$alcohol5<- as.factor(meta_M$alcohol5)
+
+#ensure continuous variables are numeric
+meta_M$MMS <- as.numeric(meta_M$MMS)
+meta_M$age_onset <- as.numeric(meta_M$age_onset)
+
+#subset betas
+dim(betas_M <- getBeta(PD_RG_filtered[,sampleNames(PD_RG_filtered) %in% meta_M$patient])) #803777    118
+```
+
+## Calculating CMR median betas
+
+Using pre-defined blood reference CMRs. 
+
+### Females
+```{r CoMeBack F, eval=F}
+betas_F_t <- t(betas_F)
+
+#get reference CMRs (1k)
+CMRs_450 <- readRDS("~/kobor_shared_coding_resource/reference_CMRs/S3_cmr_Scor30_mxd1K.rds")
+load("~/kobor_shared_coding_resource/reference_CMRs/S5_cmrs_epicOnly_1Kd.RData")
+refCMRs <- rbind(CMRs_450, cmrs_epicOnly_gene_df) #43,657 CMRs
+
+#covert to a list, where each element contains CpG probe names, and names correspond to chromosome
+refCMRlist <- lapply(1:nrow(refCMRs), function(x){
+  probes <- unlist(strsplit(as.character(refCMRs$cmr[x]), split=","))
+  
+})
+
+#subset to CMRs contained in QC'ed data
+CMRcheck <- sapply(1:length(refCMRlist), function(x){
+  probes <- refCMRlist[[x]]
+  return(all(probes %in% colnames(betas_F_t)))
+})
+summary(CMRcheck)
+#   Mode   FALSE    TRUE 
+#logical     881   42776
+
+#check the order matches here
+head(CMRcheck)
+head(refCMRs)
+nrow(refCMRs_in_TERRE <- refCMRs[CMRcheck,]) #42,776
+write.csv(refCMRs_in_TERRE, file="~/2-EWAS_CMRs/TERRE/refCMRs_in_TERRE_df.csv", row.names=F)
+
+length(refCMRlist <- refCMRlist[CMRcheck]) #42,776
+save(refCMRlist, file="~/2-EWAS_CMRs/TERRE/refCMRs_in_TERRE_list.RData")
+
+# use uncorrrected betas to calculate CMR median betas
+# with this function from the package, an error "Error in Mdata[,x]: index type "list" is incorrect" occurs.  Looking at cmr_comp, line 22 specifies to unlist all the CMRs into one vector (as opposed to a list of lists containing CMRs per chromosome) only if there are fewer than 24 chromosomes. 
+#cmr_cor40_cmpB=cmr_comp(cmrs = refCMRlist, Mdata = beta_noCTC)
+#save(cmr_cor40_cmpB, file="/home1/NEURO/schaffner/CoMeBack/CMR_cmpB.Rdata")
+
+#I have 24 exactly, and it seems like the CMRs need to be unlisted for the next part of the function to work. I commented out this line and saved a new R script, "cmr_comp2.R," which I will try on my data.
+source("/home1/NEURO/schaffner/EWAS/CoMeBack/cmr_comp2.R")
+
+refCMR_medB_F=cmr_comp2(cmrs = refCMRlist, Mdata = betas_F_t, cmethod="median")
+#[1] "Found 42776 CMRs, this may take awhile."
+save(refCMR_medB_F, file="/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/refCMR_medB_F.RData")
+```
+
+### Males
+```{r CoMeBack M, eval=F}
+betas_M_t <- t(betas_M)
+
+refCMR_medB_M=cmr_comp2(cmrs = refCMRlist, Mdata = betas_M_t, cmethod="median")
+#[1] "Found 42776 CMRs, this may take awhile."
+save(refCMR_medB_M, file="/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/refCMR_medB_M.RData")
+```
+
+## Collinearity check
+
+For categorical predictors with multiple factor levels, three values are produced from the vif() function: GVIF, Df, and GVIF^(1/(2 * Df)). GVIF^(1/(2 * Df)) is analagous to taking the square root of a typical VIF value. So, VIF cutoffs should be applied to the squared GVIF^(1/(2 * Df)) value in this case. See https://stats.stackexchange.com/questions/70679/which-variance-inflation-factor-should-i-be-using-textgvif-or-textgvif/96584#96584 for a good explainer.
+
+```{r collinearity check, eval=F}
+##### females
+all(meta_F$patient==rownames(refCMR_medB_F)) #TRUE
+
+#PD, age, alcohol1, smoking, head trauma, 6 cell type PCs, 3 ancestry PCs, chip, row
+sapply(vif(lm(refCMR_medB_F[,1] ~ meta_F$PD + meta_F$age + meta_F$alcohol1 + meta_F$smoking + meta_F$head_trauma + meta_F$CTP_PC1 + meta_F$CTP_PC2 + meta_F$CTP_PC3 + meta_F$CTP_PC4 + meta_F$CTP_PC5 + meta_F$CTP_PC6 + meta_F$ancestryPC1 + meta_F$ancestryPC2 + meta_F$ancestryPC3 + meta_F$SentrixBarcode_A + meta_F$SentrixPosition_A, weights=meta_F$weights))[,3], function(x) x^2)
+#               meta_F$PD               meta_F$age          meta_F$alcohol1           meta_F$smoking 
+#                2.136803                19.132059                 3.494850                 1.670425 
+#      meta_F$head_trauma           meta_F$CTP_PC1           meta_F$CTP_PC2           meta_F$CTP_PC3 
+#                3.588848                 4.407816                 3.650422                 8.019099 
+#          meta_F$CTP_PC4           meta_F$CTP_PC5           meta_F$CTP_PC6       meta_F$ancestryPC1 
+#                6.028438                 6.041055                 4.147091                 8.213996 
+#      meta_F$ancestryPC2       meta_F$ancestryPC3  meta_F$SentrixBarcode_A meta_F$SentrixPosition_A 
+#                3.264000                 2.822811                 1.730015                 2.653986 
+
+#plotting chip vs age and chip vs plate to check confounding
+ggplot(meta_F, aes(x=age, y=meta_F$SentrixBarcode_A, col=meta_F$SentrixBarcode_A)) + geom_jitter() + theme_bw() + theme(axis.text.y=element_blank(), legend.position = "none")
+#samples of similar age are grouped together on chips, resulting in model inflation when both variables are included
+
+ggplot(meta_F, aes(y=meta_F$SentrixBarcode_A, x=meta_F$plate, col=meta_F$SentrixBarcode_A)) + geom_jitter() + theme_bw() + theme(axis.text.y=element_blank(), legend.position = "none")
+#chip and plate are also related
+
+#replacing chip with plate in the model
+sapply(vif(lm(refCMR_medB_F[,1] ~ meta_F$PD + meta_F$age + meta_F$alcohol1 + meta_F$smoking + meta_F$head_trauma + meta_F$CTP_PC1 + meta_F$CTP_PC2 + meta_F$CTP_PC3 + meta_F$CTP_PC4 + meta_F$CTP_PC5 + meta_F$CTP_PC6 + meta_F$ancestryPC1 + meta_F$ancestryPC2 + meta_F$ancestryPC3 + meta_F$plate + meta_F$SentrixPosition_A, weights=meta_F$weights))[,3], function(x) x^2)
+#               meta_F$PD               meta_F$age          meta_F$alcohol1           meta_F$smoking 
+#                1.303774                 1.662998                 1.536961                 1.184435 
+#      meta_F$head_trauma           meta_F$CTP_PC1           meta_F$CTP_PC2           meta_F$CTP_PC3 
+#                1.529295                 1.748570                 2.287370                 3.481372 
+#          meta_F$CTP_PC4           meta_F$CTP_PC5           meta_F$CTP_PC6       meta_F$ancestryPC1 
+#                2.384423                 1.806170                 1.992621                 1.699924 
+#      meta_F$ancestryPC2       meta_F$ancestryPC3             meta_F$plate meta_F$SentrixPosition_A 
+#                1.702420                 1.653185                 1.498657                 1.383885 
+
+##### males
+all(meta_M$patient==rownames(refCMR_medB_M)) #TRUE
+
+sapply(vif(lm(refCMR_medB_M[,1] ~ meta_M$PD + meta_M$age + meta_M$alcohol1 + meta_M$smoking + meta_M$head_trauma + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3 + meta_M$CTP_PC4 + meta_M$CTP_PC5 + meta_M$CTP_PC6 + meta_M$ancestryPC1 + meta_M$ancestryPC2 + meta_M$ancestryPC3 + meta_M$plate + meta_M$SentrixPosition_A, weights=meta_M$weights))[,3], function(x) x^2)
+#               meta_M$PD               meta_M$age          meta_M$alcohol1           meta_M$smoking 
+#                1.406016                 1.479302                 1.546569                 1.252016 
+#      meta_M$head_trauma           meta_M$CTP_PC1           meta_M$CTP_PC2           meta_M$CTP_PC3 
+#                1.622521                 1.542701                 1.595191                 1.608060 
+#          meta_M$CTP_PC4           meta_M$CTP_PC5           meta_M$CTP_PC6       meta_M$ancestryPC1 
+#                1.713158                 1.765355                 1.521713                 1.548727 
+#      meta_M$ancestryPC2       meta_M$ancestryPC3             meta_M$plate meta_M$SentrixPosition_A 
+#                1.396820                 1.421645                 1.472667                 1.395288 
+```
+![Age by chip in females](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/age_by_chip_F.png)
+![Age by chip in males](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/age_by_chip_M.png)
+
+Since age and chip are related, and some chips have as few as 1-2 individuals on them, I chose to correct for plate and row but not chip in the models. This allows inclusion of all other covariates in a non-collinear fashion within either sex.
+
+## Checking residuals of different models
+Next I will perform "stepwise" AIC analysis, starting with a simpler model and adding covariates to check fit. Covariates to check are smoking, alcohol, and head trauma (age, cell type, and batch should be included regardless).
+```{r residuals check, eval=F}
+######## females
+
+#1: age, cell type PCs, ancestry PCs, batch
+#lm (AIC check)
+f1 <- mean(sapply(1:ncol(refCMR_medB_F), function(x) AIC(lm(refCMR_medB_F[,x] ~ meta_F$PD + meta_F$age + meta_F$CTP_PC1 + meta_F$CTP_PC2 + meta_F$CTP_PC3 + meta_F$CTP_PC4 + meta_F$CTP_PC5 + meta_F$CTP_PC6 + meta_F$ancestryPC1 + meta_F$ancestryPC2 + meta_F$ancestryPC3 + meta_F$plate + meta_F$SentrixPosition_A, weights=meta_F$weights)))) #-430.6623
+f1_pvals <- sapply(1:ncol(refCMR_medB_F), function(x) {
+  coef(summary(lm(refCMR_medB_F[,x] ~ meta_F$PD + meta_F$age + meta_F$CTP_PC1 + meta_F$CTP_PC2 + meta_F$CTP_PC3 + meta_F$CTP_PC4 + meta_F$CTP_PC5 + meta_F$CTP_PC6 + meta_F$ancestryPC1 + meta_F$ancestryPC2 + meta_F$ancestryPC3 + meta_F$plate + meta_F$SentrixPosition_A, weights=meta_F$weights)))[2,4]
+   })
+f1_qq <- qqunif.plot(f1_pvals, title="Females: base model")
+
+#2: age, cell type PCs, ancestry PCs, batch, smoking
+#lm (AIC check)
+f2 <- mean(sapply(1:ncol(refCMR_medB_F), function(x) AIC(lm(refCMR_medB_F[,x] ~ meta_F$PD + meta_F$age + meta_F$CTP_PC1 + meta_F$CTP_PC2 + meta_F$CTP_PC3 + meta_F$CTP_PC4 + meta_F$CTP_PC5 + meta_F$CTP_PC6 + meta_F$ancestryPC1 + meta_F$ancestryPC2 + meta_F$ancestryPC3 + meta_F$plate + meta_F$SentrixPosition_A + meta_F$smoking, weights=meta_F$weights)))) #-427.9004
+f2_pvals <- sapply(1:ncol(refCMR_medB_F), function(x) {
+  coef(summary(lm(refCMR_medB_F[,x] ~ meta_F$PD + meta_F$age + meta_F$CTP_PC1 + meta_F$CTP_PC2 + meta_F$CTP_PC3 + meta_F$CTP_PC4 + meta_F$CTP_PC5 + meta_F$CTP_PC6 + meta_F$ancestryPC1 + meta_F$ancestryPC2 + meta_F$ancestryPC3 + meta_F$plate + meta_F$SentrixPosition_A + meta_F$smoking, weights=meta_F$weights)))[2,4]
+   })
+f2_qq <- qqunif.plot(f2_pvals, title="Females: base + smoking")
+
+#3: age, cell type PCs, ancestry PCs, batch, smoking, alcohol1
+#lm (AIC check)
+f3 <- mean(sapply(1:ncol(refCMR_medB_F), function(x) AIC(lm(refCMR_medB_F[,x] ~ meta_F$PD + meta_F$age + meta_F$CTP_PC1 + meta_F$CTP_PC2 + meta_F$CTP_PC3 + meta_F$CTP_PC4 + meta_F$CTP_PC5 + meta_F$CTP_PC6 + meta_F$ancestryPC1 + meta_F$ancestryPC2 + meta_F$ancestryPC3 + meta_F$plate + meta_F$SentrixPosition_A + meta_F$alcohol1 + meta_F$smoking, weights=meta_F$weights)))) #-427.5958
+f3_pvals <- sapply(1:ncol(refCMR_medB_F), function(x) {
+  coef(summary(lm(refCMR_medB_F[,x] ~ meta_F$PD + meta_F$age + meta_F$CTP_PC1 + meta_F$CTP_PC2 + meta_F$CTP_PC3 + meta_F$CTP_PC4 + meta_F$CTP_PC5 + meta_F$CTP_PC6 + meta_F$ancestryPC1 + meta_F$ancestryPC2 + meta_F$ancestryPC3 + meta_F$plate + meta_F$SentrixPosition_A + meta_F$smoking + meta_F$alcohol1, weights=meta_F$weights)))[2,4]
+   })
+f3_qq <- qqunif.plot(f2_pvals, title="Females: base + smoking + alcohol1")
+
+#4: age, cell type PCs, ancestry PCs, batch, smoking, alcohol1, head trauma
+#lm (AIC check)
+
+#Erreur dans mean(sapply(1:ncol(refCMR_medB_F), function(x) AIC(lm(refCMR_medB_F[,  : 
+#  la cible de l'assignation est un objet n'appartenant pas au langage
+
+#this error does not occur if the calculation is performed first and then assigned to "f4" variable separately
+aics4 <- sapply(1:ncol(refCMR_medB_F), function(x) AIC(lm(refCMR_medB_F[,x] ~ meta_F$PD + meta_F$age + meta_F$CTP_PC1 + meta_F$CTP_PC2 + meta_F$CTP_PC3 + meta_F$CTP_PC4 + meta_F$CTP_PC5 + meta_F$CTP_PC6 + meta_F$ancestryPC1 + meta_F$ancestryPC2 + meta_F$ancestryPC3 + meta_F$plate + meta_F$SentrixPosition_A + meta_F$alcohol1 + meta_F$smoking + meta_F$head_trauma, weights=meta_F$weights)))
+f4 <- mean(aics4)  #-427.5329
+  
+f4_pvals <- sapply(1:ncol(refCMR_medB_F), function(x) {
+  coef(summary(lm(refCMR_medB_F[,x] ~ meta_F$PD + meta_F$age + meta_F$CTP_PC1 + meta_F$CTP_PC2 + meta_F$CTP_PC3 + meta_F$CTP_PC4 + meta_F$CTP_PC5 + meta_F$CTP_PC6 + meta_F$ancestryPC1 + meta_F$ancestryPC2 + meta_F$ancestryPC3 + meta_F$plate + meta_F$SentrixPosition_A + meta_F$smoking + meta_F$alcohol1 + meta_F$head_trauma, weights=meta_F$weights)))[2,4]
+   })
+f4_qq <- qqunif.plot(f2_pvals, title="Females: base + smoking + alcohol1 + head trauma")
+
+png("~/2-EWAS_CMRs/TERRE/qqplots_F_v3.png", width=600, height=600)
+grid.arrange(f1_qq, f2_qq, f3_qq, f4_qq, nrow=2, ncol=2)
+dev.off()
+
+######## males
+
+#1: age, cell type PCs, ancestry PCs, batch
+#lm (AIC check)
+m1 <- mean(sapply(1:ncol(refCMR_medB_M), function(x) AIC(lm(refCMR_medB_M[,x] ~ meta_M$PD + meta_M$age + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3 + meta_M$CTP_PC4 + meta_M$CTP_PC5 + meta_M$CTP_PC6 + meta_M$ancestryPC1 + meta_M$ancestryPC2 + meta_M$ancestryPC3 + meta_M$plate + meta_M$SentrixPosition_A, weights=meta_M$weights)))) #-509.5669
+m1_pvals <- sapply(1:ncol(refCMR_medB_M), function(x) {
+  coef(summary(lm(refCMR_medB_M[,x] ~ meta_M$PD + meta_M$age + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3 + meta_M$CTP_PC4 + meta_M$CTP_PC5 + meta_M$CTP_PC6 + meta_M$ancestryPC1 + meta_M$ancestryPC2 + meta_M$ancestryPC3 + meta_M$plate + meta_M$SentrixPosition_A, weights=meta_M$weights)))[2,4]
+   })
+m1_qq <- qqunif.plot(f1_pvals, title="Males: base model")
+
+#2: age, cell type PCs, ancestry PCs, batch, smoking
+#lm (AIC check)
+m2 <- mean(sapply(1:ncol(refCMR_medB_M), function(x) AIC(lm(refCMR_medB_M[,x] ~ meta_M$PD + meta_M$age + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3 + meta_M$CTP_PC4 + meta_M$CTP_PC5 + meta_M$CTP_PC6 + meta_M$ancestryPC1 + meta_M$ancestryPC2 + meta_M$ancestryPC3 + meta_M$plate + meta_M$SentrixPosition_A + meta_M$smoking, weights=meta_M$weights)))) #-507.7394
+m2_pvals <- sapply(1:ncol(refCMR_medB_M), function(x) {
+  coef(summary(lm(refCMR_medB_M[,x] ~ meta_M$PD + meta_M$age + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3 + meta_M$CTP_PC4 + meta_M$CTP_PC5 + meta_M$CTP_PC6 + meta_M$ancestryPC1 + meta_M$ancestryPC2 + meta_M$ancestryPC3 + meta_M$plate + meta_M$SentrixPosition_A + meta_M$smoking, weights=meta_M$weights)))[2,4]
+   })
+m2_qq <- qqunif.plot(f1_pvals, title="Males: base + smoking")
+
+#3: age, cell type PCs, ancestry PCs, batch, smoking, alcohol1
+#lm (AIC check)
+m3 <- mean(sapply(1:ncol(refCMR_medB_M), function(x) AIC(lm(refCMR_medB_M[,x] ~ meta_M$PD + meta_M$age + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3 + meta_M$CTP_PC4 + meta_M$CTP_PC5 + meta_M$CTP_PC6 + meta_M$ancestryPC1 + meta_M$ancestryPC2 + meta_M$ancestryPC3 + meta_M$plate + meta_M$SentrixPosition_A + meta_M$alcohol1 + meta_M$smoking, weights=meta_M$weights)))) #-507.2221
+m3_pvals <- sapply(1:ncol(refCMR_medB_M), function(x) {
+  coef(summary(lm(refCMR_medB_M[,x] ~ meta_M$PD + meta_M$age + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3 + meta_M$CTP_PC4 + meta_M$CTP_PC5 + meta_M$CTP_PC6 + meta_M$ancestryPC1 + meta_M$ancestryPC2 + meta_M$ancestryPC3 + meta_M$plate + meta_M$SentrixPosition_A + meta_M$smoking + meta_M$alcohol1, weights=meta_M$weights)))[2,4]
+   })
+m3_qq <- qqunif.plot(f1_pvals, title="Males: base + smoking + alcohol1")
+
+#4: age, cell type PCs, ancestry PCs, batch, smoking, alcohol1, head trauma
+#lm (AIC check)
+m4 <- mean(sapply(1:ncol(refCMR_medB_M), function(x) AIC(lm(refCMR_medB_M[,x] ~ meta_M$PD + meta_M$age + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3 + meta_M$CTP_PC4 + meta_M$CTP_PC5 + meta_M$CTP_PC6 + meta_M$ancestryPC1 + meta_M$ancestryPC2 + meta_M$ancestryPC3 + meta_M$plate + meta_M$SentrixPosition_A + meta_M$alcohol1 + meta_M$smoking + meta_M$head_trauma, weights=meta_M$weights)))) #-507.4039
+m4_pvals <- sapply(1:ncol(refCMR_medB_M), function(x) {
+  coef(summary(lm(refCMR_medB_M[,x] ~ meta_M$PD + meta_M$age + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3 + meta_M$CTP_PC4 + meta_M$CTP_PC5 + meta_M$CTP_PC6 + meta_M$ancestryPC1 + meta_M$ancestryPC2 + meta_M$ancestryPC3 + meta_M$plate + meta_M$SentrixPosition_A + meta_M$smoking + meta_M$alcohol1 + meta_M$head_trauma, weights=meta_M$weights)))[2,4]
+   })
+m4_qq <- qqunif.plot(f1_pvals, title="Males: base + smoking + alcohol1 + head trauma")
+
+png("~/2-EWAS_CMRs/TERRE/qqplots_M_v3.png", width=600, height=600)
+grid.arrange(m1_qq, m2_qq, m3_qq, m4_qq, nrow=2, ncol=2)
+dev.off()
+
+aic <- data.frame(sex=c("F","M"), base=c(f1, m1), base_smoking=c(f2,m2), base_smoking_alc1=c(f3,m3), base_smoking_alc1_headtrauma=c(f4,m4))
+delta_aic <- data.frame(sex=c("F","M"), smoking=aic$base_smoking-aic$base, smoking_alc1=aic$base_smoking_alc1-aic$base, smoking_alc1_headtrauma=aic$base_smoking_alc1_headtrauma-aic$base)
+aic_melt <- melt(delta_aic, id.vars="sex")
+ggplot(aic_melt, aes(x=variable,y=value,fill=sex)) + geom_col(position="dodge") + theme_bw() + xlab("Model") + ylab("Delta AIC") + geom_hline(yintercept=2, linetype="dotted")
+
+f1_hist <- ggplot(as.data.frame(f1_pvals), aes(x=f1_pvals)) + geom_histogram(color="black") + theme_bw() + ggtitle("Females: base model")
+f2_hist <- ggplot(as.data.frame(f2_pvals), aes(x=f2_pvals)) + geom_histogram(color="black") + theme_bw() + ggtitle("Females: base + smoking")
+f3_hist <- ggplot(as.data.frame(f3_pvals), aes(x=f3_pvals)) + geom_histogram(color="black") + theme_bw() + ggtitle("Females: base + smoking + alcohol1")
+f4_hist <- ggplot(as.data.frame(f4_pvals), aes(x=f4_pvals)) + geom_histogram(color="black") + theme_bw() + ggtitle("Females: base + smoking + alcohol1 + head trauma")
+grid.arrange(f1_hist, f2_hist, f3_hist, f4_hist, nrow=2, ncol=2)
+
+m1_hist <- ggplot(as.data.frame(m1_pvals), aes(x=m1_pvals)) + geom_histogram(color="black") + theme_bw() + ggtitle("Males: base model")
+m2_hist <- ggplot(as.data.frame(m2_pvals), aes(x=m2_pvals)) + geom_histogram(color="black") + theme_bw() + ggtitle("Males: base + smoking")
+m3_hist <- ggplot(as.data.frame(m3_pvals), aes(x=m3_pvals)) + geom_histogram(color="black") + theme_bw() + ggtitle("Males: base + smoking + alcohol1")
+m4_hist <- ggplot(as.data.frame(m4_pvals), aes(x=m4_pvals)) + geom_histogram(color="black") + theme_bw() + ggtitle("Males: base + smoking + alcohol1 + head trauma")
+grid.arrange(m1_hist, m2_hist, m3_hist, m4_hist, nrow=2, ncol=2)
+```
+![Delta AICs compared to base model](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/aic_v3.png)
+
+Adding smoking, alcohol1, and head trauma covariates increases AIC in females and has little effect in males. Since males are more likely to smoke, drink, and have head injuries than females, it makes sense that these covariates result in a better fit in models with males than they do in models with females. However, AIC differences overall are low (max 4).
+
+
+![Q-Q plots for female models (PD coefficient)](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/qqplots_F_v3.png)
+
+![P-value histograms for female models (PD coefficient)](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/pval_hist_F_v3.png)
+
+![Q-Q plots for male models (PD coefficient)](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/qqplots_M_v3.png)
+![P-value histograms for male models (PD coefficient)](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/pval_hist_M_v3.png)
+
+The four models have similar p-value distributions for the PD coefficient. P-value histograms are right skewed and q-q plots seem inflated in all cases.

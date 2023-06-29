@@ -1,0 +1,102 @@
+TERRE Differential DNAm Analysis
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: May 29, 2023
+  
+The *TERRE* cohort (subset containing n=88 cases and n=177 controls) consists of French agricultural workers enrolled in the Mutualite Sociale Agricole health insurance system. All PD cases in this subset of data have a disease duration of one year or less. 
+
+Here I am checking the PD delta betas of CMRs differentially methylated in TERRE in individuals from DIG-PD.
+
+#Libraries
+```{r libraries, eval=F}
+setwd("/home1/NEURO/schaffner")
+library(ggplot2) #For plotting
+library(dplyr)
+library(reshape2)
+library(gridExtra)
+library(car)
+library(MASS)
+library(sfsmisc)
+```
+
+### Female-male overlap (DB > 0.03 and FDR < 0.05)
+
+```{r CMRplot, eval=F}
+sig.cpgs.F <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_F_hits_BH0.05_adjDB0.03_042023.csv")
+all.cpgs.M <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_M_adjDB_042023.csv")
+all(sig.cpgs.F$TargetID %in% all.cpgs.M$TargetID) #FALSE
+nrow(sig.cpgs.F[sig.cpgs.F$TargetID %in% all.cpgs.M$TargetID,]) #67 CMRs overlap
+
+cpgs.F.sub <- sig.cpgs.F[sig.cpgs.F$TargetID %in% all.cpgs.M$TargetID,]
+cpgs.M.sub <- all.cpgs.M[match(cpgs.F.sub$TargetID, all.cpgs.M$TargetID),]
+
+all(cpgs.M.sub$TargetID==cpgs.F.sub$TargetID) #TRUE
+colnames(cpgs.F.sub)
+colnames(cpgs.F.sub)[4] <- "adjDB_F"
+cpgs.F.sub$adjDB_M <- cpgs.M.sub$adjDB
+
+#plotting case-control beta difference at every CMR CpG
+summary(c(cpgs.F.sub$adjDB_F, cpgs.F.sub$adjDB_M))
+#     Min.   1st Qu.    Median      Mean   3rd Qu.      Max. 
+#-0.082337 -0.010224  0.008087  0.013761  0.040150  0.150624 
+    
+cor.test(cpgs.F.sub$adjDB_F, cpgs.F.sub$adjDB_M)
+#	Pearson's product-moment correlation
+#
+#data:  cpgs.F.sub$adjDB_F and cpgs.F.sub$adjDB_M
+#t = 0.020733, df = 65, p-value = 0.9835
+#alternative hypothesis: true correlation is not equal to 0
+#95 percent confidence interval:
+# -0.2377839  0.2426304
+#sample estimates:
+#        cor 
+#0.002571614 
+        
+cpgs.F.sub$lab <- as.character(cpgs.F.sub$geneSymbol)
+#cpgs.F.sub.sub$lab[is.na(cpgs.F.sub.sub$lab)] <- as.character(cpgs.F.sub.sub$cmrGR)
+library(ggrepel)
+
+png("~/4-replication/TERRE_opp_sex_check/adjDB_TERRE_F_TERRE_M.png", width=300, height=300)
+ggplot(cpgs.F.sub, aes(x=adjDB_F, y=adjDB_M)) + geom_smooth(method="lm", col="grey50") + geom_point(color="grey50", size=5, alpha=0.6) + theme_bw() + xlab("TERRE Female Adjusted Delta Beta") + ylab("TERRE Male Adjusted Delta Beta") + xlim(c(-0.2,0.2)) + ylim(c(-0.2,0.2)) + ggtitle("TERRE Female vs TERRE Male \nCMR Median Adjusted Delta Betas") + coord_cartesian(clip="off")
+dev.off()
+
+signs <- sign(cpgs.F.sub$adjDB_F)==sign(cpgs.F.sub$adjDB_M)
+length(signs[signs==TRUE]) #33
+```
+![CMRs from TERRE females in TERRE males](/home1/NEURO/schaffner/4-replication/TERRE_opp_sex_check/adjDB_TERRE_F_TERRE_M.png)
+
+### Male-female overlap (DB > 0.03, FDR < 0.05)
+
+```{r CMRplot, eval=F}
+sig.cpgs.M <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_M_hits_BH0.05_adjDB0.03_042023.csv")
+all.cpgs.F <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_F_adjDB_042023.csv")
+all(sig.cpgs.M$TargetID %in% all.cpgs.F$TargetID) #TRUE
+
+cpgs.F.sub <- all.cpgs.F[match(sig.cpgs.M$TargetID, all.cpgs.F$TargetID),]
+
+all(cpgs.F.sub$TargetID==sig.cpgs.M$TargetID) #TRUE
+colnames(sig.cpgs.M)
+colnames(sig.cpgs.M)[4] <- "adjDB_M"
+sig.cpgs.M$adjDB_F <- cpgs.F.sub$adjDB
+
+#plotting case-control beta difference at every CMR CpG
+summary(c(sig.cpgs.M$adjDB_F, sig.cpgs.M$adjDB_M))
+#    Min.  1st Qu.   Median     Mean  3rd Qu.     Max. 
+#0.007077 0.012718 0.026110 0.026477 0.039869 0.046613 
+    
+cor.test(sig.cpgs.M$adjDB_F, sig.cpgs.M$adjDB_M)
+#not enough finite observations
+        
+sig.cpgs.M$lab <- as.character(sig.cpgs.M$geneSymbol)
+#sig.cpgs.F.sub$lab[is.na(sig.cpgs.F.sub$lab)] <- as.character(sig.cpgs.F.sub$cmrGR)
+library(ggrepel)
+
+png("~/4-replication/TERRE_opp_sex_check/adjDB_TERRE_M_TERRE_F.png", width=300, height=300)
+ggplot(sig.cpgs.M, aes(x=adjDB_F, y=adjDB_M)) + geom_smooth(method="lm", col="grey50") + geom_point(color="grey50", size=5, alpha=0.6) + theme_bw() + xlab("TERRE Female Adjusted Delta Beta") + ylab("TERRE Male Adjusted Delta Beta") + xlim(c(-0.05,0.05)) + ylim(c(-0.05,0.05)) + ggtitle("TERRE Female vs TERRE Male \nCMR Median Adjusted Delta Betas") + coord_cartesian(clip="off")+ geom_label_repel(aes(label = lab), size = 3, force=50, max.overlaps=Inf)
+dev.off()
+
+signs <- sign(sig.cpgs.M$adjDB_F)==sign(sig.cpgs.M$adjDB_M)
+length(signs[signs==TRUE]) #33
+```
+![CMRs from TERRE females in TERRE males](/home1/NEURO/schaffner/4-replication/TERRE_opp_sex_check/adjDB_TERRE_F_TERRE_M.png)

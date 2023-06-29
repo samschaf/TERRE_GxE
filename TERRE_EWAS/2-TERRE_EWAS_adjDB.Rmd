@@ -1,0 +1,388 @@
+
+TERRE Differential DNAm Analysis
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: Apr 17, 2023
+  
+The *TERRE* cohort (subset containing n=88 cases and n=177 controls) consists of French agricultural workers enrolled in the Mutualite Sociale Agricole health insurance system. All PD cases in this subset of data have a disease duration of one year or less. 
+
+In this script I will perform EWAS in TERRE using the blood reference CMRs from the EPIC array, with median betas calculated within each sex of TERRE (see ~/2-EWAS_CMRs/TERRE//TERRE_models.Rmd). Covariate selection was also optimized in this script. Model weights (matching samples on smoking status, alcohol consumption, age, and heat trauma) were calculated with MatchIt (see ~/preprocessing/TERRE/normalized_filtered/matching_v2/TERRE_propensity_match_v2.Rmd).
+
+Update Mar 1, 2023: Using the 6 recalculated cell type PCs in models. The maximum iterations for rlm were changed from 100 to 150, since it no longer converged in 100 iterations.
+
+Update Mar 6, 2023: Calculating adjusted delta betas rather than raw case - control delta betas. This might improve the validation since cell type composition likely has a strong influence on PD-associated DNAm patterns.
+
+Update Apr 17, 2023: Using updated propensity matched weights (from MatchIt 4.5.3).
+
+## Loading Libraries
+```{r libraries, eval=F}
+setwd("/home1/NEURO/schaffner/")
+library(minfi)
+library(dplyr)
+library(ggplot2)
+library(DescTools)
+library(reshape2)
+library(MASS)
+library(sfsmisc)
+library(gridExtra)
+library(ggrepel)
+```
+
+
+# EWAS with sexes stratified
+
+## Females
+
+```{r rlm F, eval = F}
+meta_F <- read.csv("~/1-preprocessing/TERRE/propensity_matching/terre_meta_F_probit_matched_4.5.3.csv")
+load("~/2-EWAS_CMRs/TERRE/refCMR_medB_F.RData")
+all(meta_F$patient==rownames(refCMR_medB_F)) #TRUE
+
+#check formatting of meta data
+str(meta_F[,c("PD","age","smoking","head_trauma","alcohol1","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5","CTP_PC6","ancestryPC1","ancestryPC2","ancestryPC3","plate","SentrixPosition_A")])
+meta_F$PD <- as.factor(meta_F$PD)
+meta_F$smoking <- as.factor(meta_F$smoking)
+meta_F$head_trauma <- as.factor(meta_F$head_trauma)
+meta_F$alcohol1 <- as.factor(meta_F$alcohol1)
+meta_F$plate <- as.factor(meta_F$plate)
+
+#variability filter on median CMR betas
+Variation<-function(x) {quantile(x, c(0.9), na.rm=T)[[1]]-quantile(x, c(0.1), na.rm=T)[[1]]}
+ref_range<-sapply(1:ncol(refCMR_medB_F), function(x) Variation(refCMR_medB_F[,x]))
+dim(refCMR_medB_F_var <- refCMR_medB_F[,which(ref_range>=0.05)]) #29,363 variable CMRs
+save(refCMR_medB_F_var, file="~/2-EWAS_CMRs/TERRE/refCMR_medB_F_var.RData")
+
+#RLM on variable CMRs
+#pull out p-values and coefficients for PD term (adjusted DBs)
+
+rlm_pvals_F <- lapply(1:ncol(refCMR_medB_F_var), function(x) {
+ RLM <- rlm(refCMR_medB_F_var[,x] ~ meta_F$PD + meta_F$age + meta_F$smoking + meta_F$alcohol1 + meta_F$head_trauma + meta_F$plate + meta_F$SentrixPosition_A + meta_F$CTP_PC1 + meta_F$CTP_PC2 + meta_F$CTP_PC3 + meta_F$CTP_PC4 + meta_F$CTP_PC5 + meta_F$CTP_PC6 + meta_F$ancestryPC1 + meta_F$ancestryPC2 + meta_F$ancestryPC3, psi = psi.huber, weights=meta_F$weights, maxit=500)
+  return(f.robftest(RLM, var = names(RLM$coefficients)[2])$p.value)
+})
+
+results.F <- as.data.frame(do.call(rbind, rlm_pvals_F))
+rownames(results.F) <- colnames(refCMR_medB_F_var)
+names(results.F)[1] <- "pval"
+results.F$adjP_BH <- p.adjust(results.F$pval, method="BH")
+results.F$TargetID <- rownames(results.F)
+
+coefs_F <- lapply(1:ncol(refCMR_medB_F_var), function(x) {
+ rlm(refCMR_medB_F_var[,x] ~ meta_F$PD + meta_F$age + meta_F$smoking + meta_F$alcohol1 + meta_F$head_trauma + meta_F$plate + meta_F$SentrixPosition_A + meta_F$CTP_PC1 + meta_F$CTP_PC2 + meta_F$CTP_PC3 + meta_F$CTP_PC4 + meta_F$CTP_PC5 + meta_F$CTP_PC6 + meta_F$ancestryPC1 + meta_F$ancestryPC2 + meta_F$ancestryPC3, psi = psi.huber, weights=meta_F$weights, maxit=500)$coefficients[2]
+})
+all(names(coefs_F)==rownames(results.F)) #TRUE
+results.F$adjDB <- unlist(coefs_F)
+
+#getting non-adj DB for comparison (in old results data frame)
+results.F.v1 <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_F_adjDB.csv")
+all(results.F.v1$TargetID==results.F$TargetID) #TRUE
+results.F$DB <- results.F.v1$DB
+
+cor.test(results.F$DB, results.F$adjDB)
+#	Pearson's product-moment correlation
+#
+#data:  results.F$DB and results.F$adjDB
+#t = 148.16, df = 29361, p-value < 2.2e-16
+#alternative hypothesis: true correlation is not equal to 0
+#95 percent confidence interval:
+# 0.6474631 0.6605537
+#sample estimates:
+#      cor 
+#0.6540573 
+
+png("~/2-EWAS_CMRs/TERRE/DB_v_adjDB_F_042023.png")
+ggplot(results.F, aes(x=DB,y=adjDB)) + geom_point() + theme_bw()
+dev.off()
+```
+![Raw vs adjusted delta betas - females](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/DB_v_adjDB_F_042023.png)
+
+Delta betas are generally correlated, but there is a bit more variability than expected.
+
+### Setting DB threshold for hits
+```{r delta beta F, eval=F}
+#The max RMSE was 0.025 between tech reps (see preprocessing script)
+#how many sites pass DB 0.03 and FDR 0.05 with BH multiple test correction?
+summary(results.F$threshold_adjDB <- (results.F$adjP_BH <= 0.05 & abs(results.F$adjDB) >= 0.03)) #69
+```
+
+### Volcano plot
+```{r volcano F, eval=F}
+results.F$DNAm_change <- results.F$threshold_adjDB
+results.F[results.F$threshold_adjDB==TRUE & results.F$adjDB>0,]$DNAm_change <- "Increase"
+results.F[results.F$threshold_adjDB==TRUE & results.F$adjDB<0,]$DNAm_change <- "Decrease"
+results.F[results.F$threshold_adjDB==FALSE,]$DNAm_change <- "NS"
+summary(as.factor(results.F$DNAm_change))
+#Decrease Increase       NS 
+#      16       53    29294 
+
+#add in gene annotations
+colnames(results.F.v1)
+all(results.F$TargetID==results.F.v1$TargetID) #TRUE
+results.F <- cbind(results.F, results.F.v1[,10:66])
+
+write.csv(results.F, file="~/2-EWAS_CMRs/TERRE/rlm_F_adjDB_042023.csv", row.names=F)
+colnames(results.F)
+tbl.F <- results.F[results.F$threshold_adjDB==TRUE,c(3,1,2,4,25,27,57:64)]
+write.csv(tbl.F, file="~/2-EWAS_CMRs/TERRE/rlm_F_hits_BH0.05_adjDB0.03_042023.csv", row.names=F)
+
+max(results.F[results.F$threshold_adjDB==TRUE,"pval"]) #0.0007897251
+
+png("~/2-EWAS_CMRs/TERRE/volcano_F_pink_adjDB_042023.png", width=200, height=250)
+ggplot(results.F[,c("adjDB","pval","DNAm_change","geneSymbol")], aes(x=adjDB, y=-log10(pval), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta Beta") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("lightpink4","lightpink4","gray70")) + geom_hline(yintercept=-log10(0.0007897251)) + geom_vline(xintercept=-0.03) + geom_vline(xintercept=0.03) +
+    geom_label_repel(data = results.F[results.F$threshold==TRUE,c("adjDB","pval","DNAm_change","geneSymbol")],
+            aes(label = geneSymbol), size = 4, force = 10, max.overlaps=16) + theme(legend.position="none") + ylim(c(0,7.5)) + xlim(c(-0.12,0.12))
+dev.off()
+```
+![Volcano plot for females EWAS](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/volcano_F_pink_adjDB_042023.png)
+
+## Males
+
+```{r rlm M, eval = F}
+meta_M <- read.csv("~/1-preprocessing/TERRE/propensity_matching/terre_meta_M_probit_matched_4.5.3.csv")
+load("~/2-EWAS_CMRs/TERRE/refCMR_medB_M.RData")
+all(meta_M$patient==rownames(refCMR_medB_M)) #TRUE
+
+#check formatting of meta data
+str(meta_M[,c("PD","age","smoking","head_trauma","alcohol1","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC6","ancestryPC1","ancestryPC2","ancestryPC3","plate","SentrixPosition_A")])
+meta_M$PD <- as.factor(meta_M$PD)
+meta_M$smoking <- as.factor(meta_M$smoking)
+meta_M$head_trauma <- as.factor(meta_M$head_trauma)
+meta_M$alcohol1 <- as.factor(meta_M$alcohol1)
+meta_M$plate <- as.factor(meta_M$plate)
+meta_M$SentrixPosition_A <- as.factor(meta_M$SentrixPosition_A)
+
+#variability filter on median CMR betas
+ref_range<-sapply(1:ncol(refCMR_medB_M), function(x) Variation(refCMR_medB_M[,x]))
+dim(refCMR_medB_M_var <- refCMR_medB_M[,which(ref_range>=0.05)]) #29,190 variable CMRs
+save(refCMR_medB_M_var, file="~/2-EWAS_CMRs/TERRE/refCMR_medB_M_var.RData")
+
+#RLM on variable CMRs
+rlm_pvals_M <- lapply(1:ncol(refCMR_medB_M_var), function(x) {
+ RLM <- rlm(refCMR_medB_M_var[,x] ~ meta_M$PD + meta_M$age + meta_M$smoking + meta_M$alcohol1 + meta_M$head_trauma + meta_M$plate + meta_M$SentrixPosition_A + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3 + meta_M$CTP_PC4 + meta_M$CTP_PC5 + meta_M$CTP_PC6 + meta_M$ancestryPC1 + meta_M$ancestryPC2 + meta_M$ancestryPC3, psi = psi.huber, weights=meta_M$weights, maxit=500)
+  return(f.robftest(RLM, var = names(RLM$coefficients)[2])$p.value)
+})
+
+results.M <- as.data.frame(do.call(rbind, rlm_pvals_M))
+rownames(results.M) <- colnames(refCMR_medB_M_var)
+names(results.M)[1] <- "pval"
+results.M$adjP_BH <- p.adjust(results.M$pval, method="BH")
+results.M$TargetID <- rownames(results.M)
+
+all(meta_M$patient==rownames(refCMR_medB_M_var)) #TRUE
+
+coefs_M <- lapply(1:ncol(refCMR_medB_M_var), function(x) {
+ rlm(refCMR_medB_M_var[,x] ~ meta_M$PD + meta_M$age + meta_M$smoking + meta_M$alcohol1 + meta_M$head_trauma + meta_M$plate + meta_M$SentrixPosition_A + meta_M$CTP_PC1 + meta_M$CTP_PC2 + meta_M$CTP_PC3 + meta_M$CTP_PC4 + meta_M$CTP_PC5 + meta_M$CTP_PC6 + meta_M$ancestryPC1 + meta_M$ancestryPC2 + meta_M$ancestryPC3, psi = psi.huber, weights=meta_M$weights, maxit=500)$coefficients[2]
+})
+names(coefs_M) <- colnames(refCMR_medB_M_var)
+all(names(coefs_M)==results.M$TargetID) #TRUE
+results.M$adjDB <- unlist(coefs_M)
+
+#add in unadj DB (from previous data frame)
+results.M.v1 <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_M_adjDB.csv")
+all(results.M$TargetID==results.M.v1$TargetID) #TRUE
+results.M$DB <- results.M.v1$DB
+
+cor.test(results.M$DB, results.M$adjDB)
+#	Pearson's product-moment correlation
+#
+#data:  results.M$DB and results.M$adjDB
+#t = 90.688, df = 29188, p-value < 2.2e-16
+#alternative hypothesis: true correlation is not equal to 0
+#95 percent confidence interval:
+# 0.4598592 0.4777598
+#sample estimates:
+#      cor 
+#0.4688577
+
+png("~/2-EWAS_CMRs/TERRE/DB_v_adjDB_M_042023.png")
+ggplot(results.M, aes(x=DB,y=adjDB)) + geom_point() + theme_bw()
+dev.off()
+```
+![Raw vs adjusted delta betas - males](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/DB_v_adjDB_M_042023.png)
+
+Correlation between raw and adjusted is weaker in men than in women.
+
+### Setting DB threshold for hits
+```{r delta beta M, eval=F}
+#The max RMSE was 0.025 between tech reps (see preprocessing script)
+#how many sites pass DB 0.03 and FDR 0.05 with BH multiple test correction?
+summary(results.M$threshold_adjDB <- (results.M$adjP_BH <= 0.05 & abs(results.M$adjDB) >= 0.03)) #2
+summary(results.M$threshold0.1_adjDB <- (results.M$adjP_BH <= 0.1 & abs(results.M$adjDB) >= 0.03)) #6
+nrow(results.M[results.M$adjP_BH<=0.05,]) #7
+nrow(results.M[results.M$adjP_BH<=0.1,]) #18
+
+#add in gene annotations
+colnames(results.M.v1)
+all(results.M$TargetID==results.M.v1$TargetID) #TRUE
+results.M <- cbind(results.M, results.M.v1[,7:63])
+
+results.M[results.M$threshold_adjDB==TRUE,c("cmrGR","geneSymbol","DB","adjDB","adjP_BH")]
+#                             cmrGR geneSymbol          DB      adjDB    adjP_BH
+#cg04749306 chr19:17433773-17434268  ANO8,DDA1 0.025286800 0.04661313 0.01935978
+#cg06192961  chr6:32294470-32295230       <NA> 0.004261129 0.03762120 0.03904346
+```
+
+### Volcano plot
+```{r volcano M, eval=F}
+results.M$DNAm_change <- results.M$threshold_adjDB
+results.M[results.M$threshold_adjDB==TRUE & results.M$adjDB>0,]$DNAm_change <- "Increase"
+#results.M[results.M$threshold_adjDB==TRUE & results.M$adjDB<0,]$DNAm_change <- "Decrease"
+results.M[results.M$threshold_adjDB==FALSE,]$DNAm_change <- "NS"
+summary(as.factor(results.M$DNAm_change))
+#Increase       NS 
+#       2    29188 
+
+write.csv(results.M, file="~/2-EWAS_CMRs/TERRE/rlm_M_adjDB_042023.csv", row.names=F)
+colnames(results.M)
+tbl.M <- results.M[results.M$threshold_adjDB==TRUE,c(3,1,2,4,25,27,57:64)]
+write.csv(tbl.M, file="~/2-EWAS_CMRs/TERRE/rlm_M_hits_BH0.05_adjDB0.03_042023.csv", row.names=F)
+
+max(results.M[results.M$threshold_adjDB==TRUE,"pval"]) #6.040479e-06
+
+png("~/2-EWAS_CMRs/TERRE/volcano_M_blue_adjDB_042023.png", width=200, height=250)
+ggplot(results.M[,c("adjDB","pval","DNAm_change","geneSymbol")], aes(x=adjDB, y=-log10(pval), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta Beta") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("lightsteelblue4","gray70")) + geom_hline(yintercept=-log10(6.040479e-06)) + geom_vline(xintercept=-0.03) + geom_vline(xintercept=0.03) +
+    geom_label_repel(data = results.M[results.M$threshold_adjDB==TRUE,c("adjDB","pval","DNAm_change","geneSymbol")],
+            aes(label = geneSymbol), size = 4, force = 10, max.overlaps=16) + theme(legend.position="none") + ylim(c(0,7.5)) + xlim(c(-0.12,0.12))
+dev.off()
+
+summary(results.M$threshold <- (results.M$adjP_BH <= 0.05 & abs(results.M$DB) >= 0.03)) #none
+```
+![Volcano plot for males EWAS](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/volcano_M_blue_adjDB_042023.png)
+
+## Checking overlaps between M/F
+```{r sex overlap, eval=F}
+nrow(tbl.F[tbl.F$TargetID %in% tbl.M$TargetID,]) #0 - no overlap
+
+tbl.F$sex <- "F"
+tbl.M$sex <- "M"
+tbl.combine <- rbind(tbl.F, tbl.M)
+
+summary(tbl.F$cmr_length)
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#    7.0    79.0   208.0   368.1   438.0  2606.0 
+
+summary(tbl.M$cmr_length)
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+#  495.0   561.2   627.5   627.5   693.8   760.0 
+
+png("~/2-EWAS_CMRs/TERRE/sig_cmrs_by_length_adjDB_042023.png")
+ggplot(tbl.combine, aes(x=cmr_length, fill=sex)) + geom_histogram() + theme_bw() + facet_wrap(~sex) + ggtitle("EWAS on median CMR beta (padj <= 0.05, adj DB >= 0.03)")
+dev.off()
+```
+![Length of significant CMRs](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/sig_cmrs_by_length_adjDB_042023.png)
+
+#### CMR plots
+```{r cmrplot F, eval=F}
+source('~/2-EWAS_CMRs/cmrplot_adjDB.R')
+
+#getting all betas (not just CMR betas)
+load("~/1-preprocessing/TERRE/TERRE_RG_filtered.RData")
+betas <- getBeta(PD_RG_filtered)
+betas <- betas[,colnames(betas) %in% c(as.character(meta_M$Sample_Name), as.character(meta_F$Sample_Name))]
+#betas_F <- betas[,colnames(betas) %in% meta_F$Sample_Name]
+#betas_M <- betas[,colnames(betas) %in% meta_M$Sample_Name]
+
+#getting fdat for all probes (not just variable representative CMR probes)
+load("~/kobor_shared_coding_resource/EPIC_fdat.RData")
+fData_EPIC <- fData_EPIC[fData_EPIC$TargetID %in% featureNames(PD_RG_filtered),]
+
+meta_F$reportedSex <- "F"
+meta_M$reportedSex <- "M"
+meta <- rbind(meta_F, meta_M)
+
+for (i in 1:nrow(results.F[results.F$threshold_adjDB==TRUE,])){
+cmrplot(sig.cpgs=results.F, fdat=fData_EPIC, metadata=meta, betas=betas, cmr=i, path="~/2-EWAS_CMRs/TERRE/CMRs_F_042023/")}
+
+for (i in 1:nrow(results.M[results.M$threshold_adjDB==TRUE,])){
+cmrplot(sig.cpgs=results.M, fdat=fData_EPIC, metadata=meta, betas=betas, cmr=i, path="~/2-EWAS_CMRs/TERRE/CMRs_M_042023/")}
+
+cmrplot(sig.cpgs=results.F, fdat=fData_EPIC, metadata=meta, betas=betas, cmr=16, path="~/2-EWAS_CMRs/TERRE/CMRs_Fig2_042023/", width=350, height=750)
+cmrplot(sig.cpgs=results.M, fdat=fData_EPIC, metadata=meta, betas=betas, cmr=1, path="~/2-EWAS_CMRs/TERRE/CMRs_Fig2_042023/", width=350, height=750)
+
+#double all check probe annotations for DDA1/ANO8 CMR (get refgene group for both gene annotations)
+fData_EPIC[fData_EPIC$TargetID %in% c("cg04749306","cg25605313"),c("TargetID","UCSC_REFGENE_NAME","UCSC_REFGENE_GROUP"),]
+#             TargetID UCSC_REFGENE_NAME UCSC_REFGENE_GROUP
+#cg04749306 cg04749306              DDA1              3'UTR
+#cg25605313 cg25605313              ANO8              3'UTR
+```
+
+## Overlap with sex CMRs
+
+### Females
+```{r overlap, eval=F}
+sCMRs <- read.csv("~/3-posthoc/sex_CMRs_overlap/sCMRs_Gatev_2021.csv", skip=3)
+nrow(sCMRs) #179 sex CMRs
+
+### exact overlap
+length(sCMRs$cmr[sCMRs$cmr %in% results.F$cmr]) #152 reference CMRs with exact overlap
+nrow(results.F[results.F$threshold_adjDB==TRUE & results.F$cmr %in% sCMRs$cmr,]) #0 differentially methylated CMRs with exact overlap
+
+### partial overlap
+seqnames=sapply(1:nrow(sCMRs), function(x) unlist(strsplit(as.character(sCMRs$cmrGR[x]), split=":"))[1])
+ranges=sapply(1:nrow(sCMRs), function(x) unlist(strsplit(as.character(sCMRs$cmrGR[x]), split=":"))[2])
+start=as.numeric(sapply(1:length(ranges), function(x) unlist(strsplit(ranges[x], split="-"))[1]))
+end=as.numeric(sapply(1:length(ranges), function(x) unlist(strsplit(ranges[x], split="-"))[2]))
+length(sCMR_gr <- GRanges(seqnames=seqnames, ranges=IRanges(start=start, end=end))) #179
+
+seqnames=sapply(1:nrow(results.F), function(x) unlist(strsplit(as.character(results.F$cmrGR[x]), split=":"))[1])
+ranges=sapply(1:nrow(results.F), function(x) unlist(strsplit(as.character(results.F$cmrGR[x]), split=":"))[2])
+start=as.numeric(sapply(1:length(ranges), function(x) unlist(strsplit(ranges[x], split="-"))[1]))
+end=as.numeric(sapply(1:length(ranges), function(x) unlist(strsplit(ranges[x], split="-"))[2]))
+length(refCMR_var_gr <- GRanges(seqnames=seqnames, ranges=IRanges(start=start, end=end))) #29,363
+
+length(subsetByOverlaps(refCMR_var_gr, sCMR_gr)) #279 reference CMRs with partial overlap
+
+#CMRs passing adjDB > 0.03 and FDR < 0.05
+seqnames=sapply(1:nrow(results.F[results.F$threshold_adjDB==TRUE,]), function(x) unlist(strsplit(as.character(results.F[results.F$threshold_adjDB==TRUE,]$cmrGR[x]), split=":"))[1])
+ranges=sapply(1:nrow(results.F[results.F$threshold_adjDB==TRUE,]), function(x) unlist(strsplit(as.character(results.F[results.F$threshold_adjDB==TRUE,]$cmrGR[x]), split=":"))[2])
+start=as.numeric(sapply(1:length(ranges), function(x) unlist(strsplit(ranges[x], split="-"))[1]))
+end=as.numeric(sapply(1:length(ranges), function(x) unlist(strsplit(ranges[x], split="-"))[2]))
+length(DM_CMR_gr <- GRanges(seqnames=seqnames, ranges=IRanges(start=start, end=end))) #69
+
+length(subsetByOverlaps(DM_CMR_gr, sCMR_gr)) #0 differentially methylated reference CMRs with partial overlap
+
+source('~/2-EWAS_CMRs/TERRE/sex_EWAS/sCMRs_overlap_perm.R')
+sCMRs_overlap_perm(sig_CMR_gr=DM_CMR_gr, ref_CMR_gr=refCMR_var_gr, sex_CMR_gr=sCMR_gr)
+#[1] "Permutation P values for enrichment and depletion"
+#[1] "Enrichment: 1; Depletion 0.495"
+```
+
+### Males
+```{r overlap M, eval=F}
+### exact overlap
+length(sCMRs$cmr[sCMRs$cmr %in% results.M$cmr]) #152 reference CMRs with exact overlap
+nrow(results.M[results.M$threshold_adjDB==TRUE & results.M$cmr %in% sCMRs$cmr,]) #0 differentially methylated CMRs with exact overlap
+
+### partial overlap
+seqnames=sapply(1:nrow(sCMRs), function(x) unlist(strsplit(as.character(sCMRs$cmrGR[x]), split=":"))[1])
+ranges=sapply(1:nrow(sCMRs), function(x) unlist(strsplit(as.character(sCMRs$cmrGR[x]), split=":"))[2])
+start=as.numeric(sapply(1:length(ranges), function(x) unlist(strsplit(ranges[x], split="-"))[1]))
+end=as.numeric(sapply(1:length(ranges), function(x) unlist(strsplit(ranges[x], split="-"))[2]))
+length(sCMR_gr <- GRanges(seqnames=seqnames, ranges=IRanges(start=start, end=end))) #179
+
+seqnames=sapply(1:nrow(results.M), function(x) unlist(strsplit(as.character(results.M$cmrGR[x]), split=":"))[1])
+ranges=sapply(1:nrow(results.M), function(x) unlist(strsplit(as.character(results.M$cmrGR[x]), split=":"))[2])
+start=as.numeric(sapply(1:length(ranges), function(x) unlist(strsplit(ranges[x], split="-"))[1]))
+end=as.numeric(sapply(1:length(ranges), function(x) unlist(strsplit(ranges[x], split="-"))[2]))
+length(refCMR_var_gr <- GRanges(seqnames=seqnames, ranges=IRanges(start=start, end=end))) #29,190
+
+length(subsetByOverlaps(refCMR_var_gr, sCMR_gr)) #275 reference CMRs with partial overlap
+
+seqnames=sapply(1:nrow(results.M[results.M$threshold_adjDB==TRUE,]), function(x) unlist(strsplit(as.character(results.M[results.M$threshold_adjDB==TRUE,]$cmrGR[x]), split=":"))[1])
+ranges=sapply(1:nrow(results.M[results.M$threshold_adjDB==TRUE,]), function(x) unlist(strsplit(as.character(results.M[results.M$threshold_adjDB==TRUE,]$cmrGR[x]), split=":"))[2])
+start=as.numeric(sapply(1:length(ranges), function(x) unlist(strsplit(ranges[x], split="-"))[1]))
+end=as.numeric(sapply(1:length(ranges), function(x) unlist(strsplit(ranges[x], split="-"))[2]))
+length(DM_CMR_gr <- GRanges(seqnames=seqnames, ranges=IRanges(start=start, end=end))) #2
+
+length(subsetByOverlaps(DM_CMR_gr, sCMR_gr)) #0 differentially methylated reference CMRs with partial overlap
+
+sCMRs_overlap_perm(sig_CMR_gr=DM_CMR_gr, ref_CMR_gr=refCMR_var_gr, sex_CMR_gr=sCMR_gr)
+#[1] "Permutation P values for enrichment and depletion"
+#[1] "Enrichment: 1; Depletion 0.99"
+```
