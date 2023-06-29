@@ -1,0 +1,59 @@
+---
+title: "Downloading PD GEO Data"
+author: "Samantha Schaffner"
+date: '2022-09-28'
+output: html_document
+---
+
+## Pulling Data From GEO
+
+Methylome-wide association studies conducted in blood, comparing PD patients and controls, with public data:
+
+Chuang et al., 2017
+
+Vallerga et al., 2020
+
+Henderson et al., 2021
+
+### Chuang 2017
+```{r}
+library(GEOquery)
+Chuang_Mat <- getGEO("GSE111629", destdir= "~/4-replication/Chuang_2017")
+Chuang_eSet <- Chuang_Mat[[1]]
+meta <- pData(Chuang_eSet)
+write.csv(meta, file="~/4-replication/Chuang_2017/Chuang_2017_meta.csv", row.names=F)
+
+getGEOSuppFiles("GSE111629", baseDir="~/4-replication/Chuang_2017/")
+untar("GSE111629/GSE111629_RAW.tar", exdir = "GSE111629/idat")
+head(list.files("GSE111629/idat", pattern = "idat"))
+idatFiles <- list.files("GSE111629/idat", pattern = "idat.gz$", full = TRUE)
+sapply(idatFiles, gunzip, overwrite = TRUE)
+```
+
+### Vallerga 2020
+```{r}
+Vallerga_Mat <- getGEO("GSE145361", destdir= "~/4-replication/Vallerga_2020")
+Vallerga_eSet <- Vallerga_Mat[[1]]
+meta <- pData(Vallerga_eSet)
+write.csv(meta, file="~/4-replication/Vallerga_2020/Vallerga_2020_meta.csv", row.names=F)
+
+getGEOSuppFiles("GSE145361", baseDir="~/4-replication/Vallerga_2020/")
+untar("Vallerga_2020/GSE145361/GSE145361_RAW.tar", exdir = "Vallerga_2020/GSE145361/idat")
+head(list.files("Vallerga_2020/GSE145361/idat", pattern = "idat"))
+idatFiles <- list.files("Vallerga_2020/GSE145361/idat", pattern = "idat.gz$", full = TRUE)
+sapply(idatFiles, gunzip, overwrite = TRUE)
+```
+
+### Henderson 2021
+```{r}
+Henderson_Mat <- getGEO("GSE165081", destdir= "~/4-replication/Henderson_2021")
+Henderson_eSet <- Henderson_Mat[[1]]
+meta <- pData(Henderson_eSet)
+write.csv(meta, file="~/4-replication/Henderson_2021/Henderson_2021_meta.csv", row.names=F)
+
+getGEOSuppFiles("GSE165081", baseDir="~/4-replication/Henderson_2021/")
+untar("Henderson_2021/GSE165081/GSE165081_RAW.tar", exdir = "Henderson_2021/GSE165081/idat")
+head(list.files("Henderson_2021/GSE165081/idat", pattern = "idat"))
+idatFiles <- list.files("Henderson_2021/GSE165081/idat", pattern = "idat.gz$", full = TRUE)
+sapply(idatFiles, gunzip, overwrite = TRUE)
+```
