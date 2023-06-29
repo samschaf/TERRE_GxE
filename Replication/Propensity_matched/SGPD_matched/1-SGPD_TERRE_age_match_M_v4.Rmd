@@ -1,0 +1,192 @@
+---
+itle: "SGPD_Matching"
+author: "SS"
+date: "03/02/2023"
+output:
+  html_document:
+    df_print: paged
+  rmdformats::readthedown:
+    fig_caption: yes
+    gallery: no
+    highlight: kate
+    lightbox: yes
+    self_contained: yes
+    thumbnails: no
+---
+SGPD Propensity Matching
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: Mar 2, 2023
+
+From the MatchIt vignette:
+
+"MatchIt implements the suggestions of Ho et al. (2007) for improving parametric statistical models for estimating treatment effects in observational studies and reducing model dependence by preprocessing data with semi-parametric and non-parametric matching methods. After appropriately preprocessing with MatchIt, researchers can use whatever parametric model they would have used without MatchIt and produce inferences that are more robust and less sensitive to modeling assumptions...
+
+...The goal of matching is to produce **covariate balance**, that is, for the distributions of covariates in the two groups to be approximately equal to each other, as they would be in a successful randomized experiment."
+
+Apr 18, 2023: Bugs were reported with MatchIt version 4.5.1 and 4.5.2 (version 4.5.1 was used here originally). Here I've updated MatchIt to the latest release (4.5.3) where bugs were fixed, and will re-run this script to check if it changes any results.
+
+### Libraries and outside functions
+```{r results='hide', warning=FALSE, message=FALSE, eval=F}
+setwd("~/")
+library(MatchIt)
+library(optmatch)
+library(car)
+library(DescTools)
+library(Rglpk)
+```
+
+# Matching in males
+
+## Checking initial imbalances
+
+Values of standardized mean differences and eCDF statistics close to zero and values of variance ratios close to one indicate good balance.
+
+```{r intial check F, eval=F}
+smoking <- read.csv("~/4-replication/predicted_smoking/pred_smoking_all_cohorts.csv")
+SGPD_meta <- read.csv("~/4-replication/Vallerga_2020/preprocessing/SGPD_meta_celltypePCs_age.csv")
+smoking_SGPD <- smoking[match(SGPD_meta$Sample_Name, smoking$Sample_Name),]
+all.equal(smoking_SGPD$Sample_Name,SGPD_meta$Sample_Name) #TRUE
+SGPD_meta$smokingScore <- smoking_SGPD$smokingScore
+
+SGPD_meta_sub <- SGPD_meta[,c("reportedSex","disease.state.ch1","age","smokingScore","Neu","Sample_Name")]
+colnames(SGPD_meta_sub)[2:3] <- c("PD","age")
+SGPD_meta_sub$PD <- as.character(SGPD_meta_sub$PD)
+SGPD_meta_sub[SGPD_meta_sub$PD=="Parkinson's disease","PD"] <- "Case"
+#SGPD_meta_sub[SGPD_meta_sub$PD=="Control","PD"] <- "Control"
+SGPD_meta_sub$cohort <- "SGPD"
+
+TERRE_meta <- read.csv("~/1-preprocessing/TERRE/terre_meta_extcelltypePCs2_ancestryPCs_complete.csv") #includes individuals with matched genotype only, includes extended cell types estimation only
+meta2 <- read.csv("~/1-preprocessing/TERRE/terre_meta_cellprop_ext2_02272023.csv") #includes individuals without genotype, and 6-cell type reference estimations (want to use the latter estimation for matching with other cohorts so the reference is consistent)
+meta2 <- meta2[match(TERRE_meta$Sample_Name, meta2$Sample_Name),]
+all.equal(meta2$Sample_Name, TERRE_meta$Sample_Name) #TRUE
+TERRE_meta$Neu <- meta2$Neu
+smoking_TERRE <- smoking[match(TERRE_meta$Sample_Name, smoking$Sample_Name),]
+all.equal(smoking_TERRE$Sample_Name,TERRE_meta$Sample_Name) #TRUE
+TERRE_meta$smokingScore <- smoking_TERRE$smokingScore
+
+TERRE_meta_sub <- TERRE_meta[complete.cases(TERRE_meta$smoking),c("reportedSex","PD","age","smokingScore","Neu","Sample_Name")]
+TERRE_meta_sub$PD <- gsub(0, "Control", gsub(1, "Case", TERRE_meta_sub$PD))
+TERRE_meta_sub$cohort <- "TERRE"
+
+meta_combined <- rbind(SGPD_meta_sub, TERRE_meta_sub)
+meta_combined$cohort <- as.factor(meta_combined$cohort)
+meta_combined$cohort <- reorder.factor(meta_combined$cohort, new.order=c("TERRE","SGPD"))
+
+meta_M <- meta_combined[meta_combined$reportedSex=="M",]
+summary(meta_M[,c("cohort","age","smokingScore","Neu")])
+#178 missing values for age in SGPD
+#subset to those with complete age data (778 SGPD)
+meta_M <- meta_M[complete.cases(meta_M$age),]
+
+#create a matchit object relating the treatment to the covariates
+M.out0 <- summary(matchit(cohort ~ age + smokingScore + Neu, data = meta_M,
+                 method = NULL, distance = "glm"))$sum.all
+
+M.out0
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio  eCDF Mean  eCDF Max Std. Pair Dist.
+#distance         0.8848104     0.7594702      1.40797252  0.3632008 0.25796461 0.4239902              NA
+#age             67.7416452    68.0240838     -0.03183702  1.8586605 0.06283146 0.1753301              NA
+#smokingScore    -1.8119220    -4.4618345      0.75943620  0.6560492 0.22588841 0.3693739              NA
+#Neu              0.5999905     0.5659011      0.25991838  1.7620393 0.09624668 0.2023441              NA
+```
+
+## Matching within SGPD PD cases/controls
+
+"Optimal" pair matching aims to make the overall means comparable between groups. This is a good way of making two populations more similar to each other, without forcing each individual in the population to be similar.
+```{r matching F, eval=F}
+SGPD_M <- meta_M[meta_M$cohort=="SGPD",]
+SGPD_M$PD <- as.factor(SGPD_M$PD)
+
+M.out3 <- matchit(PD ~ age + smokingScore + Neu, data = SGPD_M, method = "optimal", distance = "glm", link="probit")
+
+summary(M.out3)
+#Summary of Balance for All Data:
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio eCDF Mean eCDF Max
+#distance            0.4549        0.3626          0.6242     1.1794    0.1821   0.2983
+#age                67.9325       67.6146          0.0375     0.8620    0.0126   0.0385
+#smokingScore       -0.8973       -2.4210          0.4003     1.4882    0.1190   0.1977
+#Neu                 0.5587        0.6275         -0.5479     0.9654    0.1664   0.2791
+#
+#Summary of Balance for Matched Data:
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio eCDF Mean eCDF Max Std. Pair Dist.
+#distance            0.4549        0.4201          0.2356     1.3293    0.0556   0.1511          0.2391
+#age                67.9325       67.7588          0.0205     0.9053    0.0080   0.0225          1.1690
+#smokingScore       -0.8973       -1.4464          0.1443     1.5552    0.0411   0.1029          0.7951
+#Neu                 0.5587        0.5833         -0.1958     1.0006    0.0638   0.1415          0.7193
+#
+#Sample Sizes:
+#          Control Treated
+#All           467     311
+#Matched       311     311
+#Unmatched     156       0
+#Discarded       0       0
+
+png("~/4-replication/Vallerga_2020/validation_matched/male/eQQ_SGPD_M_probit_optimal_smoking.png")
+plot(M.out3, type = "qq", interactive = FALSE)
+dev.off()
+
+png("~/4-replication/Vallerga_2020/validation_matched/male/loveplot_SGPD_M_probit_optimal_smoking.png")
+plot(summary(M.out3), xlim=c(-0.1,2), main="SGPD male case-control matching")
+dev.off()
+
+nrow(SGPD_M_matched <- match.data(M.out3)) #622
+summary(as.factor(SGPD_M$PD))
+#   Case Control 
+#    467     311 
+    
+summary(as.factor(SGPD_M_matched$PD))
+#   Case Control 
+#    311     311 
+    
+meta_M_2 <- rbind(meta_M[meta_M$cohort=="TERRE",], as.data.frame(SGPD_M_matched[,1:7]))
+```
+![eQQ plots in SGPD males: probit link function](/home1/NEURO/schaffner/4-replication/Vallerga_2020/validation_matched/male/eQQ_SGPD_M_probit_optimal_smoking.png)
+
+![Standardized mean difference in SGPD males: probit link function](/home1/NEURO/schaffner/4-replication/Vallerga_2020/validation_matched/male/loveplot_SGPD_M_probit_optimal_smoking.png)
+
+## Matching for age across cohorts
+
+```{r matching F, eval=F}
+meta_M_2$cohort <- reorder.factor(meta_M_2$cohort, new.order=c("SGPD","TERRE"))
+M.out3 <- matchit(cohort ~ age + smokingScore + Neu, data = meta_M_2, method = "optimal", distance = "glm", link="probit", ratio=4)
+
+summary(M.out3)
+#Summary of Balance for Matched Data:
+#             Means Treated Means Control Std. Mean Diff. Var. Ratio eCDF Mean eCDF Max Std. Pair Dist.
+#distance            0.2676        0.1683          0.7211     2.4846    0.1798   0.3814          0.7220
+#age                68.0241       67.6992          0.0499     0.5613    0.0631   0.1653          1.3121
+#smokingScore       -4.4618       -2.1426         -0.5383     1.7921    0.1826   0.3898          0.6138
+#Neu                 0.5659        0.5580          0.0798     0.6319    0.0463   0.0932          1.2702
+#
+#Sample Sizes:
+#          Control Treated
+#All           622     118
+#Matched       472     118
+#Unmatched     150       0
+#Discarded       0       0
+
+png("~/4-replication/Vallerga_2020/validation_matched/male/eQQ_TERRE_SGPD_M_probit_optimal.png")
+plot(M.out3, type = "qq", interactive = FALSE)
+dev.off()
+
+png("~/4-replication/Vallerga_2020/validation_matched/male/loveplot_TERRE_SGPD_M_probit_optimal.png")
+plot(summary(M.out3), xlim=c(-0.1,2), main="TERRE and SGPD male matching")
+dev.off()
+
+nrow(meta_M_matched <- match.data(M.out3)) #590
+table(meta_M_matched$PD, meta_M_matched$cohort)
+#          SGPD TERRE
+#  Case     243    38
+#  Control  229    80
+```
+![eQQ plots in TERRE and SGPD males: probit link function](/home1/NEURO/schaffner/4-replication/Vallerga_2020/validation_matched/male/eQQ_TERRE_SGPD_M_probit_optimal.png)
+
+![Standardized mean difference in TERRE and SGPD males: probit link function](/home1/NEURO/schaffner/4-replication/Vallerga_2020/validation_matched/male/loveplot_TERRE_SGPD_M_probit_optimal.png)
+
+## Saving matched metadata
+
+```{r save, eval=F}
+write.csv(meta_M_matched, file="~/4-replication/Vallerga_2020/validation_matched/male/TERRE_SGPD_meta_M_matched_probit.csv", row.names=F)
+```
