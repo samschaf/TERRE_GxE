@@ -1,0 +1,267 @@
+# EpiSmokEr predicted smoking status in DIGPD, PEG1, and SGPD
+## Oct 26, 2022
+
+Reference: https://www.futuremedicine.com/doi/10.2217/epi-2019-0206 
+
+R package: https://github.com/sailalithabollepalli/EpiSmokEr
+
+Vignette: http://htmlpreview.github.io/?https://github.com/sailalithabollepalli/EpiSmokEr/blob/master/vignettes/epismoker.html
+
+## Libraries
+```{r libraries, eval=F}
+library("EpiSmokEr")
+library(ggplot2)
+#library(methylumi)
+library(ggpubr)
+```
+
+## Smoking score (SSc)
+
+This uses 187 CpGs to calculate a smoking score (Elliot et al. 2014). Smoking score is highest for current smokers, and slightly higher in former smokers than never smokers.
+
+### DIG-PD
+
+```{r DIGPD, eval=F}
+load("~/1-preprocessing/DIGPD/082022/DIGPD_RG_filtered.RData")
+DIGPD_meta <- read.csv("~/1-preprocessing/DIGPD/082022/digpd_meta_visit1_celltypePCs_ancestryPCs_nomut.csv")
+dim(betas <- getBeta(DIGPD_RG_filtered[,sampleNames(DIGPD_RG_filtered) %in% as.character(DIGPD_meta$Sample_Name)])) #803734    222
+
+#sample sheet
+#rownames as sample IDs
+#"sex" column where 1 = male and 2 = female
+rownames(DIGPD_meta) <- DIGPD_meta$Sample_Name
+colnames(DIGPD_meta)
+colnames(DIGPD_meta)[4] <- "sex"
+summary(as.factor(DIGPD_meta$sex))
+#  F   M 
+# 93 129 
+DIGPD_meta$sex <- as.integer(gsub("M", 1, gsub("F", 2, DIGPD_meta$sex)))
+str(DIGPD_meta$sex)
+summary(as.factor(DIGPD_meta$sex))
+#  1   2 
+#129  93 
+
+DIGPD_meta$Sample_Name <- as.character(DIGPD_meta$Sample_Name)
+
+DIGPD_SSc <- epismoker(dataset = betas, samplesheet=DIGPD_meta, method = "SSc")
+#Dataset has 170 of 187 CpGs required for smoking status estimation.
+
+all.equal(as.character(DIGPD_SSc$SampleName), DIGPD_meta$Sample_Name)
+DIGPD_SSc <- DIGPD_SSc[match(DIGPD_meta$Sample_Name, DIGPD_SSc$SampleName),]
+all.equal(as.character(DIGPD_SSc$SampleName), DIGPD_meta$Sample_Name) #TRUE
+DIGPD_meta$smokingScore <- DIGPD_SSc[,2]
+
+#plotting smoking score on y-axis, split by smoking status. Shape is PD status and colour is sex.
+DIGPD_meta$PD <- as.factor(DIGPD_meta$PD)
+DIGPD_meta$PD <- gsub(0, "Control", gsub(1, "Case", DIGPD_meta$PD))
+DIGPD_meta$sex_cat <- as.factor(DIGPD_meta$sex)
+DIGPD_meta$sex_cat <- gsub(2, "Female", gsub(1, "Male", DIGPD_meta$sex_cat))
+DIGPD_meta$smoking <- gsub(1, "Never Smoker", gsub(2, "Former Smoker", gsub(3, "Current Smoker", DIGPD_meta$smoking)))
+
+png("~/4-replication/predicted_smoking/DIGPD_smoking_by_sex.png")
+ggboxplot(DIGPD_meta, y="smokingScore", x="smoking", add="jitter", facet.by="sex_cat") + theme_bw() + theme(axis.text.x=element_text(angle=90)) + stat_compare_means(method="anova")
+dev.off()
+
+png("~/4-replication/predicted_smoking/DIGPD_smoking.png")
+ggboxplot(DIGPD_meta, y="smokingScore", x="smoking", add="jitter") + theme_bw() + theme(axis.text.x=element_text(angle=90)) + stat_compare_means(method="anova")
+dev.off()
+
+png("~/4-replication/predicted_smoking/DIGPD_pred_smoking_by_sex_PD.png")
+ggboxplot(DIGPD_meta, y="smokingScore", x="PD", add="jitter", facet.by="sex_cat") + theme_bw() + theme(axis.text.x=element_text(angle=90)) + stat_compare_means(method="anova")
+dev.off()
+
+png("~/4-replication/predicted_smoking/DIGPD_pred_smoking_by_PD.png")
+ggboxplot(DIGPD_meta, y="smokingScore", x="PD", add="jitter") + theme_bw() + theme(axis.text.x=element_text(angle=90)) + stat_compare_means(method="anova")
+dev.off()
+```
+![Smoking score in DIGPD compared to reported smoking status](/home1/NEURO/schaffner/4-replication/predicted_smoking/DIGPD_smoking_by_sex.png)
+
+Recorded smoking status here is only for PD cases, and the score seems to separate never/former/current smokers well. The "NA" category is the controls, which seems to include a range of scores, with the median similar to that of former smokers.
+
+![Smoking score in DIGPD, by sex and PD status](/home1/NEURO/schaffner/4-replication/predicted_smoking/DIGPD_pred_smoking_by_sex_PD.png)
+
+Male controls have higher predicted smoking than male PD cases. Predicted smoking score is similar between female cases and controls.
+
+### PEG1
+
+```{r PEG1, eval=F}
+rm(betas, DIGPD_RG_filtered)
+
+load("~/4-replication/Chuang_2017/PEG1_betas_combat.RData")
+PEG1_meta <- read.csv("~/4-replication/Chuang_2017/PEG1_meta_celltypePCs.csv")
+all.equal(colnames(betas_combat),as.character(PEG1_meta$Sample_Name)) #TRUE
+dim(betas_combat) #424263    539
+
+#sample sheet
+#rownames as sample IDs
+#"sex" column where 1 = male and 2 = female
+rownames(PEG1_meta) <- PEG1_meta$Sample_Name
+colnames(PEG1_meta)
+colnames(PEG1_meta)[42] <- "sex"
+summary(as.factor(PEG1_meta$sex))
+#  F   M 
+#232 307 
+PEG1_meta$sex <- as.integer(gsub("M", 1, gsub("F", 2, PEG1_meta$sex)))
+str(PEG1_meta$sex)
+summary(as.factor(PEG1_meta$sex))
+#  1   2 
+#307 232 
+
+PEG1_meta$Sample_Name <- as.character(PEG1_meta$Sample_Name)
+
+PEG1_SSc <- epismoker(dataset = betas_combat, samplesheet=PEG1_meta, method = "SSc")
+#Dataset has 176 of 187 CpGs required for smoking status estimation.
+
+all.equal(as.character(PEG1_SSc$SampleName), PEG1_meta$Sample_Name) #TRUE
+PEG1_meta$smokingScore <- PEG1_SSc[,2]
+
+#plotting smoking score on y-axis, split by smoking status. Shape is PD status and colour is sex.
+colnames(PEG1_meta)[40] <- "PD"
+PEG1_meta$PD <- gsub("PD-free control", "Control", gsub("Parkinson's disease (PD)", "Case", PEG1_meta$PD))
+PEG1_meta$PD <- gsub("Parkinson's disease (PD)", "Case", PEG1_meta$PD)
+
+PEG1_meta$sex_cat <- as.factor(PEG1_meta$sex)
+PEG1_meta$sex_cat <- gsub(2, "Female", gsub(1, "Male", PEG1_meta$sex_cat))
+
+png("~/4-replication/predicted_smoking/PEG1_pred_smoking_by_sex_PD.png")
+ggboxplot(PEG1_meta, y="smokingScore", x="PD", add="jitter", facet.by="sex_cat") + theme_bw() + theme(axis.text.x=element_text(angle=90)) + stat_compare_means(method="anova")
+dev.off()
+
+png("~/4-replication/predicted_smoking/PEG1_pred_smoking_by_PD.png")
+ggboxplot(PEG1_meta, y="smokingScore", x="PD", add="jitter") + theme_bw() + theme(axis.text.x=element_text(angle=90)) + stat_compare_means(method="anova")
+dev.off()
+```
+![Smoking score in PEG1, by sex and PD status](/home1/NEURO/schaffner/4-replication/predicted_smoking/PEG1_pred_smoking_by_sex_PD.png)
+
+Like in DIG-PD, male controls have higher predicted smoking than male PD cases. Predicted smoking score is also slightly higher in female controls but there is no significant case-control difference.
+
+### SGPD
+
+```{r SGPD, eval=F}
+load("~/4-replication/Vallerga_2020/SGPD_betas_combat.RData")
+SGPD_meta <- read.csv("~/4-replication/Vallerga_2020/SGPD_meta_celltypePCs.csv")
+all.equal(colnames(betas_combat),as.character(SGPD_meta$Sample_Name)) #TRUE
+dim(betas_combat) #424699   1751
+
+#sample sheet
+#rownames as sample IDs
+#"sex" column where 1 = male and 2 = female
+rownames(SGPD_meta) <- SGPD_meta$Sample_Name
+colnames(SGPD_meta)
+colnames(SGPD_meta)[34] <- "sex"
+summary(as.factor(SGPD_meta$sex))
+#  F   M 
+#795 956 
+SGPD_meta$sex <- as.integer(gsub("M", 1, gsub("F", 2, SGPD_meta$sex)))
+str(SGPD_meta$sex)
+summary(as.factor(SGPD_meta$sex))
+#  1   2 
+#956 795 
+
+SGPD_meta$Sample_Name <- as.character(SGPD_meta$Sample_Name)
+
+SGPD_SSc <- epismoker(dataset = betas_combat, samplesheet=SGPD_meta, method = "SSc")
+#Dataset has 176 of 187 CpGs required for smoking status estimation.
+
+all.equal(as.character(SGPD_SSc$SampleName), SGPD_meta$Sample_Name) #TRUE
+SGPD_meta$smokingScore <- SGPD_SSc[,2]
+
+#plotting smoking score on y-axis, split by smoking status. Shape is PD status and colour is sex.
+colnames(SGPD_meta)[33] <- "PD"
+SGPD_meta$PD <- gsub("Parkinson's disease", "Case", SGPD_meta$PD)
+
+SGPD_meta$sex_cat <- as.factor(SGPD_meta$sex)
+SGPD_meta$sex_cat <- gsub(2, "Female", gsub(1, "Male", SGPD_meta$sex_cat))
+
+png("~/4-replication/predicted_smoking/SGPD_pred_smoking_by_sex_PD.png")
+ggboxplot(SGPD_meta, y="smokingScore", x="PD", add="jitter", facet.by="sex_cat") + theme_bw() + theme(axis.text.x=element_text(angle=90)) + stat_compare_means(method="anova")
+dev.off()
+
+png("~/4-replication/predicted_smoking/SGPD_pred_smoking_by_PD.png")
+ggboxplot(SGPD_meta, y="smokingScore", x="PD", add="jitter") + theme_bw() + theme(axis.text.x=element_text(angle=90)) + stat_compare_means(method="anova")
+dev.off()
+```
+![Smoking score in SGPD, by sex and PD status](/home1/NEURO/schaffner/4-replication/predicted_smoking/SGPD_pred_smoking_by_sex_PD.png)
+
+Yet again we see controls with a higher smoking score than PD cases, with the effect stronger in males than females. Females reach significance here, likely because of the huge n.
+
+### TERRE
+
+```{r TERRE, eval=F}
+load("~/1-preprocessing/TERRE/normalized_filtered/TERRE_RG_filtered.RData")
+TERRE_meta <- read.csv("~/1-preprocessing/TERRE/normalized_filtered/terre_meta_extcelltypePCs_ancestryPCs_complete.csv")
+dim(betas <- getBeta(PD_RG_filtered[,sampleNames(PD_RG_filtered) %in% as.character(TERRE_meta$patient)])) #803777    219
+
+#sample sheet
+#rownames as sample IDs
+#"sex" column where 1 = male and 2 = female
+rownames(TERRE_meta) <- TERRE_meta$patient
+colnames(TERRE_meta)[7] <- "sex"
+summary(as.factor(TERRE_meta$sex))
+#  F   M 
+#100 119 
+TERRE_meta$sex <- as.integer(gsub("M", 1, gsub("F", 2, TERRE_meta$sex)))
+str(TERRE_meta$sex)
+summary(as.factor(TERRE_meta$sex))
+#  1   2 
+#119 100 
+
+TERRE_SSc <- epismoker(dataset = betas, samplesheet=TERRE_meta, method = "SSc")
+#Dataset has 170 of 187 CpGs required for smoking status estimation.
+
+all.equal(as.character(TERRE_SSc$SampleName), as.character(TERRE_meta$patient)) #TRUE
+TERRE_meta$smokingScore <- TERRE_SSc[,2]
+
+#plotting smoking score on y-axis, split by smoking status. Shape is PD status and colour is sex.
+TERRE_meta$PD <- as.factor(TERRE_meta$PD)
+TERRE_meta$PD <- gsub(0, "Control", gsub(1, "Case", TERRE_meta$PD))
+TERRE_meta$sex_cat <- as.factor(TERRE_meta$sex)
+TERRE_meta$sex_cat <- gsub(2, "Female", gsub(1, "Male", TERRE_meta$sex_cat))
+```
+
+## Comparison within sexes, across cohorts
+
+### Females
+```{r cross cohort F, eval=F}
+DIGPD_meta_sub <- DIGPD_meta[,c("sex_cat","PD","smokingScore","Sample_Name")]
+DIGPD_meta_sub$cohort <- "DIG-PD"
+PEG1_meta_sub <- PEG1_meta[,c("sex_cat","PD","smokingScore","Sample_Name")]
+PEG1_meta_sub[PEG1_meta_sub$PD=="Parkinson's disease (PD)","PD"] <- "Case"
+PEG1_meta_sub$cohort <- "PEG1"
+SGPD_meta_sub <- SGPD_meta[,c("sex_cat","PD","smokingScore","Sample_Name")]
+SGPD_meta_sub$cohort <- "SGPD"
+TERRE_meta_sub <- TERRE_meta[,c("sex_cat","PD","smokingScore","Sample_Name")]
+TERRE_meta_sub$cohort <- "TERRE"
+
+meta_combined <- rbind(DIGPD_meta_sub, PEG1_meta_sub, SGPD_meta_sub, TERRE_meta_sub)
+meta_combined$cohort <- as.factor(meta_combined$cohort)
+library(DescTools)
+meta_combined$cohort <- reorder.factor(meta_combined$cohort, new.order=c("TERRE","DIG-PD","PEG1","SGPD"))
+
+png("~/4-replication/predicted_smoking/pred_smoking_by_cohort_F.png")
+comparisons <- list(c("TERRE","DIG-PD"),c("TERRE","PEG1"),c("TERRE","SGPD"))
+ggboxplot(meta_combined[meta_combined$sex_cat=="Female",], y="smokingScore", x="cohort", add="jitter", facet.by="PD", color="lightpink4") + theme_bw() + theme(axis.text.x=element_text(angle=90)) + stat_compare_means(comparisons=comparisons) + ggtitle("Smoking score in females") 
+dev.off()
+
+png("~/4-replication/predicted_smoking/pred_smoking_by_cohort_M.png")
+comparisons <- list(c("TERRE","DIG-PD"),c("TERRE","PEG1"),c("TERRE","SGPD"))
+ggboxplot(meta_combined[meta_combined$sex_cat=="Male",], y="smokingScore", x="cohort", add="jitter", facet.by="PD", color="lightsteelblue4") + theme_bw() + theme(axis.text.x=element_text(angle=90)) + stat_compare_means(comparisons=comparisons) + ggtitle("Smoking score in males") 
+dev.off()
+
+png("~/4-replication/predicted_smoking/pred_smoking_by_cohort_sex_grouped.png")
+ggboxplot(meta_combined, y="smokingScore", x="sex_cat", facet.by="cohort", color="sex_cat", add="jitter", palette=c("lightsteelblue2","lightpink2")) + theme_bw() + theme(axis.text.x=element_text(angle=90)) + stat_compare_means(label.y=18)
+dev.off()
+
+write.csv(meta_combined, file="~/4-replication/predicted_smoking/pred_smoking_all_cohorts.csv", row.names=F)
+```
+![Smoking score in females from different cohorts, split by PD status](/home1/NEURO/schaffner/4-replication/predicted_smoking/pred_smoking_by_cohort_F.png)
+
+Smoking score looks similar between TERRE and DIG-PD, is higher in PEG1, and still higher in SGPD.
+
+![Smoking score in males from different cohorts, split by PD status](/home1/NEURO/schaffner/4-replication/predicted_smoking/pred_smoking_by_cohort_M.png)
+
+For PD cases, smoking score is similar between TERRE and DIG-PD and higher in PEG1 and SGPD. For controls, it is higher in DIG-PD, then PEG1, then SGPD.
+
+![Male/female smoking score difference within each cohort](/home1/NEURO/schaffner/4-replication/predicted_smoking/pred_smoking_by_cohort_sex_grouped.png)
+
+--

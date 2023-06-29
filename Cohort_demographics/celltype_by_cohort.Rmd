@@ -1,0 +1,120 @@
+# Cell type shifts in PD: comparisons across cohorts, within each sex
+## Nov 28, 2022
+
+## Libraries
+```{r libraries, eval=F}
+library(ggplot2)
+library(ggpubr)
+library(DescTools)
+library(reshape2)
+#library(rstatix)
+```
+
+## Comparison within sexes, across cohorts
+
+```{r cross cohort F, eval=F}
+DIGPD_meta <- read.csv("~/1-preprocessing/DIGPD/082022/digpd_meta_visit1_celltypePCs_ancestryPCs_nomut.csv")
+DIGPD_meta_sub <- DIGPD_meta[,c("reportedSex","PD","CD8T","CD4T","NK","Bcell","Mono","Neu")]
+DIGPD_meta_sub$PD <- gsub(0, "Control", gsub(1, "Case", DIGPD_meta_sub$PD))
+DIGPD_meta_sub$cohort <- "DIG-PD"
+
+PEG1_meta <- read.csv("~/4-replication/Chuang_2017/PEG1_meta_celltypePCs.csv")
+PEG1_meta_sub <- PEG1_meta[,c("reportedSex","disease.state.ch1","CD8T","CD4T","NK","Bcell","Mono","Neu")]
+colnames(PEG1_meta_sub)[2] <- "PD"
+PEG1_meta_sub$PD <- gsub("PD-free control", "Control", PEG1_meta_sub$PD)
+PEG1_meta_sub[PEG1_meta_sub$PD=="Parkinson's disease (PD)","PD"] <- "Case"
+PEG1_meta_sub$cohort <- "PEG1"
+
+SGPD_meta <- read.csv("~/4-replication/Vallerga_2020/SGPD_meta_celltypePCs.csv")
+SGPD_meta_sub <- SGPD_meta[,c("reportedSex","disease.state.ch1","CD8T","CD4T","NK","Bcell","Mono","Neu")]
+colnames(SGPD_meta_sub)[2] <- "PD"
+SGPD_meta_sub$PD <- gsub("Parkinson's disease", "Case", SGPD_meta_sub$PD)
+SGPD_meta_sub$cohort <- "SGPD"
+
+TERRE_meta <- read.csv("~/1-preprocessing/TERRE/normalized_filtered/terre_meta_extcelltypePCs2_ancestryPCs_complete.csv")
+TERRE_meta_sub <- TERRE_meta[,c("reportedSex","PD","CD8T","CD4T","NK","Bcell","Mono","Neu")]
+TERRE_meta_sub$PD <- gsub(0, "Control", gsub(1, "Case", TERRE_meta_sub$PD))
+TERRE_meta_sub$cohort <- "TERRE"
+
+meta_combined <- rbind(DIGPD_meta_sub, PEG1_meta_sub, SGPD_meta_sub, TERRE_meta_sub)
+meta_combined$cohort <- as.factor(meta_combined$cohort)
+meta_combined$cohort <- reorder.factor(meta_combined$cohort, new.order=c("TERRE","DIG-PD","PEG1","SGPD"))
+
+celltype_melt <- melt(meta_combined, id.vars=c("cohort","reportedSex","PD"))
+
+ttest_F <- compare_means(value ~ PD, p.adjust.method = "BH", method='t.test', data = celltype_melt[celltype_melt$reportedSex=="F",], group.by=c("cohort","variable"))
+ttest_F$lab <- ttest_F$p.signif
+ttest_F[ttest_F$p.adj>0.05,"lab"] <- "ns"
+ttest_F[ttest_F$p.adj<=0.05,"lab"] <- "*"
+ttest_F[ttest_F$p.adj<=0.01,"lab"] <- "**"
+ttest_F[ttest_F$p.adj<=0.001,"lab"] <- "**"
+
+ggboxplot(celltype_melt[celltype_melt$reportedSex=="F",], y="value", x="variable", facet.by="cohort", color="PD") + scale_color_manual(values=c("lightpink4","lightpink2")) + theme_bw() + theme(axis.text.x=element_text(angle=90), axis.title.x=element_blank()) + stat_pvalue_manual(ttest_F, label = "lab", y.position=0.92, x="variable", hide.ns=TRUE, size=5) + ggtitle("Case-control cell type differences in females") + ylab("Predicted proportion") 
+
+ttest_M <- compare_means(value ~ PD, p.adjust.method = "BH", method='t.test', data = celltype_melt[celltype_melt$reportedSex=="M",], group.by=c("cohort","variable"))
+ttest_M$lab <- ttest_M$p.signif
+ttest_M[ttest_M$p.adj>0.05,"lab"] <- "ns"
+ttest_M[ttest_M$p.adj<=0.05,"lab"] <- "*"
+ttest_M[ttest_M$p.adj<=0.01,"lab"] <- "**"
+ttest_M[ttest_M$p.adj<=0.001,"lab"] <- "**"
+
+ggboxplot(celltype_melt[celltype_melt$reportedSex=="M",], y="value", x="variable", facet.by="cohort", color="PD") + scale_color_manual(values=c("lightsteelblue4","lightsteelblue2")) + theme_bw() + theme(axis.text.x=element_text(angle=90), axis.title.x=element_blank()) + stat_pvalue_manual(ttest_M, label = "lab", y.position=0.92, x="variable", hide.ns=TRUE, size=5) + ggtitle("Case-control cell type differences in males") + ylab("Predicted proportion") 
+```
+![Predicted immune cell proportions in females from different cohorts, split by PD status](/home1/NEURO/schaffner/4-replication/celltype_by_cohort_F.png)
+
+![Predicted immune cell proprotions in males from different cohorts, split by PD status](/home1/NEURO/schaffner/4-replication/celltype_by_cohort_M.png)
+
+## Plotting extended cell types by sex in TERRE
+
+```{r celltype ext, eval=F}
+TERRE_ext <- TERRE_meta[,c(13,7,43:54)]
+colnames(TERRE_ext) <- gsub(".ext2", "", colnames(TERRE_ext))
+TERRE_ext$PD <- gsub(0, "Control", gsub(1, "Case", TERRE_ext$PD))
+TERRE_melt <- melt(TERRE_ext, id.vars=c("PD","reportedSex"))
+
+ttest_F <- compare_means(value ~ PD, p.adjust.method = "BH", method='t.test', data = TERRE_melt[TERRE_melt$reportedSex=="F",], group.by="variable")
+ttest_F$lab <- ttest_F$p.signif
+ttest_F[ttest_F$p.adj>0.05,"lab"] <- "ns"
+#   variable .y.   group1 group2       p p.adj p.format p.signif method lab  
+#   <fct>    <chr> <chr>  <chr>    <dbl> <dbl> <chr>    <chr>    <chr>  <chr>
+# 1 Neu      value Case   Control 0.752   0.82 0.752    ns       T-test ns   
+# 2 Eos      value Case   Control 0.496   0.82 0.496    ns       T-test ns   
+# 3 Bas      value Case   Control 0.861   0.86 0.861    ns       T-test ns   
+# 4 Mono     value Case   Control 0.149   0.82 0.149    ns       T-test ns   
+# 5 Bnv      value Case   Control 0.347   0.82 0.347    ns       T-test ns   
+# 6 Bmem     value Case   Control 0.300   0.82 0.300    ns       T-test ns   
+# 7 CD4nv    value Case   Control 0.418   0.82 0.418    ns       T-test ns   
+# 8 CD4mem   value Case   Control 0.620   0.82 0.620    ns       T-test ns   
+# 9 Treg     value Case   Control 0.359   0.82 0.359    ns       T-test ns   
+#10 CD8nv    value Case   Control 0.751   0.82 0.751    ns       T-test ns   
+#11 CD8mem   value Case   Control 0.736   0.82 0.736    ns       T-test ns   
+#12 NK       value Case   Control 0.0189  0.23 0.019    *        T-test ns 
+
+ggboxplot(TERRE_melt[TERRE_melt$reportedSex=="F",], y="value", x="variable", color="PD") + scale_color_manual(values=c("lightpink4","lightpink2")) + theme_bw() + theme(axis.text.x=element_text(angle=90), axis.title.x=element_blank()) + stat_pvalue_manual(ttest_F, label = "p.adj", y.position=0.98, x="variable", hide.ns=TRUE, size=5) + ggtitle("TERRE case-control cell type differences in females") + ylab("Predicted proportion") + ylim(c(0,1))
+
+ttest_M <- compare_means(value ~ PD, p.adjust.method = "BH", method='t.test', data = TERRE_melt[TERRE_melt$reportedSex=="M",], group.by="variable")
+ttest_M$lab <- ttest_M$p.signif
+ttest_M[ttest_M$p.adj>0.05,"lab"] <- "ns"
+ttest_M[ttest_M$p.adj<=0.05,"lab"] <- "*"
+#   variable .y.   group1  group2      p p.adj p.format p.signif method lab  
+#   <fct>    <chr> <chr>   <chr>   <dbl> <dbl> <chr>    <chr>    <chr>  <chr>
+# 1 Neu      value Control Case   0.0929  0.19 0.093    ns       T-test ns   
+# 2 Eos      value Control Case   0.0590  0.14 0.059    ns       T-test ns   
+# 3 Bas      value Control Case   0.0266  0.14 0.027    *        T-test ns   
+# 4 Mono     value Control Case   0.283   0.42 0.283    ns       T-test ns   
+# 5 Bnv      value Control Case   0.0212  0.14 0.021    *        T-test ns   
+# 6 Bmem     value Control Case   0.676   0.74 0.676    ns       T-test ns   
+# 7 CD4nv    value Control Case   0.0385  0.14 0.038    *        T-test ns   
+# 8 CD4mem   value Control Case   0.186   0.32 0.186    ns       T-test ns   
+# 9 Treg     value Control Case   0.854   0.85 0.854    ns       T-test ns   
+#10 CD8nv    value Control Case   0.0467  0.14 0.047    *        T-test ns   
+#11 CD8mem   value Control Case   0.464   0.56 0.464    ns       T-test ns   
+#12 NK       value Control Case   0.425   0.56 0.425    ns       T-test ns 
+
+ggboxplot(TERRE_melt[TERRE_melt$reportedSex=="M",], y="value", x="variable", color="PD") + scale_color_manual(values=c("lightsteelblue4","lightsteelblue2")) + theme_bw() + theme(axis.text.x=element_text(angle=90), axis.title.x=element_blank()) + stat_pvalue_manual(ttest_M, label = "lab", y.position=0.98, x="variable", hide.ns=TRUE, size=5) + ggtitle("TERRE case-control cell type differences in males") + ylab("Predicted proportion") + ylim(c(0,1))
+```
+![Predicted immune cell proportions in females from TERRE, split by PD status](/home1/NEURO/schaffner/4-replication/celltype_ext_TERRE_F_v2.png)
+
+![Predicted immune cell proprotions in males from TERRE, split by PD status](/home1/NEURO/schaffner/4-replication/celltype_ext_TERRE_M_v2.png)
+
+--

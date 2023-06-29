@@ -1,0 +1,277 @@
+# Demographics tables within TERRE and between cohorts
+### Samantha Schaffner
+### Nov 14, 2022
+
+## Read in data
+```{r}
+meta_T_F <- read.csv("/home1/NEURO/SHARE_DECIPHER/processed_DNAm_data/2022/TERRE_processed_2022/3-terre_meta_F_logit_matched.csv")
+meta_T_F$reportedSex <- "F"
+meta_T_M <- read.csv("/home1/NEURO/SHARE_DECIPHER/processed_DNAm_data/2022/TERRE_processed_2022/3-terre_meta_M_logit_matched.csv")
+meta_T_M$reportedSex <- "M"
+meta_T <- rbind(meta_T_F, meta_T_M)
+meta_T$ethnicity <- as.character(meta_T$ethnicity)
+meta_T_sub <- meta_T[,c("reportedSex", "age", "PD", "dis_duration", "MMS", "levodopa", "agonist", "ethnicity", "edu", "smoking", "pesticides", "head_trauma", "alcohol1")]
+colnames(meta_T_sub)[13] <- "alcohol"
+meta_T_sub$cohort <- "TERRE"
+
+meta_D_F <- read.csv("/home1/NEURO/SHARE_DECIPHER/processed_DNAm_data/2022/DIGPD_processed_2022/3-digpd_meta_visit1_F_logit_matched.csv")
+meta_D_F$reportedSex <- "F"
+meta_D_M <- read.csv("/home1/NEURO/SHARE_DECIPHER/processed_DNAm_data/2022/DIGPD_processed_2022/3-digpd_meta_visit1_M_logit_matched.csv")
+meta_D_M$reportedSex <- "M"
+meta_D <- rbind(meta_D_F, meta_D_M)
+colnames(meta_D)[2] <- "age"
+meta_D$ethnicity <- as.character(meta_D$ethnicity)
+meta_D_sub <- meta_D[,c("reportedSex", "age", "PD", "dis_duration", "MMS", "levodopa", "agonist", "ethnicity", "edu", "smoking", "pesticides", "head_trauma", "alcohol")]
+meta_D_sub$cohort <- "DIG-PD"
+
+meta_P <- read.csv("~/4-replication/Chuang_2017/PEG1_meta_celltypePCs.csv")
+colnames(meta_P)[39:41] <- c("age", "PD", "ethnicity")
+meta_P$PD <- gsub("Parkinson's disease (PD)", 1, gsub("PD-free control", 0, meta_P$PD))
+meta_P$PD[meta_P$PD=="Parkinson's disease (PD)"] <- 1
+meta_P$PD <- as.integer(meta_P$PD)
+meta_P$reportedSex <- as.character(meta_P$reportedSex)
+meta_P$ethnicity <- as.character(meta_P$ethnicity)
+meta_P_sub <- meta_P[,c("reportedSex", "age", "PD")]
+meta_P_sub$dis_duration <- NA
+meta_P_sub$MMS <- NA
+meta_P_sub$levodopa <- NA
+meta_P_sub$agonist <- NA
+meta_P_sub$ethnicity <- meta_P$ethnicity
+meta_P_sub$edu <- NA
+meta_P_sub$smoking <- NA
+meta_P_sub$pesticides <- NA
+meta_P_sub$head_trauma <- NA
+meta_P_sub$alcohol <- NA
+meta_P_sub$cohort <- "PEG1"
+
+meta_S <- read.csv("~/4-replication/Vallerga_2020/SGPD_meta_celltypePCs_age.csv")
+colnames(meta_S)[34] <- "PD"
+meta_S$PD <- gsub("Parkinson's disease", 1, gsub("Control", 0, meta_S$PD))
+meta_S$reportedSex <- as.character(meta_S$reportedSex)
+meta_S_sub <- meta_S[,c("reportedSex", "age", "PD")]
+meta_S_sub$dis_duration <- NA
+meta_S_sub$MMS <- NA
+meta_S_sub$levodopa <- NA
+meta_S_sub$agonist <- NA
+meta_S_sub$ethnicity <- "Caucasian"
+meta_S_sub$edu <- NA
+meta_S_sub$smoking <- NA
+meta_S_sub$pesticides <- NA
+meta_S_sub$head_trauma <- NA
+meta_S_sub$alcohol <- NA
+meta_S_sub$cohort <- "SGPD"
+
+meta_combined <- rbind(meta_T_sub, meta_D_sub, meta_P_sub, meta_S_sub)
+meta_combined$reportedSex <- as.factor(meta_combined$reportedSex)
+meta_combined$PD <- as.factor(meta_combined$PD)
+meta_combined$levodopa <- as.factor(meta_combined$levodopa)
+meta_combined$agonist <- as.factor(meta_combined$agonist)
+meta_combined$ethnicity <- as.factor(meta_combined$ethnicity)
+meta_combined$edu <- as.factor(meta_combined$edu)
+meta_combined$alcohol <- as.factor(meta_combined$alcohol)
+meta_combined$pesticides <- as.factor(meta_combined$pesticides)
+meta_combined$head_trauma <- as.factor(meta_combined$head_trauma)
+meta_combined$cohort <- as.factor(meta_combined$cohort)
+meta_combined$smoking <- as.factor(meta_combined$smoking)
+
+summary(meta_combined[meta_combined$cohort=="TERRE",])
+# reportedSex      age        PD       dis_duration         MMS        levodopa agonist         ethnicity   edu     smoking pesticides
+# F:100       Min.   :41.26   0:147   Min.   :0.0000   Min.   :14.00   0:165    0:165   Caucasian    :215   0:166   1:153   0   : 58  
+# M:118       1st Qu.:63.16   1: 71   1st Qu.:0.3059   1st Qu.:25.00   1: 53    1: 53   Hispanic     :  0   1: 47   2: 50   1   : 39  
+#             Median :68.24           Median :0.6140   Median :28.00                    North_African:  3   2:  5   3: 15   2   :101  
+#             Mean   :66.93           Mean   :0.6562   Mean   :26.83                    Other        :  0                   NA's: 20  
+#             3rd Qu.:71.44           3rd Qu.:0.9654   3rd Qu.:29.00                                                                  
+#             Max.   :76.38           Max.   :1.4586   Max.   :99.00                                                                  
+#                                     NA's   :147                                                                                     
+# head_trauma alcohol    cohort   
+# 0:184       1:37    DIG-PD:  0  
+# 1: 34       2:75    PEG1  :  0  
+#             3:20    SGPD  :  0  
+#             4:86    TERRE :218 
+
+summary(meta_combined[meta_combined$cohort=="DIG-PD",])
+# reportedSex      age        PD       dis_duration         MMS        levodopa   agonist            ethnicity     edu      smoking    pesticides
+# F: 93       Min.   :29.95   0:112   Min.   :0.1013   Min.   :21.00   0   : 58   0   : 45   Caucasian    :104   0   : 19   1   : 60   0   : 73  
+# M:129       1st Qu.:55.70   1:110   1st Qu.:0.6858   1st Qu.:27.00   1   : 52   1   : 65   Hispanic     :  0   1   : 42   2   : 36   1   : 23  
+#             Median :62.80           Median :1.2375   Median :29.00   NA's:112   NA's:112   North_African:  3   2   : 47   3   : 10   2   :  1  
+#             Mean   :61.60           Mean   :1.1664   Mean   :28.36                         Other        :  3   NA's:114   NA's:116   NA's:125  
+#             3rd Qu.:68.76           3rd Qu.:1.6277   3rd Qu.:30.00                         NA's         :112                                   
+#             Max.   :85.40           Max.   :2.0561   Max.   :30.00                                                                             
+#                                     NA's   :112      NA's   :114                                                                               
+# head_trauma alcohol       cohort   
+# 0   : 88    1   : 13   DIG-PD:222  
+# 1   : 18    2   : 44   PEG1  :  0  
+# NA's:116    3   : 48   SGPD  :  0  
+#             4   :  0   TERRE :  0  
+#             NA's:117               
+                                    
+summary(meta_combined[meta_combined$cohort=="PEG1",])
+# reportedSex      age        PD       dis_duration      MMS      levodopa   agonist            ethnicity     edu      smoking    pesticides
+# F:232       Min.   :35.00   0:227   Min.   : NA   Min.   : NA   0   :  0   0   :  0   Caucasian    :481   0   :  0   1   :  0   0   :  0  
+# M:307       1st Qu.:63.00   1:312   1st Qu.: NA   1st Qu.: NA   1   :  0   1   :  0   Hispanic     : 58   1   :  0   2   :  0   1   :  0  
+#             Median :72.00           Median : NA   Median : NA   NA's:539   NA's:539   North_African:  0   2   :  0   3   :  0   2   :  0  
+#             Mean   :69.06           Mean   :NaN   Mean   :NaN                         Other        :  0   NA's:539   NA's:539   NA's:539  
+#             3rd Qu.:77.00           3rd Qu.: NA   3rd Qu.: NA                                                                             
+#             Max.   :92.00           Max.   : NA   Max.   : NA                                                                             
+#                                     NA's   :539   NA's   :539                                                                             
+# head_trauma alcohol       cohort   
+# 0   :  0    1   :  0   DIG-PD:  0  
+# 1   :  0    2   :  0   PEG1  :539  
+# NA's:539    3   :  0   SGPD  :  0  
+#             4   :  0   TERRE :  0  
+#             NA's:539                                 
+
+summary(meta_combined[meta_combined$cohort=="SGPD",])
+# reportedSex      age         PD       dis_duration       MMS       levodopa    agonist             ethnicity      edu       smoking    
+# F:795       Min.   : 25.00   0:858   Min.   : NA    Min.   : NA    0   :   0   0   :   0   Caucasian    :1751   0   :   0   1   :   0  
+# M:956       1st Qu.: 61.00   1:893   1st Qu.: NA    1st Qu.: NA    1   :   0   1   :   0   Hispanic     :   0   1   :   0   2   :   0  
+#             Median : 68.00           Median : NA    Median : NA    NA's:1751   NA's:1751   North_African:   0   2   :   0   3   :   0  
+#             Mean   : 67.17           Mean   :NaN    Mean   :NaN                            Other        :   0   NA's:1751   NA's:1751  
+#             3rd Qu.: 74.00           3rd Qu.: NA    3rd Qu.: NA                                                                        
+#             Max.   :104.00           Max.   : NA    Max.   : NA                                                                        
+#             NA's   :361              NA's   :1751   NA's   :1751                                                                       
+# pesticides  head_trauma alcohol        cohort    
+# 0   :   0   0   :   0   1   :   0   DIG-PD:   0  
+# 1   :   0   1   :   0   2   :   0   PEG1  :   0  
+# 2   :   0   NA's:1751   3   :   0   SGPD  :1751  
+# NA's:1751               4   :   0   TERRE :   0  
+#                         NA's:1751  
+```
+
+## Test differences
+```{r}
+#for categorical data, must be the same length
+#sample 218 individuals from DIGPD
+
+#variables available in all cohorts
+meta_T_D <- meta_combined[meta_combined$cohort %in% c("TERRE","DIG-PD"),]
+meta_T_D$cohort <- as.factor(as.character(meta_T_D$cohort))
+table(meta_T_D$PD, meta_T_D$cohort) #contingency table (sanity check)
+#    DIG-PD TERRE
+#  0    112   147
+#  1    110    71
+chisq.test(meta_T_D$PD, meta_T_D$cohort)
+#X-squared = 12.406, df = 1, p-value = 0.000428
+
+####### PD status
+chisq.test(meta_combined$PD, meta_combined$cohort)$p.value #1.075545e-08
+chisq.test(meta_combined[meta_combined$cohort %in% c("TERRE","DIG-PD"),"PD"], meta_combined[meta_combined$cohort %in% c("TERRE","DIG-PD"),"cohort"])$p.value #0.0004279835
+chisq.test(meta_combined[meta_combined$cohort %in% c("TERRE","PEG1"),"PD"], meta_combined[meta_combined$cohort %in% c("TERRE","PEG1"),"cohort"])$p.value #4.714215e-10
+chisq.test(meta_combined[meta_combined$cohort %in% c("TERRE","SGPD"),"PD"], meta_combined[meta_combined$cohort %in% c("TERRE","SGPD"),"cohort"])$p.value #4.156389e-07
+
+####### sex
+chisq.test(meta_combined$reportedSex, meta_combined$cohort)$p.value #0.6197756
+chisq.test(meta_combined[meta_combined$cohort %in% c("TERRE","DIG-PD"),"reportedSex"], meta_combined[meta_combined$cohort %in% c("TERRE","DIG-PD"),"cohort"])$p.value #0.4562539
+chisq.test(meta_combined[meta_combined$cohort %in% c("TERRE","PEG1"),"reportedSex"], meta_combined[meta_combined$cohort %in% c("TERRE","PEG1"),"cohort"])$p.value #0.5290928
+chisq.test(meta_combined[meta_combined$cohort %in% c("TERRE","SGPD"),"reportedSex"], meta_combined[meta_combined$cohort %in% c("TERRE","SGPD"),"cohort"])$p.value #0.9529465
+
+####### age
+aov <- aov(meta_combined$age ~ meta_combined$cohort)
+summary(aov)[[1]]$`Pr(>F)`[1]
+#[1] 9.581267e-20
+TukeyHSD(aov)
+#                  diff       lwr        upr     p adj
+#PEG1-DIG-PD   7.460733  5.471349  9.4501174 0.0000000
+#SGPD-DIG-PD   5.578040  3.775039  7.3810399 0.0000000
+#TERRE-DIG-PD  5.329593  2.951007  7.7081781 0.0000001
+#SGPD-PEG1    -1.882694 -3.148483 -0.6169043 0.0007768
+#TERRE-PEG1   -2.131141 -4.133410 -0.1288716 0.0317688
+#TERRE-SGPD   -0.248447 -2.065655  1.5687606 0.9851023
+
+demog <- data.frame(variable=colnames(meta_T_sub), pvalue=c(t.test(meta_T_sub$age, meta_D_sub$age)$p.value, chisq.test(meta_T_sub$men, sample(meta_D_sub$men, 260))$p.value, t.test(meta_T_sub$age_onset, meta_D_sub$age_onset)$p.value, t.test(meta_T_sub$dis_duration, meta_D_sub$dis_duration)$p.value, chisq.test(meta_T_sub$PD, sample(meta_D_sub$PD, 260))$p.value, t.test(meta_T_sub$MMS, meta_D_sub$MMS)$p.value, chisq.test(meta_T_sub$levodopa, sample(meta_D_sub$levodopa, 260))$p.value, chisq.test(meta_T_sub$agonist, sample(meta_D_sub$agonist, 260))$p.value))
+demog$pval_round <- round(demog$pvalue, 3)
+
+#for PD-only variables
+meta_T_PD <- meta_T_sub[meta_T_sub$PD=="1",-5]
+meta_D_PD <- meta_D_sub[meta_D_sub$PD=="1",-5]
+
+demog2 <- data.frame(variable=paste(colnames(meta_T_PD),"PD", sep="_"), pvalue=c(t.test(meta_T_PD$age, meta_D_PD$age)$p.value, chisq.test(meta_T_PD$men, sample(meta_D_PD$men, 87))$p.value, t.test(meta_T_PD$age_onset, meta_D_PD$age_onset)$p.value, t.test(meta_T_PD$dis_duration, meta_D_PD$dis_duration)$p.value, t.test(meta_T_PD$MMS, meta_D_PD$MMS)$p.value, chisq.test(meta_T_PD$levodopa, sample(meta_D_PD$levodopa, 87))$p.value, chisq.test(meta_T_PD$agonist, sample(meta_D_PD$agonist, 87))$p.value))
+demog2$pval_round <- round(demog2$pvalue, 3)
+
+demog <- rbind(demog, demog2)
+write.csv(demog, file="~/cohort_demographic_differences.csv")
+```
+
+
+## Create tables
+```{r}
+#Subset to samples with genotyping
+meta_T <- meta_T[complete.cases(meta_T$ancestryPC1),]
+summary(as.factor(meta_T$PD)) #71 cases, 147 controls
+
+colnames(meta_T)
+
+#select relevant columns
+meta_T <- meta_T[,c(1,3,4,5,6,7,8,9,10,11,12,13,14,20,21:26,29,49:60)]
+colnames(meta_T)
+# [1] "levodopa"     "age"          "dis_duration" "age_onset"    "edu"          "reportedSex" 
+# [7] "smoking"      "pesticides"   "head_trauma"  "MMS"          "time_sto"     "PD"          
+#[13] "agonist"      "bmi"          "marital"      "alcohol1"     "alcohol2"     "alcohol3"    
+#[19] "alcohol4"     "alcohol5"     "ethnicity"    "Neu.ext"      "Eos.ext"      "Bas.ext"     
+#[25] "Mono.ext"     "Bnv.ext"      "Bmem.ext"     "CD4nv.ext"    "CD4mem.ext"   "Treg.ext"    
+#[31] "CD8nv.ext"    "CD8mem.ext"   "NK.ext"  
+
+#reorder
+meta_T <- meta_T[,c(12,2,4,3,6,21,1,13,5,7,8,9,10,14,16:20,15,22:33,11)]
+colnames(meta_T)
+# [1] "PD"           "age"          "age_onset"    "dis_duration" "reportedSex"  "ethnicity"   
+# [7] "levodopa"     "agonist"      "edu"          "smoking"      "pesticides"   "head_trauma" 
+#[13] "MMS"          "bmi"          "alcohol1"     "alcohol2"     "alcohol3"     "alcohol4"    
+#[19] "alcohol5"     "marital"      "Neu.ext"      "Eos.ext"      "Bas.ext"      "Mono.ext"    
+#[25] "Bnv.ext"      "Bmem.ext"     "CD4nv.ext"    "CD4mem.ext"   "Treg.ext"     "CD8nv.ext"   
+#[31] "CD8mem.ext"   "NK.ext"       "time_sto"  
+
+#change categorical variables to factors (can ignore sex and PD for now)
+meta_T$levodopa <- as.factor(meta_T$levodopa)
+meta_T$agonist <- as.factor(meta_T$agonist)
+meta_T$edu <- as.factor(meta_T$edu)
+meta_T$smoking <- as.factor(meta_T$smoking)
+meta_T$pesticides <- as.factor(meta_T$pesticides)
+meta_T$head_trauma <- as.factor(meta_T$head_trauma)
+meta_T$alcohol1 <- as.factor(meta_T$alcohol1)
+meta_T$alcohol5 <- as.factor(meta_T$alcohol5)
+meta_T$marital <- as.factor(meta_T$marital)
+
+#rename variables
+colnames(meta_T)[15:19] <- c("Alcohol consumption","Glasses wine per week","Glasses beer per week","Glasses aperitif per week","Change in alcohol consumption")
+meta_T$`Alcohol consumption` <- gsub(1, "Never", gsub(2, "Occasionally", gsub(3, "Regulary", gsub(4, "Daily", meta_T$`Alcohol consumption`))))
+meta_T$`Alcohol consumption` <- as.factor(meta_T$`Alcohol consumption`)
+meta_T$`Change in alcohol consumption` <- gsub(0, "No", gsub(1, "Decreased", gsub(2, "Increased", meta_T$`Change in alcohol consumption`)))
+meta_T$`Change in alcohol consumption` <- as.factor(meta_T$`Change in alcohol consumption`)
+
+meta_T$marital <- as.factor(gsub(0, "Married", gsub(1, "Single", gsub(2, "Divorced, Separated, or Widowed", meta_T$marital))))
+meta_T$smoking <- as.factor(gsub(1,"Never",gsub(2,"Former",gsub(3,"Current",meta_T$smoking))))
+meta_T$pesticides <- as.factor(gsub(0,"None",gsub(1,"Gardening",gsub(2,"Professional",meta_T$pesticides))))
+meta_T$edu <- as.factor(gsub(0,"None to secondary school (age 13)", gsub(1,"High school (age 18)", gsub(2, "University", meta_T$edu))))
+
+colnames(meta_T)
+colnames(meta_T)[c(2:4,6:14,20:32)] <- c("Age", "Age of onset", "Disease duration (years)", "Ethnicity", "Levodopa", "Dopamine agonist", "Education level", "Smoking status", "Overall pesticide exposure", "Head trauma", "Mini-mental state exam", "BMI", "Marital status", "Predicted neutrophil proportion", "Predicted eosinophil proportion", "Predicted basophil proportion", "Predicted monocyte proportion", "Predicted naive B cell proportion", "Predicted memory B cell proportion", "Predicted CD4+ naive T cell proportion", "Predicted CD4+ memory T cell proportion", "Predicted regulatory T cell proportion", "Predicted CD8+ naive T cell proportion", "Predicted CD8+ memory T cell proportion", "Predicted NK cell proportion")
+meta_T$Ethnicity <- gsub("North_African", "North African", meta_T$Ethnicity)
+meta_T$Levodopa <- gsub(0, "No", gsub(1, "Yes", meta_T$Levodopa))
+meta_T$`Dopamine agonist` <- gsub(0, "No", gsub(1, "Yes", meta_T$`Dopamine agonist`))
+meta_T$`Glasses wine per week` <- as.numeric(meta_T$`Glasses wine per week`)
+
+meta_T_cat <- meta_T[,c(1,5,6,7,8,9,10,11,12,15,19,20)]
+meta_T_cont <- meta_T[,c(1,5,2,3,4,13,14,16,17,18,21:32)]
+meta_T_cont$`Age of onset` <- as.numeric(meta_T_cont$`Age of onset`)
+meta_T_cont
+
+#categorical variables: percent
+meta_T_F_case <- meta_T_cat[meta_T_cat$reportedSex=="F" & meta_T_cat$PD==1,-c(1,2)]
+meta_T_F_ctrl <- meta_T_cat[meta_T_cat$reportedSex=="F" & meta_T_cat$PD==0,-c(1,2)]
+meta_T_M_case <- meta_T_cat[meta_T_cat$reportedSex=="M" & meta_T_cat$PD==1,-c(1,2)]
+meta_T_M_ctrl <- meta_T_cat[meta_T_cat$reportedSex=="M" & meta_T_cat$PD==0,-c(1,2)]
+
+library(gtsummary)
+tbl_summary(meta_T_F_ctrl)
+
+#continous variables
+meta_T_F_case <- meta_T_cont[meta_T_cont$reportedSex=="F" & meta_T_cont$PD==1,-c(1,2)]
+meta_T_F_ctrl <- meta_T_cont[meta_T_cont$reportedSex=="F" & meta_T_cont$PD==0,-c(1,2)]
+meta_T_M_case <- meta_T_cont[meta_T_cont$reportedSex=="M" & meta_T_cont$PD==1,-c(1,2)]
+meta_T_M_ctrl <- meta_T_cont[meta_T_cont$reportedSex=="M" & meta_T_cont$PD==0,-c(1,2)]
+
+````
+
+
+
