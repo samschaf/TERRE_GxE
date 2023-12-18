@@ -1,0 +1,145 @@
+TERRE Sensitivity Analysis: Levodopa Dosage
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: Oct 20, 2023
+  
+The *TERRE* cohort (subset containing n=88 cases and n=177 controls) consists of French agricultural workers enrolled in the Mutualite Sociale Agricole health insurance system. All PD cases in this subset of data have a disease duration of one year or less. 
+
+In October 2023, Alexis Elbaz sent information on levodopa daily dosage for PD cases. Here I will check whether CMR DNAm is associated with LED within PD cases, as a sensitivity analysis.
+
+## Libraries
+```{r libraries, eval=F}
+setwd("/home1/NEURO/schaffner/")
+library(minfi)
+library(dplyr)
+library(ggplot2)
+library(DescTools)
+library(reshape2)
+library(MASS)
+library(sfsmisc)
+library(gridExtra)
+library(ggrepel)
+library(car)
+```
+
+## Sensitivity analysis in females
+
+Due to the small number of patients on levodopa with LED information (17 total), I will run a simple model correcting for only age, batch, and the first cell type PC.
+```{r female, eval=F}
+meta_F <- read.csv("~/1-preprocessing/TERRE/propensity_matching/terre_meta_F_probit_matched_4.5.3_LED.csv")
+meta_F_PDlevo <- meta_F[complete.cases(meta_F$led_levodopa),] #22 cases
+
+load("~/2-EWAS_CMRs/TERRE/refCMR_medB_F_var.RData")
+dim(refCMR_medB_F_PDlevo <- refCMR_medB_F_var[match(meta_F_PDlevo$patient,rownames(refCMR_medB_F_var)),]) #22 29363
+
+#get DM-CMR list
+CMRs_F <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_F_hits_BH0.05_adjDB0.03_042023.csv")
+dim(refCMR_medB_F_PDlevo <- refCMR_medB_F_PDlevo[,match(CMRs_F$TargetID,colnames(refCMR_medB_F_PDlevo))]) #22 69
+
+#check models with LED
+summary(meta_F_PDlevo[,c("led_levodopa","age","alcohol1","smoking","head_trauma","plate","SentrixPosition_A")])
+#remove smoking (all patients on levodopa have a value of 1 = never smoker)
+#also removed row, due to small number of participants
+
+vif(lm(refCMR_medB_F_PDlevo[,1] ~ meta_F_PDlevo$led_levodopa + meta_F_PDlevo$age + meta_F_PDlevo$alcohol1 + meta_F_PDlevo$head_trauma + meta_F_PDlevo$CTP_PC1 + meta_F_PDlevo$CTP_PC2 + meta_F_PDlevo$CTP_PC3 + meta_F_PDlevo$CTP_PC4 + meta_F_PDlevo$CTP_PC5 + meta_F_PDlevo$CTP_PC6 + meta_F_PDlevo$ancestryPC1 + meta_F_PDlevo$ancestryPC2 + meta_F_PDlevo$ancestryPC3 + meta_F_PDlevo$plate))
+#meta_F_PDlevo$led_levodopa          meta_F_PDlevo$age     meta_F_PDlevo$alcohol1  meta_F_PDlevo$head_trauma 
+#                  5.971874                   6.628680                   3.024537                   7.857275 
+#     meta_F_PDlevo$CTP_PC1      meta_F_PDlevo$CTP_PC2      meta_F_PDlevo$CTP_PC3      meta_F_PDlevo$CTP_PC4 
+#                  3.224647                   8.089449                   8.489843                   4.369415 
+#     meta_F_PDlevo$CTP_PC5      meta_F_PDlevo$CTP_PC6  meta_F_PDlevo$ancestryPC1  meta_F_PDlevo$ancestryPC2 
+#                  5.241741                   3.723360                   2.729935                   1.608618 
+# meta_F_PDlevo$ancestryPC3        meta_F_PDlevo$plate 
+#                  1.956210                   3.993659 
+
+#removing head trauma, alcohol
+vif(lm(refCMR_medB_F_PDlevo[,1] ~ meta_F_PDlevo$led_levodopa + meta_F_PDlevo$age + meta_F_PDlevo$CTP_PC1 + meta_F_PDlevo$CTP_PC2 + meta_F_PDlevo$CTP_PC3 + meta_F_PDlevo$CTP_PC4 + meta_F_PDlevo$CTP_PC5 + meta_F_PDlevo$CTP_PC6 + meta_F_PDlevo$ancestryPC1 + meta_F_PDlevo$ancestryPC2 + meta_F_PDlevo$ancestryPC3 + meta_F_PDlevo$plate))
+#meta_F_PDlevo$led_levodopa          meta_F_PDlevo$age      meta_F_PDlevo$CTP_PC1      meta_F_PDlevo$CTP_PC2 
+#                  2.575087                   2.624385                   1.644257                   4.769071 
+#     meta_F_PDlevo$CTP_PC3      meta_F_PDlevo$CTP_PC4      meta_F_PDlevo$CTP_PC5      meta_F_PDlevo$CTP_PC6 
+#                 4.033568                   1.953681                   2.603070                   2.309520 
+# meta_F_PDlevo$ancestryPC1  meta_F_PDlevo$ancestryPC2  meta_F_PDlevo$ancestryPC3        meta_F_PDlevo$plate 
+#                  1.559666                   1.464228                   1.872202                   3.843655 
+
+#basic model: age, batch, and one cell type PC
+vif(lm(refCMR_medB_F_PDlevo[,1] ~ meta_F_PDlevo$led_levodopa + meta_F_PDlevo$age + meta_F_PDlevo$CTP_PC1 + meta_F_PDlevo$plate))
+#meta_F_PDlevo$led_levodopa          meta_F_PDlevo$age      meta_F_PDlevo$CTP_PC1        meta_F_PDlevo$plate 
+#                  1.161871                   1.477283                   1.133341                   1.562852 
+
+#basic model: age, batch, and 6 cell type PCs
+vif(lm(refCMR_medB_F_PDlevo[,1] ~ meta_F_PDlevo$led_levodopa + meta_F_PDlevo$age + meta_F_PDlevo$CTP_PC1 + meta_F_PDlevo$CTP_PC2 + meta_F_PDlevo$CTP_PC3 + meta_F_PDlevo$CTP_PC4 + meta_F_PDlevo$CTP_PC5 + meta_F_PDlevo$CTP_PC6 + meta_F_PDlevo$plate))
+#meta_F_PDlevo$led_levodopa          meta_F_PDlevo$age      meta_F_PDlevo$CTP_PC1      meta_F_PDlevo$CTP_PC2 
+#                  2.121009                   2.340842                   1.383378                   4.136829 
+#     meta_F_PDlevo$CTP_PC3      meta_F_PDlevo$CTP_PC4      meta_F_PDlevo$CTP_PC5      meta_F_PDlevo$CTP_PC6 
+#                  3.532753                   1.664437                   2.373056                   1.902191 
+#       meta_F_PDlevo$plate 
+#                  3.638211 
+
+#run EWAS for LED
+rlm_pvals_F <- lapply(1:ncol(refCMR_medB_F_PDlevo), function(x) {
+ RLM <- rlm(refCMR_medB_F_PDlevo[,x] ~ meta_F_PDlevo$led_levodopa + meta_F_PDlevo$age + meta_F_PDlevo$CTP_PC1 + meta_F_PDlevo$plate, psi = psi.huber, maxit=500)
+  return(f.robftest(RLM, var = names(RLM$coefficients)[2])$p.value)
+})
+
+results.F <- as.data.frame(do.call(rbind, rlm_pvals_F))
+rownames(results.F) <- colnames(refCMR_medB_F_PDlevo)
+names(results.F)[1] <- "pval"
+results.F$adjP_BH <- p.adjust(results.F$pval, method="BH")
+results.F$TargetID <- rownames(results.F)
+
+nrow(results.F[results.F$adjP_BH<=0.05,]) #0
+summary(results.F$adjP_BH)
+#   Min. 1st Qu.  Median    Mean 3rd Qu.    Max. 
+# 0.4849  0.6973  0.8403  0.8151  0.9644  0.9896 
+```
+
+There were no associations between levodopa daily dosage and CMR DNA methylation in females (padj > 0.4).
+
+## Sensitivity analysis in males
+
+Due to the small number of patients on levodopa with LED information (18 total), I will run a simple model correcting for only age, batch, and the first cell type PC.
+```{r male, eval=F}
+meta_M <- read.csv("~/1-preprocessing/TERRE/propensity_matching/terre_meta_M_probit_matched_4.5.3_LED.csv")
+meta_M_PDlevo <- meta_M[complete.cases(meta_M$led_levodopa),] #20 cases
+
+load("~/2-EWAS_CMRs/TERRE/refCMR_medB_M_var.RData")
+dim(refCMR_medB_M_PDlevo <- refCMR_medB_M_var[match(meta_M_PDlevo$patient,rownames(refCMR_medB_M_var)),]) #20 29190
+
+#get DM-CMR list
+CMRs_M <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_M_hits_BH0.05_adjDB0.03_042023.csv")
+dim(refCMR_medB_M_PDlevo <- refCMR_medB_M_PDlevo[,match(CMRs_M$TargetID,colnames(refCMR_medB_M_PDlevo))]) #20 2
+
+#basic model: age and one cell type PC
+vif(lm(refCMR_medB_M_PDlevo[,1] ~ meta_M_PDlevo$led_levodopa + meta_M_PDlevo$age + meta_M_PDlevo$CTP_PC1 + meta_M_PDlevo$plate))
+#meta_M_PDlevo$led_levodopa          meta_M_PDlevo$age      meta_M_PDlevo$CTP_PC1        meta_M_PDlevo$plate 
+#                  1.343428                   1.338127                   1.467901                   1.542229 
+
+#run EWAS for LED
+rlm_pvals_M <- lapply(1:ncol(refCMR_medB_M_PDlevo), function(x) {
+ RLM <- rlm(refCMR_medB_M_PDlevo[,x] ~ meta_M_PDlevo$led_levodopa + meta_M_PDlevo$age + meta_M_PDlevo$CTP_PC1 + meta_M_PDlevo$plate, psi = psi.huber, maxit=500)
+  return(f.robftest(RLM, var = names(RLM$coefficients)[2])$p.value)
+})
+
+results.M <- as.data.frame(do.call(rbind, rlm_pvals_M))
+rownames(results.M) <- colnames(refCMR_medB_M_PDlevo)
+names(results.M)[1] <- "pval"
+results.M$adjP_BH <- p.adjust(results.M$pval, method="BH")
+results.M$TargetID <- rownames(results.M)
+
+coefs_M <- lapply(1:ncol(refCMR_medB_M_PDlevo), function(x) {
+ rlm(refCMR_medB_M_PDlevo[,x] ~ meta_M_PDlevo$led_levodopa + meta_M_PDlevo$age + meta_M_PDlevo$CTP_PC1 + meta_M_PDlevo$plate, psi = psi.huber, maxit=500)$coefficients[2]
+})
+all(names(coefs_M)==rownames(results.M)) #TRUE
+results.M$adjDB <- unlist(coefs_M)
+
+results.M
+#                pval    adjP_BH   TargetID        adjDB
+#cg04749306 0.0105422 0.02108441 cg04749306 1.448759e-04
+#cg06192961 0.4050075 0.40500753 cg06192961 6.893017e-05
+
+CMRs_M[CMRs_M$TargetID=="cg04749306",c("adjP_BH","adjDB","geneSymbol","cmrGR")]
+#     adjP_BH      adjDB geneSymbol                   cmrGR
+#1 0.01935978 0.04661313  ANO8,DDA1 chr19:17433773-17434268
+```
+
+Levodopa daily dosage was associated with median CMR beta for the ANO8/DDA1 CMR in males (padj = 0.02).

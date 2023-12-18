@@ -1,0 +1,77 @@
+
+TERRE Differential DNAm Analysis
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: Oct 20, 2023
+  
+The *TERRE* cohort (subset containing n=88 cases and n=177 controls) consists of French agricultural workers enrolled in the Mutualite Sociale Agricole health insurance system. All PD cases in this subset of data have a disease duration of one year or less. 
+
+In this script I will perform EWAS in TERRE using the blood reference CMRs from the EPIC array, with median betas calculated within each sex of TERRE (see ~/2-EWAS_CMRs/TERRE/TERRE_models.Rmd). I will take random subsets of males and females, to perform a null EWAS. This will reveal how many CMRs are picked up by chance in differential methylation analysis using these sample sizes.
+
+## Loading Libraries
+```{r libraries, eval=F}
+setwd("/home1/NEURO/schaffner/")
+library(dplyr)
+library(MASS)
+library(sfsmisc)
+source("~/2-EWAS_CMRs/TERRE/sensitivity_analyses/CMR_rlm_perm.R")
+```
+
+
+# Null EWAS with sexes stratified
+
+## Females
+
+```{r rlm F, eval = F}
+meta_F <- read.csv("~/1-preprocessing/TERRE/propensity_matching/terre_meta_F_probit_matched_4.5.3.csv")
+load("~/2-EWAS_CMRs/TERRE/refCMR_medB_F_var.RData")
+all(meta_F$patient==rownames(refCMR_medB_F_var)) #TRUE
+
+#check formatting of meta data
+str(meta_F[,c("age","smoking","head_trauma","alcohol1","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5","CTP_PC6","ancestryPC1","ancestryPC2","ancestryPC3","plate","SentrixPosition_A")])
+meta_F$smoking <- as.factor(meta_F$smoking)
+meta_F$head_trauma <- as.factor(meta_F$head_trauma)
+meta_F$alcohol1 <- as.factor(meta_F$alcohol1)
+meta_F$plate <- as.factor(meta_F$plate)
+
+#run permutation
+#this will shuffle the PD labels on every iteration, running the full EWAS model without weights
+#p-value is returned for whether the number of DM-CMRs (adjDB>0.03, padj<0.05) is greater or less than expected by change
+#system.time(perm <- CMR_rlm_perm(refCMR_medB_F_var, meta_F, nDM_CMRs=69, nperm=10)) #1 hour per 10 permutations
+#[1] "Permutation P values"
+#[1] "Enrichment: 0; Depletion 1"
+
+#perm <- CMR_rlm_perm(refCMR_medB_F_var, meta_F, nDM_CMRs=69, nperm=100)
+#[1] "Permutation P values"
+#[1] "Enrichment: 0; Depletion 1"
+
+perm_f <- CMR_rlm_perm(refCMR_medB_F_var, meta_F, nDM_CMRs=69, nperm=1000)
+#[1] "Permutation P values"
+#[1] "Enrichment: 0.006; Depletion 0.994"
+```
+
+## Males
+
+```{r rlm F, eval = F}
+meta_M <- read.csv("~/1-preprocessing/TERRE/propensity_matching/terre_meta_M_probit_matched_4.5.3.csv")
+load("~/2-EWAS_CMRs/TERRE/refCMR_medB_M_var.RData")
+all(meta_M$patient==rownames(refCMR_medB_M_var)) #TRUE
+
+#check formatting of meta data
+str(meta_M[,c("age","smoking","head_trauma","alcohol1","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5","CTP_PC6","ancestryPC1","ancestryPC2","ancestryPC3","plate","SentrixPosition_A")])
+meta_M$smoking <- as.factor(meta_M$smoking)
+meta_M$head_trauma <- as.factor(meta_M$head_trauma)
+meta_M$alcohol1 <- as.factor(meta_M$alcohol1)
+meta_M$plate <- as.factor(meta_M$plate)
+
+#run permutation
+#this will shuffle the PD labels on every iteration, running the full EWAS model without weights
+#p-value is returned for whether the number of DM-CMRs (adjDB>0.03, padj<0.05) is greater or less than expected by change
+#perm <- CMR_rlm_perm(refCMR_medB_M_var, meta_M, nDM_CMRs=2, nperm=100)
+#[1] "Permutation P values"
+#[1] "Enrichment: 0.06; Depletion 1"
+
+perm_m <- CMR_rlm_perm(refCMR_medB_M_var, meta_M, nDM_CMRs=2, nperm=1000)
+#"Enrichment: 0.022; Depletion 0.984"
+```

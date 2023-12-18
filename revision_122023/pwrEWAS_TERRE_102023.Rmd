@@ -1,0 +1,93 @@
+TERRE Power Analysis
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: Oct 25, 2023
+
+Here, the pwrEWAS tool will be used to simulate sex-stratified differential methylation analysis in TERRE, with the same sample sizes, effect sizes, number of data points tested, and tissue. The below code is adapted from "The pwrEWAS User's Guide" (Graw & Koestler).
+
+
+## Libraries
+
+```{r library, eval=F}
+library("pwrEWAS")
+```
+
+## Approximating TERRE study
+
+Treating CMRs like single CpGs: 30k tested, expecting 70 differentially methylated at DB > 0.03 and FDR < 0.05 (similar to females result)
+
+```{r usage, eval=F}
+results_30k_70 <- pwrEWAS(minTotSampleSize = 100,
+    maxTotSampleSize = 500,
+    SampleSizeSteps = 100,
+    NcntPer = 0.7,
+    targetDelta = c(0.03, 0.05, 0.1, 0.2),
+    J = 30000,
+    targetDmCpGs = 70,
+    tissueType = "Blood adult",
+    detectionLimit = 0.03,
+    DMmethod = "limma",
+    FDRcritVal = 0.05,
+    core = 6,
+    sims = 50)
+
+results <- (results_30k_70$meanPower)
+#         0.03      0.05       0.1       0.2
+#100 0.7850851 0.7827507 0.7831954 0.8659500
+#200 0.8811953 0.9094186 0.9206540 0.9501895
+#300 0.8990765 0.9595077 0.9574007 0.9751402
+#400 0.9242792 0.9665036 0.9768188 0.9821548
+#500 0.9287450 0.9813237 0.9876308 0.9912890
+
+write.csv(results, file="~/KoborLab/kobor_space/sschaffner/misc/pwrEWAS_results_30k_70.csv")
+
+# with exact numbers from females EWAS
+pwr_f <- pwrEWAS(minTotSampleSize = 100,
+    maxTotSampleSize = 500,
+    SampleSizeSteps = 100,
+    NcntPer = 0.67,
+    targetDelta = c(0.03, 0.05, 0.1, 0.2),
+    J = 29363,
+    targetDmCpGs = 69,
+    tissueType = "Blood adult",
+    detectionLimit = 0.03,
+    DMmethod = "limma",
+    FDRcritVal = 0.05,
+    core = 6,
+    sims = 1000)
+
+pwr_f <- (pwr_f$meanPower)
+pwr_f
+#         0.03      0.05       0.1       0.2
+#100 0.7982979 0.7883360 0.8012206 0.8868430
+#200 0.8973722 0.9192318 0.9246787 0.9569110
+#300 0.9156648 0.9573155 0.9601617 0.9779099
+#400 0.9328943 0.9720732 0.9733525 0.9860351
+#500 0.9424432 0.9785017 0.9812671 0.9897331
+
+# with exact numbers from males EWAS
+pwr_m <- pwrEWAS(minTotSampleSize = 118,
+    maxTotSampleSize = 500,
+    SampleSizeSteps = 100,
+    NcntPer = 0.68,
+    targetDelta = c(0.03, 0.05, 0.1, 0.2),
+    J = 29190,
+    targetDmCpGs = 2,
+    tissueType = "Blood adult",
+    detectionLimit = 0.03,
+    DMmethod = "limma",
+    FDRcritVal = 0.05,
+    core = 6,
+    sims = 1000)
+
+pwr_m <- (pwr_m$meanPower)
+pwr_m
+#         0.03      0.05       0.1       0.2
+#118 0.8496344 0.7124086 0.7456318 0.8523437
+#218 0.9158371 0.8674585 0.8854969 0.9253347
+#318 0.9220262 0.9251434 0.9286599 0.9621212
+#418 0.9346796 0.9516106 0.9577250 0.9795139
+
+save(pwr_f, pwr_m, file="~/KoborLab/kobor_space/sschaffner/misc/pwr_TERRE_sex_strat.RData")
+```

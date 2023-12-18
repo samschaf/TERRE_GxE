@@ -1,0 +1,429 @@
+
+TERRE Differential DNAm Analysis
+===============================================================
+
+##### Analyst: Samantha Schaffner
+##### Date: Oct 17, 2023
+  
+The *TERRE* cohort (subset containing n=88 cases and n=177 controls) consists of French agricultural workers enrolled in the Mutualite Sociale Agricole health insurance system. All PD cases in this subset of data have a disease duration of one year or less. 
+
+In this script I will perform EWAS in TERRE using the blood reference CMRs from the EPIC array, with median betas calculated within each sex of TERRE (see ~/2-EWAS_CMRs/TERRE//TERRE_models.Rmd). Covariate selection was also optimized in this script. Model weights (matching samples on smoking status, alcohol consumption, age, and heat trauma) were calculated with MatchIt (see ~/1-preprocessing/TERRE/propensity_matching/sex_combined/TERRE_propensity_match_sexpooled.Rmd).
+
+## Loading Libraries
+```{r libraries, eval=F}
+setwd("/home1/NEURO/schaffner/")
+library(minfi)
+library(dplyr)
+library(ggplot2)
+library(DescTools)
+library(reshape2)
+library(MASS)
+library(sfsmisc)
+library(gridExtra)
+library(ggrepel)
+source("~/kobor_shared_coding_resource/qqplot_NG.R")
+```
+
+## Reading in and cleaning data
+```{r read in data, eval=F}
+meta <- read.csv("~/1-preprocessing/TERRE/propensity_matching/sex_combined/terre_meta_probit_matched.csv")
+load("~/2-EWAS_CMRs/TERRE/sex_EWAS/refCMR_medB_var.RData")
+dim(refCMR_medB_var) #219 29708
+dim(refCMR_medB_var <- refCMR_medB_var[match(meta$patient, rownames(refCMR_medB_var)),]) #218 29708
+all(meta$patient==rownames(refCMR_medB_var)) #TRUE
+
+#check formatting of meta data
+str(meta[,c("PD","age","smoking","head_trauma","alcohol1","CTP_PC1","CTP_PC2","CTP_PC3","CTP_PC4","CTP_PC5","CTP_PC6","ancestryPC1","ancestryPC2","ancestryPC3","plate","SentrixPosition_A","reportedSex")])
+meta$PD <- as.factor(meta$PD)
+meta$smoking <- as.factor(meta$smoking)
+meta$head_trauma <- as.factor(meta$head_trauma)
+meta$alcohol1 <- as.factor(meta$alcohol1)
+meta$plate <- as.factor(meta$plate)
+meta$reportedSex <- as.factor(meta$reportedSex)
+```
+
+# Model assessment
+
+### Variance inflation factor
+```{r vif, eval=F}
+#PD, age, alcohol1, smoking, head trauma, 6 cell type PCs, 3 ancestry PCs, plate, row, sex
+sapply(vif(lm(refCMR_medB_var[,1] ~ meta$PD + meta$age + meta$alcohol1 + meta$smoking + meta$head_trauma + meta$CTP_PC1 + meta$CTP_PC2 + meta$CTP_PC3 + meta$CTP_PC4 + meta$CTP_PC5 + meta$CTP_PC6 + meta$ancestryPC1 + meta$ancestryPC2 + meta$ancestryPC3 + meta$plate + meta$SentrixPosition_A + meta$reportedSex, weights=meta$weights))[,3], function(x) x^2)
+#               meta$PD               meta$age          meta$alcohol1           meta$smoking 
+#              1.141071               1.407061               1.780070               1.365363 
+#      meta$head_trauma           meta$CTP_PC1           meta$CTP_PC2           meta$CTP_PC3 
+#              1.197578               1.293131               1.284289               1.733633 
+#          meta$CTP_PC4           meta$CTP_PC5           meta$CTP_PC6       meta$ancestryPC1 
+#              1.358061               1.586645               1.450399               1.195980 
+#      meta$ancestryPC2       meta$ancestryPC3             meta$plate meta$SentrixPosition_A 
+#              1.187239               1.252484               2.039295               1.160988 
+#      meta$reportedSex 
+#              3.244663
+
+#without sex
+sapply(vif(lm(refCMR_medB_var[,1] ~ meta$PD + meta$age + meta$alcohol1 + meta$smoking + meta$head_trauma + meta$CTP_PC1 + meta$CTP_PC2 + meta$CTP_PC3 + meta$CTP_PC4 + meta$CTP_PC5 + meta$CTP_PC6 + meta$ancestryPC1 + meta$ancestryPC2 + meta$ancestryPC3 + meta$plate + meta$SentrixPosition_A, weights=meta$weights))[,3], function(x) x^2)
+#               meta$PD               meta$age          meta$alcohol1           meta$smoking 
+#              1.141044               1.340125               1.483085               1.296817 
+#      meta$head_trauma           meta$CTP_PC1           meta$CTP_PC2           meta$CTP_PC3 
+#              1.196205               1.292727               1.282435               1.516824 
+#          meta$CTP_PC4           meta$CTP_PC5           meta$CTP_PC6       meta$ancestryPC1 
+#              1.267533               1.390394               1.285952               1.195767 
+#      meta$ancestryPC2       meta$ancestryPC3             meta$plate meta$SentrixPosition_A 
+#              1.186380               1.225489               1.782767               1.151702 
+
+#without plate
+sapply(vif(lm(refCMR_medB_var[,1] ~ meta$PD + meta$age + meta$alcohol1 + meta$smoking + meta$head_trauma + meta$CTP_PC1 + meta$CTP_PC2 + meta$CTP_PC3 + meta$CTP_PC4 + meta$CTP_PC5 + meta$CTP_PC6 + meta$ancestryPC1 + meta$ancestryPC2 + meta$ancestryPC3 + meta$SentrixPosition_A + meta$reportedSex, weights=meta$weights))[,3], function(x) x^2)
+#               meta$PD               meta$age          meta$alcohol1           meta$smoking 
+#              1.140721               1.239980               1.758740               1.365283 
+#      meta$head_trauma           meta$CTP_PC1           meta$CTP_PC2           meta$CTP_PC3 
+#              1.177808               1.240454               1.282784               1.659990 
+#          meta$CTP_PC4           meta$CTP_PC5           meta$CTP_PC6       meta$ancestryPC1 
+#              1.356861               1.561000               1.445185               1.194103 
+#      meta$ancestryPC2       meta$ancestryPC3 meta$SentrixPosition_A       meta$reportedSex 
+#              1.178307               1.246887               1.151368               2.836508 
+```
+There is a minor amount of inflation (VIF ~3) with sex included in the model, likely due to covariates correlated with sex (e.g. plate, alcohol). VIFs are still overall within the same range as for the sex-stratified models, though.
+
+### AIC and Q-Q plots
+```{r aic, eval=F}
+#lm (AIC check)
+
+#base model: PD, age, 6 cell type PCs, 3 ancestry PCs, plate, row, sex
+aics <- sapply(1:ncol(refCMR_medB_var), function(x) AIC(lm(refCMR_medB_var[,x] ~ meta$PD + meta$age + meta$CTP_PC1 + meta$CTP_PC2 + meta$CTP_PC3 + meta$CTP_PC4 + meta$CTP_PC5 + meta$CTP_PC6 + meta$ancestryPC1 + meta$ancestryPC2 + meta$ancestryPC3 + meta$plate + meta$SentrixPosition_A + meta$reportedSex, weights=meta$weights)))
+mean(aics)  #-780.3916
+
+pvals1 <- sapply(1:ncol(refCMR_medB_var), function(x) {
+  coef(summary(lm(refCMR_medB_var[,x] ~ meta$PD + meta$age + meta$CTP_PC1 + meta$CTP_PC2 + meta$CTP_PC3 + meta$CTP_PC4 + meta$CTP_PC5 + meta$CTP_PC6 + meta$ancestryPC1 + meta$ancestryPC2 + meta$ancestryPC3 + meta$plate + meta$SentrixPosition_A + meta$reportedSex, weights=meta$weights)))[2,4]
+   })
+qqunif.plot(pvals1, title="Base")
+
+#PD, age, 6 cell type PCs, 3 ancestry PCs, plate, row, sex, smoking
+aics <- sapply(1:ncol(refCMR_medB_var), function(x) AIC(lm(refCMR_medB_var[,x] ~ meta$PD + meta$age + meta$CTP_PC1 + meta$CTP_PC2 + meta$CTP_PC3 + meta$CTP_PC4 + meta$CTP_PC5 + meta$CTP_PC6 + meta$ancestryPC1 + meta$ancestryPC2 + meta$ancestryPC3 + meta$plate + meta$SentrixPosition_A + meta$reportedSex + meta$smoking, weights=meta$weights)))
+mean(aics)  #-779.7048
+
+pvals2 <- sapply(1:ncol(refCMR_medB_var), function(x) {
+  coef(summary(lm(refCMR_medB_var[,x] ~ meta$PD + meta$age + meta$CTP_PC1 + meta$CTP_PC2 + meta$CTP_PC3 + meta$CTP_PC4 + meta$CTP_PC5 + meta$CTP_PC6 + meta$ancestryPC1 + meta$ancestryPC2 + meta$ancestryPC3 + meta$plate + meta$SentrixPosition_A + meta$reportedSex + meta$smoking, weights=meta$weights)))[2,4]
+   })
+qqunif.plot(pvals2, title="Base + smoking")
+
+#PD, age, 6 cell type PCs, 3 ancestry PCs, plate, row, sex, smoking, alcohol
+aics <- sapply(1:ncol(refCMR_medB_var), function(x) AIC(lm(refCMR_medB_var[,x] ~ meta$PD + meta$age + meta$CTP_PC1 + meta$CTP_PC2 + meta$CTP_PC3 + meta$CTP_PC4 + meta$CTP_PC5 + meta$CTP_PC6 + meta$ancestryPC1 + meta$ancestryPC2 + meta$ancestryPC3 + meta$plate + meta$SentrixPosition_A + meta$reportedSex + meta$smoking + meta$alcohol1, weights=meta$weights)))
+mean(aics)  #-779.6082
+
+pvals3 <- sapply(1:ncol(refCMR_medB_var), function(x) {
+  coef(summary(lm(refCMR_medB_var[,x] ~ meta$PD + meta$age + meta$CTP_PC1 + meta$CTP_PC2 + meta$CTP_PC3 + meta$CTP_PC4 + meta$CTP_PC5 + meta$CTP_PC6 + meta$ancestryPC1 + meta$ancestryPC2 + meta$ancestryPC3 + meta$plate + meta$SentrixPosition_A + meta$reportedSex + meta$smoking + meta$alcohol1, weights=meta$weights)))[2,4]
+   })
+qqunif.plot(pvals3, title="Base + smoking + alcohol1")
+
+#full model: PD, age, 6 cell type PCs, 3 ancestry PCs, plate, row, alcohol, smoking, head trauma, sex
+aics <- sapply(1:ncol(refCMR_medB_var), function(x) AIC(lm(refCMR_medB_var[,x] ~ meta$PD + meta$age + meta$CTP_PC1 + meta$CTP_PC2 + meta$CTP_PC3 + meta$CTP_PC4 + meta$CTP_PC5 + meta$CTP_PC6 + meta$ancestryPC1 + meta$ancestryPC2 + meta$ancestryPC3 + meta$plate + meta$SentrixPosition_A + meta$alcohol1 + meta$smoking + meta$head_trauma + meta$reportedSex, weights=meta$weights)))
+mean(aics)  #-779.3636
+
+pvals4 <- sapply(1:ncol(refCMR_medB_var), function(x) {
+  coef(summary(lm(refCMR_medB_var[,x] ~ meta$PD + meta$age + meta$CTP_PC1 + meta$CTP_PC2 + meta$CTP_PC3 + meta$CTP_PC4 + meta$CTP_PC5 + meta$CTP_PC6 + meta$ancestryPC1 + meta$ancestryPC2 + meta$ancestryPC3 + meta$plate + meta$SentrixPosition_A + meta$smoking + meta$alcohol1 + meta$head_trauma + meta$reportedSex, weights=meta$weights)))[2,4]
+   })
+qqunif.plot(pvals4, title="Base + smoking + alcohol1 + head trauma")
+
+#p-value histograms
+hist1 <- ggplot(as.data.frame(pvals1), aes(x=pvals1)) + geom_histogram(color="black") + theme_bw() + ggtitle("Base model")
+hist2 <- ggplot(as.data.frame(pvals2), aes(x=pvals2)) + geom_histogram(color="black") + theme_bw() + ggtitle("Base + smoking")
+hist3 <- ggplot(as.data.frame(pvals3), aes(x=pvals3)) + geom_histogram(color="black") + theme_bw() + ggtitle("Base + smoking + alcohol1")
+hist4 <- ggplot(as.data.frame(pvals4), aes(x=pvals4)) + geom_histogram(color="black") + theme_bw() + ggtitle("Base + smoking + alcohol1 + head trauma")
+grid.arrange(hist1, hist2, hist3, hist4, nrow=2, ncol=2)
+
+#full model with only 2 cell type PCs. Cell type PCs 3, 5, and 6 correlated with sex
+aics <- sapply(1:ncol(refCMR_medB_var), function(x) AIC(lm(refCMR_medB_var[,x] ~ meta$PD + meta$age + meta$CTP_PC1 + meta$CTP_PC2 + meta$ancestryPC1 + meta$ancestryPC2 + meta$ancestryPC3 + meta$plate + meta$SentrixPosition_A + meta$alcohol1 + meta$smoking + meta$head_trauma + meta$reportedSex, weights=meta$weights)))
+mean(aics)  #-744.5612
+#having fewer cell type PCs makes the model fit less well (35-pt AIC difference!)
+
+pvals5 <- sapply(1:ncol(refCMR_medB_var), function(x) {
+  coef(summary(lm(refCMR_medB_var[,x] ~ meta$PD + meta$age + meta$CTP_PC1 + meta$CTP_PC2 + meta$ancestryPC1 + meta$ancestryPC2 + meta$ancestryPC3 + meta$plate + meta$SentrixPosition_A + meta$smoking + meta$alcohol1 + meta$head_trauma + meta$reportedSex, weights=meta$weights)))[2,4]
+   })
+qqunif.plot(pvals5, title="Base (2 CTPCs) + smoking + alcohol1 + head trauma")
+ggplot(as.data.frame(pvals5), aes(x=pvals5)) + geom_histogram(color="black") + theme_bw() + ggtitle("Base (2 CTPCs) + smoking + alcohol1 + head trauma")
+#early inflation in QQ is gone, but late deflation still there
+
+#base model without sex (to see if sex is related to late deflation in QQ)
+aics <- sapply(1:ncol(refCMR_medB_var), function(x) AIC(lm(refCMR_medB_var[,x] ~ meta$PD + meta$age + meta$CTP_PC1 + meta$CTP_PC2 + meta$CTP_PC3 + meta$CTP_PC4 + meta$CTP_PC5 + meta$CTP_PC6 + meta$ancestryPC1 + meta$ancestryPC2 + meta$ancestryPC3 + meta$plate + meta$SentrixPosition_A, weights=meta$weights)))
+mean(aics)  #-776.3527
+#delta AIC from models with sex is about 4. Cell type better explains DNAm than sex (as expected)
+
+pvals6 <- sapply(1:ncol(refCMR_medB_var), function(x) {
+  coef(summary(lm(refCMR_medB_var[,x] ~ meta$PD + meta$age + meta$CTP_PC1 + meta$CTP_PC2 + meta$CTP_PC3 + meta$CTP_PC4 + meta$CTP_PC5 + meta$CTP_PC6 + meta$ancestryPC1 + meta$ancestryPC2 + meta$ancestryPC3 + meta$plate + meta$SentrixPosition_A, weights=meta$weights)))[2,4]
+   })
+qqunif.plot(pvals6, title="Base without sex")
+#the p-value distribution is very similar to base model with sex, confirming cell type was reponsible for early inflation...
+
+ggplot(as.data.frame(pvals6), aes(x=pvals6)) + geom_histogram(color="black") + theme_bw() + ggtitle("Base without sex")
+```
+![P-value histograms for sex-combined models](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/sex_combined/pval_histograms.png)
+P-value histograms are similar across models with minor inflation, similar to sex-stratified analyses.
+
+![Q-Q plot for "full" sex-combined model](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/sex_combined/qq_full.png)
+
+Compared with the sex-stratified models, there is late deflation in the Q-Q plot. 
+
+Cell type is causing the mid-inflation, but did not affect the late deflation, as shown here when only the first two cell type PCs (not correlated with other variables) are included:
+
+![Q-Q plot for "reduced" sex-combined model](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/sex_combined/qq_2CTPCs_full.png)
+
+Late deflation is even observed in the base model (corrected for age, cell type, ancestry, batch, and sex):
+![Q-Q plot for "base" sex-combined model](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/sex_combined/qq_base.png)
+
+Cell type has a significant contribution to model fit/variation in DNAm, and other covariates had little effect on model diagnostics, so I will stick with the same full model used for sex-stratified analyses, with the knowledge that it is imperfect.
+
+# EWAS with sexes combined
+
+Adjusting for sex as a covariate.
+
+```{r rlm, eval = F}
+#RLM on variable CMRs
+#pull out p-values and coefficients for PD term (adjusted DBs)
+
+rlm_pvals <- lapply(1:ncol(refCMR_medB_var), function(x) {
+ RLM <- rlm(refCMR_medB_var[,x] ~ meta$PD + meta$age + meta$smoking + meta$alcohol1 + meta$head_trauma + meta$plate + meta$SentrixPosition_A + meta$CTP_PC1 + meta$CTP_PC2 + meta$CTP_PC3 + meta$CTP_PC4 + meta$CTP_PC5 + meta$CTP_PC6 + meta$ancestryPC1 + meta$ancestryPC2 + meta$ancestryPC3 + meta$reportedSex, psi = psi.huber, weights=meta$weights, maxit=500)
+  return(f.robftest(RLM, var = names(RLM$coefficients)[2])$p.value)
+})
+
+results <- as.data.frame(do.call(rbind, rlm_pvals))
+rownames(results) <- colnames(refCMR_medB_var)
+names(results)[1] <- "pval"
+results$adjP_BH <- p.adjust(results$pval, method="BH")
+results$TargetID <- rownames(results)
+nrow(results[results$adjP_BH<=0.05,]) #18
+
+coefs <- lapply(1:ncol(refCMR_medB_var), function(x) {
+ rlm(refCMR_medB_var[,x] ~ meta$PD + meta$age + meta$smoking + meta$alcohol1 + meta$head_trauma + meta$plate + meta$SentrixPosition_A + meta$CTP_PC1 + meta$CTP_PC2 + meta$CTP_PC3 + meta$CTP_PC4 + meta$CTP_PC5 + meta$CTP_PC6 + meta$ancestryPC1 + meta$ancestryPC2 + meta$ancestryPC3 + meta$reportedSex, psi = psi.huber, weights=meta$weights, maxit=500)$coefficients[2]
+})
+all(names(coefs)==rownames(results)) #TRUE
+results$adjDB <- unlist(coefs)
+```
+
+### Setting DB threshold for hits
+```{r delta beta F, eval=F}
+#The max RMSE was 0.025 between tech reps (see preprocessing script)
+#how many sites pass DB 0.03 and FDR 0.05 with BH multiple test correction?
+summary(results$threshold_adjDB <- (results$adjP_BH <= 0.05 & abs(results$adjDB) >= 0.03)) #1
+summary(abs(results[results$adjP_BH<=0.05,"adjDB"]))
+#    Min.  1st Qu.   Median     Mean  3rd Qu.     Max. 
+#0.009283 0.012298 0.017671 0.019309 0.023350 0.041859 
+```
+
+### Volcano plot
+```{r volcano F, eval=F}
+results$DNAm_change <- results$threshold_adjDB
+results[results$threshold_adjDB==TRUE & results$adjDB>0,]$DNAm_change <- "Increase"
+#results[results$threshold_adjDB==TRUE & results$adjDB<0,]$DNAm_change <- "Decrease"
+results[results$threshold_adjDB==FALSE,]$DNAm_change <- "NS"
+summary(as.factor(results$DNAm_change))
+#Increase       NS 
+#       1    29707 
+
+write.csv(results, file="~/2-EWAS_CMRs/TERRE/sex_combined/rlm_adjDB_102023.csv", row.names=F)
+
+### Annotating full CMR coordinates
+#get reference CMRs (1k)
+CMRs_450 <- readRDS("~/kobor_shared_coding_resource/reference_CMRs/S3_cmr_Scor30_mxd1K.rds")
+load("~/kobor_shared_coding_resource/reference_CMRs/S5_cmrs_epicOnly_1Kd.RData")
+refCMRs <- rbind(CMRs_450, cmrs_epicOnly_gene_df) #43,657 CMRs
+
+#covert to a list, where each element contains CpG probe names
+refCMRlist <- lapply(1:nrow(refCMRs), function(x){
+  probes <- unlist(strsplit(as.character(refCMRs$cmr[x]), split=","))
+  
+})
+
+results <- cbind(results, data.frame(cmr=NA, cmrGR=NA, cmr_indx=NA, Gene_id=NA, geneSymbol=NA, geneGR=NA))
+
+for(x in(1:nrow(results))){
+  print(x)
+  index <- grep(results$TargetID[x], refCMRlist)
+  results[x,7] <- as.character(refCMRs[index,1]) #cmr (probes)
+  results[x,8] <- as.character(refCMRs[index,2]) #cmr coords
+  results[x,9] <- refCMRs[index,3] #cmr number
+  results[x,10] <- as.character(refCMRs[index,4]) #gene ID(s)
+  results[x,11] <- as.character(refCMRs[index,5]) #gene symbol(s)
+  results[x,12] <- as.character(refCMRs[index,6]) #gene coords
+}
+
+results$cmr_length <- NA
+results$cmr_num_probes <- NA
+for(x in (1:nrow(results))){
+  print(x)
+  results$cmr_num_probes[x] <- length(unlist(strsplit(results[x,7],split=",")))
+  results$cmr_length[x] <- as.numeric(unlist(strsplit(unlist(strsplit(results[x,8],split=":"))[2], split="-"))[2]) - as.numeric(unlist(strsplit(unlist(strsplit(results[x,8],split=":"))[2], split="-"))[1])
+}
+  
+write.csv(results, file="~/2-EWAS_CMRs/TERRE/sex_combined/rlm_adjDB_102023.csv", row.names=F)
+
+#check gene
+rlm_F <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_F_adjDB_042023.csv")
+rlm_F[rlm_F$TargetID==results[results$threshold_adjDB==TRUE,"TargetID"],c("cmrGR","geneSymbol")]
+#                         cmrGR geneSymbol
+#12886 chr3:137228231-137228637       <NA>
+results$cmrGR <- NA
+results[results$threshold_adjDB==TRUE,"cmrGR"] <- "chr3:137228231-137228637"
+
+max(results[results$adjP_BH<=0.05,"pval"]) #3.023141e-05
+
+png("~/2-EWAS_CMRs/TERRE/sex_combined/volcano_adjDB_102023.png", width=200, height=250)
+ggplot(results[,c("adjDB","pval","DNAm_change")], aes(x=adjDB, y=-log10(pval), colour=DNAm_change)) +
+  geom_point(size=1.75) +
+  labs(legend.position = "none") +
+  xlab("Adjusted Delta Beta") + ylab("-log10 P-Value") + theme_classic() + scale_color_manual(values=c("darkgreen","gray70")) + geom_hline(yintercept=-log10(3.023141e-05)) + geom_vline(xintercept=-0.03) + geom_vline(xintercept=0.03) +
+ theme(legend.position="none") + ylim(c(0,7.5)) + xlim(c(-0.12,0.12))+
+    geom_label_repel(data = results,
+            aes(label = cmrGR), size = 4, force = 10, max.overlaps=16)
+dev.off()
+
+cor.test(results_sub$adjDB_F, results_sub$adjDB_M)
+#	Pearson's product-moment correlation
+#
+#data:  results_sub$adjDB_F and results_sub$adjDB_M
+#t = 4.6056, df = 15, p-value = 0.0003431
+#alternative hypothesis: true correlation is not equal to 0
+#95 percent confidence interval:
+# 0.4503935 0.9109091
+#sample estimates:
+#      cor 
+#0.7653548 
+```
+![Volcano plot for sex-combined EWAS](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/sex_combined/volcano_adjDB_102023.png)
+
+## Checking top hits against sex-stratified EWAS results
+```{r sex overlap, eval=F}
+results_sub <- results[results$adjP_BH<=0.05,]
+results_F <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_F_adjDB_042023.csv")
+all(results_sub$TargetID %in% results_F$TargetID) #FALSE
+nrow(results_sub <- results_sub[results_sub$TargetID %in% results_F$TargetID,]) #17 (1 CMR removed)
+results_F <- results_F[match(results_sub$TargetID, results_F$TargetID),]
+
+results_M <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_M_adjDB_042023.csv")
+all(results_sub$TargetID %in% results_M$TargetID) #TRUE
+results_M <- results_M[match(results_sub$TargetID, results_M$TargetID),]
+
+all.equal(results_sub$TargetID, results_F$TargetID, results_M$TargetID) #TRUE
+results_sub$adjP_BH_F <- results_F$adjP_BH
+results_sub$adjDB_F <- results_F$adjDB
+results_sub$adjP_BH_M <- results_M$adjP_BH
+results_sub$adjDB_M <- results_M$adjDB
+
+#comparing sex-pooled vs female
+f_effect <- ggplot(results_sub, aes(x=adjDB,y=adjDB_F)) + geom_point(col="lightpink4") + theme_classic() + ggtitle("Top sex-pooled CMRs:\nSex-pooled vs female effect sizes") + xlab("Adjusted delta beta (sex-pooled)") + ylab("Adjusted delta beta (females)") + xlim(c(-0.05,0.05)) + ylim(c(-0.05,0.05)) + geom_vline(xintercept=0.03,linetype="dashed",color="grey") + geom_hline(yintercept=0.03,linetype="dashed",color="grey")+ geom_vline(xintercept=-0.03,linetype="dashed",color="grey") + geom_hline(yintercept=-0.03,linetype="dashed",color="grey")+ geom_vline(xintercept=0) + geom_hline(yintercept=0)
+
+f_p <- ggplot(results_sub, aes(x=adjP_BH,y=adjP_BH_F)) + geom_point(col="lightpink4") + theme_classic() + ggtitle("Top sex-pooled CMRs:\nSex-pooled vs female adjusted p-values") + xlab("Adjusted p-value (sex-pooled)") + ylab("Adjusted p-value (females)") + xlim(c(0,1)) + ylim(c(0,1))+ geom_hline(yintercept=0.05,linetype="dashed",color="grey")+ geom_vline(xintercept=0.05,linetype="dashed",color="grey")
+
+grid.arrange(f_effect, f_p, ncol=1)
+
+nrow(results_sub[results_sub$adjP_BH<=0.05 & results_sub$adjP_BH_F<=0.05,]) #5
+
+#comparing sex-pooled vs male
+m_effect <- ggplot(results_sub, aes(x=adjDB,y=adjDB_M)) + geom_point(col="steelblue4") + theme_classic() + ggtitle("Top sex-pooled CMRs:\nSex-pooled vs male effect sizes") + xlab("Adjusted delta beta (sex-pooled)") + ylab("Adjusted delta beta (males)") + xlim(c(-0.05,0.05)) + ylim(c(-0.05,0.05)) + geom_vline(xintercept=0.03,linetype="dashed",color="grey") + geom_hline(yintercept=0.03,linetype="dashed",color="grey")+ geom_vline(xintercept=-0.03,linetype="dashed",color="grey") + geom_hline(yintercept=-0.03,linetype="dashed",color="grey")+ geom_vline(xintercept=0) + geom_hline(yintercept=0)
+
+m_p <- ggplot(results_sub, aes(x=adjP_BH,y=adjP_BH_M)) + geom_point(col="steelblue4") + theme_classic() + ggtitle("Top sex-pooled CMRs:\nSex-pooled vs male adjusted p-values") + xlab("Adjusted p-value (sex-pooled)") + ylab("Adjusted p-value (males)") + xlim(c(0,1)) + ylim(c(0,1))+ geom_hline(yintercept=0.05,linetype="dashed",color="grey")+ geom_vline(xintercept=0.05,linetype="dashed",color="grey")
+
+grid.arrange(m_effect, m_p, ncol=1)
+
+nrow(results_sub[results_sub$adjP_BH<=0.05 & results_sub$adjP_BH_M<=0.05,]) #1
+
+#comparing male vs female
+png("~/2-EWAS_CMRs/TERRE/sex_combined/sexcombined_p0.05_adjDB_M_F.png", width=300, height=300)
+ggplot(results_sub, aes(x=adjDB_F, y=adjDB_M)) +  geom_smooth(method="lm", col="grey50") + geom_point(color="grey50", size=5, alpha=0.6) + theme_bw() + xlab("TERRE Female Adjusted Delta Beta") + ylab("TERRE Male Adjusted Delta Beta") + xlim(c(-0.05,0.05)) + ylim(c(-0.05,0.05)) + ggtitle("TERRE Female vs TERRE Male \nCMR Median Adjusted Delta Betas") + coord_cartesian(clip="off")+ geom_label_repel(data=results_sub[results_sub$threshold_adjDB==TRUE,],aes(label = cmrGR), size = 3, force=50, max.overlaps=Inf)
+dev.off()
+```
+![Comparing effect sizes and p-values between sex-pooled and female-stratified analysis](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/sex_combined/sex_pooled_vs_female_CMRs.png)
+
+![Comparing effect sizes and p-values between sex-pooled and male-stratified analysis](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/sex_combined/sex_pooled_vs_male_CMRs.png)
+
+The CMRs passing adjP < 0.05 in sex-pooled analysis have similar effects size in each sex-stratified analysis, though most do not reach statistical significance. This is consistent with the sex-combined sample having increased power to reject the null hypothesis.
+
+#### CMR plots
+```{r cmrplot F, eval=F}
+source("~/2-EWAS_CMRs/TERRE/sex_combined/cmrplot_adjDB_2.R") #changed so that it calls CMRs passing signficance threshold only (adjP <= 0.05), not the "threshold" column
+
+#getting all betas (not just CMR betas)
+load("~/1-preprocessing/TERRE/TERRE_RG_filtered.RData")
+betas <- getBeta(PD_RG_filtered)
+betas <- betas[,colnames(betas) %in% as.character(meta$Sample_Name)]
+#betas_F <- betas[,colnames(betas) %in% meta_F$Sample_Name]
+#betas_M <- betas[,colnames(betas) %in% meta_M$Sample_Name]
+
+#getting fdat for all probes (not just variable representative CMR probes)
+load("~/kobor_shared_coding_resource/EPIC_fdat.RData")
+fData_EPIC <- fData_EPIC[fData_EPIC$TargetID %in% featureNames(PD_RG_filtered),]
+
+#add annotation information to sex-pooled results
+results_sub <- cbind(results_sub, results_F[,8:64])
+
+for (i in 1:nrow(results_sub)){
+cmrplot(sig.cpgs=results_sub, fdat=fData_EPIC, metadata=meta, betas=betas, cmr=i, path="~/2-EWAS_CMRs/TERRE/sex_combined/CMRs_102023/")}
+
+#DTHD1 CMR is female-driven, as is CMR #8
+
+cmrplot(sig.cpgs=results_sub, fdat=fData_EPIC, metadata=meta, betas=betas, cmr=2, path="~/2-EWAS_CMRs/TERRE/sex_combined/", width=350, height=750)
+```
+
+## Overlap with sex-stratified CMRs
+
+```{r overlap, eval=F}
+#Females
+sig_F <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_F_hits_BH0.05_adjDB0.03_042023.csv")
+length(sig_F$TargetID[sig_F$TargetID %in% rownames(results_sub)]) #2
+results_sub[rownames(results_sub) %in% sig_F$TargetID,c("adjDB","adjDB_F","adjP_BH","adjP_BH_F","cmrGR","geneSymbol","cmr_length","cmr_num_probes")]
+#                adjDB    adjDB_F    adjP_BH  adjP_BH_F                    cmrGR geneSymbol cmr_length cmr_num_probes
+#cg02805612 0.04185913 0.04649663 0.02631144 0.01307582 chr3:137228231-137228637       <NA>        406              3
+#cg25330192 0.02916790 0.03833224 0.01292628 0.01594051                     <NA>       <NA>        206              2
+
+#Comparing female and sex-pooled CMRs
+all(sig_F$TargetID %in% rownames(results)) #TRUE
+results_sub2 <- results[match(sig_F$TargetID, rownames(results)),]
+all.equal(rownames(results_sub2), sig_F$TargetID) #TRUE
+results_sub2$adjP_BH_F <- sig_F$adjP_BH
+results_sub2$adjDB_F <- sig_F$adjDB
+
+max(c(abs(results_sub2$adjDB), abs(results_sub2$adjDB_F))) #0.1506236
+
+f_effect <- ggplot(results_sub2, aes(y=adjDB,x=adjDB_F)) + geom_point(col="black") + theme_classic() + ggtitle("Female CMRs:\nFemale vs sex-pooled effect sizes") + xlab("Adjusted delta beta (females)") + ylab("Adjusted delta beta (sex-pooled)") + xlim(c(-0.16,0.16)) + ylim(c(-0.16,0.16)) + geom_vline(xintercept=0.03,linetype="dashed",color="grey") + geom_hline(yintercept=0.03,linetype="dashed",color="grey")+ geom_vline(xintercept=-0.03,linetype="dashed",color="grey") + geom_hline(yintercept=-0.03,linetype="dashed",color="grey")+ geom_vline(xintercept=0) + geom_hline(yintercept=0)
+
+f_p <- ggplot(results_sub2, aes(x=adjP_BH,y=adjP_BH_F)) + geom_point() + theme_classic() + ggtitle("Female CMRs:\nSex-pooled vs female adjusted p-values") + xlab("Adjusted p-value (sex-pooled)") + ylab("Adjusted p-value (females)") + xlim(c(0,1)) + ylim(c(0,1))
+
+grid.arrange(f_effect, f_p, ncol=1)
+
+#female vs male plot
+results_M <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_M_adjDB_042023.csv")
+all(results_sub2$TargetID %in% results_M$TargetID) #FALSE
+length(results_sub2$TargetID[results_sub2$TargetID %in% results_M$TargetID]) #67
+results_sub3 <- results_sub2[results_sub2$TargetID %in% results_M$TargetID,]
+
+results_M <- results_M[match(results_sub3$TargetID, results_M$TargetID),]
+all.equal(rownames(results_sub3), results_M$TargetID) #TRUE
+results_sub3$adjP_BH_M <- results_M$adjP_BH
+results_sub3$adjDB_M <- results_M$adjDB
+
+ggplot(results_sub3, aes(y=adjDB_M,x=adjDB_F)) + geom_point(col="grey60") + theme_classic() + ggtitle("Female CMRs:\nFemale vs male effect sizes") + xlab("Adjusted delta beta (females)") + ylab("Adjusted delta beta (males)") + xlim(c(-0.16,0.16)) + ylim(c(-0.16,0.16)) + geom_vline(xintercept=0.03,linetype="dashed",color="grey") + geom_hline(yintercept=0.03,linetype="dashed",color="grey")+ geom_vline(xintercept=-0.03,linetype="dashed",color="grey") + geom_hline(yintercept=-0.03,linetype="dashed",color="grey")+ geom_vline(xintercept=0) + geom_hline(yintercept=0)
+
+#Males
+sig_M <- read.csv("~/2-EWAS_CMRs/TERRE/rlm_M_hits_BH0.05_adjDB0.03_042023.csv")
+length(sig_M$TargetID[sig_M$TargetID %in% rownames(results_sub)]) #1
+results_sub[rownames(results_sub) %in% sig_M$TargetID,c("adjDB","adjDB_M","adjP_BH","adjP_BH_M","cmrGR","geneSymbol","cmr_length","cmr_num_probes")]
+#                adjDB   adjDB_M    adjP_BH  adjP_BH_M                  cmrGR geneSymbol cmr_length cmr_num_probes
+#cg06192961 0.02630775 0.0376212 0.03762598 0.03904346 chr6:32294470-32295230       <NA>        760              5
+
+#Comparing male and sex-pooled CMRs
+all(sig_M$TargetID %in% rownames(results)) #TRUE
+results_sub2 <- results[match(sig_M$TargetID, rownames(results)),]
+all.equal(rownames(results_sub2), sig_M$TargetID) #TRUE
+results_sub2$adjP_BH_M <- sig_M$adjP_BH
+results_sub2$adjDB_M <- sig_M$adjDB
+
+max(c(abs(results_sub2$adjDB), abs(results_sub2$adjDB_M))) #0.04661313
+
+m_effect <- ggplot(results_sub2, aes(x=adjDB,y=adjDB_M)) + geom_point() + theme_classic() + ggtitle("Male CMRs:\nSex-pooled vs male effect sizes") + xlab("Adjusted delta beta (sex-pooled)") + ylab("Adjusted delta beta (males)") + xlim(c(-0.05,0.05)) + ylim(c(-0.05,0.05)) + geom_vline(xintercept=0.03,linetype="dashed",color="grey") + geom_hline(yintercept=0.03,linetype="dashed",color="grey")+ geom_vline(xintercept=-0.03,linetype="dashed",color="grey") + geom_hline(yintercept=-0.03,linetype="dashed",color="grey")+ geom_vline(xintercept=0) + geom_hline(yintercept=0)
+
+m_p <- ggplot(results_sub2, aes(x=adjP_BH,y=adjP_BH_M)) + geom_point() + theme_classic() + ggtitle("Male CMRs:\nSex-pooled vs male adjusted p-values") + xlab("Adjusted p-value (sex-pooled)") + ylab("Adjusted p-value (males)") + xlim(c(0,0.15)) + ylim(c(0,0.15))
+
+grid.arrange(m_effect, m_p, ncol=1)
+```
+![Comparing effect sizes and p-values between female-stratified and sex-pooled analysis](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/sex_combined/female_vs_sex_pooled_CMRs.png)
+![Comparing effect sizes and p-values between male-stratified and sex-pooled analysis](/home1/NEURO/schaffner/2-EWAS_CMRs/TERRE/sex_combined/male_vs_sex_pooled_CMRs.png)
+Effect sizes are similar between sex-stratified and sex-pooled analyses in both cases, but smaller in the sex-pooled analysis. Many CMRs significant in the females-only analysis are not close to reaching significance in the sex-pooled analysis, whereas in the males analysis, one CMR is significant in the sex-pooled analysis and the other is close to significance.
+
